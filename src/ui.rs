@@ -15,9 +15,12 @@ use ratatui::widgets::Paragraph;
 use ratatui::widgets::Wrap;
 
 use crate::app::App;
+use crate::app::Drawn;
 use crate::app::Feed;
 use crate::app::Mode;
 use crate::app::Sort;
+use crate::app::Thread;
+use crate::app::drawn_comments;
 use crate::data::Comment;
 use crate::data::Post;
 use crate::data::Vote;
@@ -237,8 +240,16 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             ("q", "quit"),
         ],
         Mode::Search => &[("type", "filter"), ("enter", "keep"), ("esc", "clear")],
+        Mode::Post { .. } if app.thread.focus.is_some() => &[
+            ("j/k", "scroll"),
+            ("n/p", "comments"),
+            ("a/z", "vote comment"),
+            ("enter", "collapse"),
+            ("esc", "unfocus"),
+        ],
         Mode::Post { .. } => &[
             ("j/k", "scroll"),
+            ("n/p", "comments"),
             ("a/z", "vote"),
             ("s", "save"),
             ("c", "share"),
@@ -650,36 +661,75 @@ fn render_card(frame: &mut Frame, app: &App, post: &Post, area: Rect, selected: 
     );
 }
 
-fn comment_lines(comment: &Comment, depth: usize, width: usize, out: &mut Vec<Line<'static>>) {
+/// Pushes the rows of one drawn comment. Its replies are drawn separately.
+fn comment_lines(drawn: &Drawn, width: usize, thread: &Thread, out: &mut Vec<Line<'static>>) {
+    let comment = drawn.comment;
     let guide = Style::new().fg(BORDER);
-    let prefix = "│ ".repeat(depth);
+    let prefix = "│ ".repeat(drawn.depth());
     let text_width = width.saturating_sub(prefix.chars().count());
+    let collapsed = thread.collapsed.contains(&drawn.id);
+    let focused = thread.focus == Some(drawn.id);
 
-    out.push(Line::from(vec![
-        Span::styled(prefix.clone(), guide),
-        Span::styled(format!("u/{}", comment.author), Style::new().bold()),
-        Span::styled(
-            format!(" · {}", age(comment.hours_ago)),
-            Style::new().fg(DIM),
-        ),
-    ]));
+    let (marker, suffix) = match collapsed.then(|| comment.total() - 1) {
+        None => ("", String::new()),
+        Some(0) => ("[+] ", String::new()),
+        Some(1) => ("[+] ", " (1 reply)".to_owned()),
+        Some(n) => ("[+] ", format!(" ({n} replies)")),
+    };
+    let header = if focused {
+        let text = format!(
+            "{marker}u/{} · {}{suffix}",
+            comment.author,
+            age(comment.hours_ago)
+        );
+        vec![Span::styled(
+            format!("{text:<text_width$}"),
+            Style::new().fg(ORANGE).bg(HIGHLIGHT_BG).bold(),
+        )]
+    } else {
+        vec![
+            Span::styled(marker, Style::new().fg(DIM)),
+            Span::styled(format!("u/{}", comment.author), Style::new().bold()),
+            Span::styled(
+                format!(" · {}{suffix}", age(comment.hours_ago)),
+                Style::new().fg(DIM),
+            ),
+        ]
+    };
+    out.push(Line::from(
+        [Span::styled(prefix.clone(), guide)]
+            .into_iter()
+            .chain(header)
+            .collect::<Vec<_>>(),
+    ));
+    if collapsed {
+        out.push(Line::styled(format!("{prefix}│"), guide));
+        return;
+    }
+
     out.extend(
         wrap(comment.body, text_width)
             .into_iter()
             .map(|l| Line::from(vec![Span::styled(prefix.clone(), guide), Span::raw(l)])),
     );
+    let arrow = |active: bool, glyph: &'static str, c: Color| {
+        Span::styled(glyph, Style::new().fg(if active { c } else { DIM }).bold())
+    };
+    let score_color = match comment.vote {
+        Vote::None => DIM,
+        vote => vote_color(vote),
+    };
     out.push(Line::from(vec![
         Span::styled(prefix.clone(), guide),
+        arrow(comment.vote == Vote::Up, "▲", ORANGE),
         Span::styled(
-            format!("▲ {} ▼   Reply   Share", compact(i64::from(comment.score))),
-            Style::new().fg(DIM).bold(),
+            format!(" {} ", compact(i64::from(comment.score))),
+            Style::new().fg(score_color).bold(),
         ),
+        arrow(comment.vote == Vote::Down, "▼", PERIWINKLE),
+        Span::styled("   Reply   Share", Style::new().fg(DIM).bold()),
     ]));
     out.push(Line::styled(format!("{prefix}│"), guide));
-    comment
-        .replies
-        .iter()
-        .for_each(|r| comment_lines(r, depth + 1, width, out));
 }
 
 fn render_post(frame: &mut Frame, app: &mut App, area: Rect, scroll: u16) {
@@ -733,11 +783,13 @@ fn render_post(frame: &mut Frame, app: &mut App, area: Rect, scroll: u16) {
     ]));
     lines.push(Line::raw(""));
 
-    let mut comments = Vec::new();
-    post.comments
-        .iter()
-        .for_each(|c| comment_lines(c, 0, width, &mut comments));
-    lines.extend(comments);
+    let mut focus_row = None;
+    for drawn in drawn_comments(&post.comments, &app.thread.collapsed) {
+        if app.thread.focus == Some(drawn.id) {
+            focus_row = Some(lines.len());
+        }
+        comment_lines(&drawn, width, &app.thread, &mut lines);
+    }
     let shown: u32 = post.comments.iter().map(Comment::total).sum();
     let hidden = post.comment_count.saturating_sub(shown);
     if hidden > 0 {
@@ -748,7 +800,16 @@ fn render_post(frame: &mut Frame, app: &mut App, area: Rect, scroll: u16) {
     }
 
     let max_scroll = (lines.len() as u16).saturating_sub(inner.height);
-    let scroll = scroll.min(max_scroll);
+    let mut scroll = scroll.min(max_scroll);
+    // Right after the focus moves, scroll by the least amount that brings the
+    // focused comment's header into view.
+    if app.thread.reveal
+        && let Some(row) = focus_row
+    {
+        let row = row as u16;
+        scroll = scroll.clamp(row.saturating_sub(inner.height.saturating_sub(1)), row);
+    }
+    app.thread.reveal = false;
     app.mode = Mode::Post { scroll };
 
     frame.render_widget(
@@ -1079,10 +1140,309 @@ mod tests {
             press(&mut app, KeyCode::Enter);
             let post = footer(&mut app);
             assert!(post.ends_with("esc back"), "{feed:?}: {post:?}");
+            assert!(post.contains("n/p comments"), "{feed:?}: {post:?}");
+            assert!(
+                !app.selected_post()
+                    .expect("just opened")
+                    .comments
+                    .is_empty(),
+                "{feed:?} needs a comment to focus"
+            );
+            press(&mut app, KeyCode::Char('n'));
+            let focused = footer(&mut app);
+            assert!(
+                focused.contains("a/z vote comment") && focused.ends_with("esc unfocus"),
+                "{feed:?}: {focused:?}"
+            );
+            press(&mut app, KeyCode::Esc);
             press(&mut app, KeyCode::Esc);
 
             press(&mut app, KeyCode::Char(']'));
         }
         assert_eq!(app.feed, Feed::Home, "visited every feed");
+    }
+
+    fn comment(author: &'static str, body: &'static str, replies: Vec<Comment>) -> Comment {
+        Comment {
+            author,
+            body,
+            score: 10,
+            hours_ago: 1,
+            replies,
+            vote: Vote::None,
+        }
+    }
+
+    /// Opens the first post on Home with its comments replaced by `comments`.
+    fn open_with(comments: Vec<Comment>) -> App {
+        let mut app = App::new();
+        let i = app.view[0];
+        app.posts[i].comments = comments;
+        app.posts[i].comment_count = 50;
+        press(&mut app, KeyCode::Enter);
+        app
+    }
+
+    /// alpha > bravo > charlie, delta > echo, and foxtrot: 2, 1 and 0 replies.
+    fn three_threads() -> App {
+        open_with(vec![
+            comment(
+                "alpha",
+                "alpha body",
+                vec![comment(
+                    "bravo",
+                    "bravo body",
+                    vec![comment("charlie", "charlie body", vec![])],
+                )],
+            ),
+            comment(
+                "delta",
+                "delta body",
+                vec![comment("echo", "echo body", vec![])],
+            ),
+            comment("foxtrot", "foxtrot body", vec![]),
+        ])
+    }
+
+    fn row_of(s: &str, needle: &str) -> usize {
+        s.lines()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("missing {needle:?} in:\n{s}"))
+    }
+
+    #[test]
+    fn collapsed_comment_shows_reply_count_and_hides_its_thread() {
+        let mut app = three_threads();
+        let s = screen(&mut app, 140, 60);
+        let bodies = ["alpha body", "bravo", "charlie", "delta body", "echo"];
+        for needle in bodies {
+            assert!(
+                s.contains(needle),
+                "missing {needle:?} before collapsing:\n{s}"
+            );
+        }
+        assert!(!s.contains("[+]") && !s.contains("[–]"), "{s}");
+
+        // n, Enter on each top-level comment collapses all three.
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Char('n'));
+            press(&mut app, KeyCode::Enter);
+        }
+        let s = screen(&mut app, 140, 60);
+        assert!(s.contains("[+] u/alpha · 1h ago (2 replies)"), "{s}");
+        assert!(s.contains("[+] u/delta · 1h ago (1 reply)"), "{s}");
+        let foxtrot = s
+            .split("[+] u/foxtrot")
+            .nth(1)
+            .and_then(|rest| rest.split('│').next())
+            .expect("found");
+        assert_eq!(foxtrot.trim_end(), " · 1h ago", "no suffix without replies");
+        for needle in bodies.into_iter().chain(["foxtrot body", "Reply"]) {
+            assert!(!s.contains(needle), "{needle:?} should be hidden:\n{s}");
+        }
+        assert_eq!(
+            row_of(&s, "u/delta"),
+            row_of(&s, "u/alpha") + 2,
+            "a collapsed comment is its header and its guide row"
+        );
+    }
+
+    /// Renders `app` and returns the cell where `needle` starts.
+    fn cell_at(app: &mut App, needle: &str) -> ratatui::buffer::Cell {
+        let mut terminal =
+            Terminal::new(TestBackend::new(140, 60)).expect("test backend is infallible");
+        terminal
+            .draw(|f| render(f, app))
+            .expect("test backend is infallible");
+        let buf = terminal.backend().buffer();
+        for y in 0..buf.area.height {
+            let row: Vec<&str> = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+            if let Some(x) = (0..row.len()).find(|&x| row[x..].concat().starts_with(needle)) {
+                return buf[(x as u16, y)].clone();
+            }
+        }
+        panic!("missing {needle:?}");
+    }
+
+    #[test]
+    fn focused_comment_header_uses_the_nav_highlight_and_votes_are_colored() {
+        let mut app = three_threads();
+        press(&mut app, KeyCode::Char('n'));
+        let cell = cell_at(&mut app, "u/alpha");
+        assert_eq!((cell.fg, cell.bg), (ORANGE, HIGHLIGHT_BG));
+        assert!(cell.modifier.contains(Modifier::BOLD));
+        assert_ne!(cell_at(&mut app, "u/bravo").bg, HIGHLIGHT_BG);
+
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(cell_at(&mut app, "▲ 11 ▼").fg, ORANGE, "upvoted arrow");
+        assert_eq!(cell_at(&mut app, "11 ▼").fg, ORANGE, "upvoted score");
+        assert_eq!(cell_at(&mut app, "▼   Reply").fg, DIM);
+        assert_eq!(cell_at(&mut app, "▲ 10 ▼").fg, DIM, "no vote stays dim");
+        assert_eq!(cell_at(&mut app, "10 ▼").fg, DIM);
+
+        press(&mut app, KeyCode::Char('z'));
+        assert_eq!(cell_at(&mut app, "▲ 9 ▼").fg, DIM);
+        assert_eq!(cell_at(&mut app, "9 ▼").fg, PERIWINKLE, "downvoted score");
+        assert_eq!(cell_at(&mut app, "▼   Reply").fg, PERIWINKLE);
+    }
+
+    #[test]
+    fn comment_scores_stay_compacted() {
+        let mut app = three_threads();
+        let i = app.view[0];
+        app.posts[i].comments[0].score = 1_242;
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(cell_at(&mut app, "▲ 1.2k ▼   Reply").fg, ORANGE);
+        assert_eq!(app.posts[i].comments[0].score, 1_243);
+    }
+
+    #[test]
+    fn more_comments_count_ignores_collapse() {
+        let mut app = three_threads();
+        let s = screen(&mut app, 140, 60);
+        assert!(
+            s.contains("··· 44 more comments"),
+            "50 minus 6 seeded:\n{s}"
+        );
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Enter);
+        let s = screen(&mut app, 140, 60);
+        assert!(s.contains("[+] u/alpha"), "{s}");
+        assert!(s.contains("··· 44 more comments"), "{s}");
+    }
+
+    #[test]
+    fn collapsing_keeps_scroll_clamped_to_the_shorter_content() {
+        let mut app = three_threads();
+        // echo, the fifth comment, is on screen at the bottom of the post.
+        (0..5).for_each(|_| press(&mut app, KeyCode::Char('n')));
+        screen(&mut app, 110, 16);
+        press(&mut app, KeyCode::Char('G'));
+        let s = screen(&mut app, 110, 16);
+        assert!(s.contains("u/echo"), "{s}");
+        let Mode::Post { scroll: before } = app.mode else {
+            panic!("should still be in post view");
+        };
+        press(&mut app, KeyCode::Enter);
+        let s = screen(&mut app, 110, 16);
+        assert!(s.contains("[+] u/echo"), "{s}");
+        assert_eq!(
+            app.mode,
+            Mode::Post { scroll: before - 2 },
+            "its body and action row are gone, so the bottom is 2 rows higher"
+        );
+        press(&mut app, KeyCode::Char('j'));
+        screen(&mut app, 110, 16);
+        assert_eq!(
+            app.mode,
+            Mode::Post { scroll: before - 2 },
+            "already at the bottom"
+        );
+        press(&mut app, KeyCode::Char('k'));
+        screen(&mut app, 110, 16);
+        assert_eq!(
+            app.mode,
+            Mode::Post { scroll: before - 3 },
+            "k moves right away"
+        );
+    }
+
+    #[test]
+    fn focusing_a_comment_off_screen_scrolls_it_into_view_once() {
+        const AUTHORS: [&str; 8] = [
+            "user0", "user1", "user2", "user3", "user4", "user5", "user6", "user7",
+        ];
+        let mut app = open_with(
+            AUTHORS
+                .iter()
+                .map(|&a| comment(a, "short", vec![]))
+                .collect(),
+        );
+        // At 16 rows the post box spans rows 3..=14, so rows 4..=13 are content.
+        let (width, height) = (110, 16);
+        let (top, bottom) = (4, height as usize - 3);
+        let scroll = |app: &App| match app.mode {
+            Mode::Post { scroll } => scroll,
+            _ => panic!("should still be in post view"),
+        };
+        let mut s = screen(&mut app, width, height);
+        assert!(!s.contains("u/user7"), "the last comment starts off screen");
+
+        for author in AUTHORS {
+            press(&mut app, KeyCode::Char('n'));
+            s = screen(&mut app, width, height);
+            let row = row_of(&s, &format!("u/{author}"));
+            assert!((top..=bottom).contains(&row), "{author} at {row}:\n{s}");
+        }
+        assert_eq!(
+            row_of(&s, "u/user7"),
+            bottom,
+            "scrolled by the least amount, so the header is on the last row"
+        );
+        let revealed = scroll(&app);
+        assert!(revealed > 0);
+
+        press(&mut app, KeyCode::Char('k'));
+        s = screen(&mut app, width, height);
+        assert_eq!(scroll(&app), revealed - 1, "k isn't pulled back:\n{s}");
+        assert!(!s.contains("u/user7"));
+        s = screen(&mut app, width, height);
+        assert_eq!(scroll(&app), revealed - 1, "nor on the next frame");
+
+        // Upwards: from the bottom, p back to the top comment.
+        press(&mut app, KeyCode::Char('G'));
+        screen(&mut app, width, height);
+        for _ in 0..AUTHORS.len() {
+            press(&mut app, KeyCode::Char('p'));
+            s = screen(&mut app, width, height);
+        }
+        assert_eq!(row_of(&s, "u/user0"), top, "header on the first row:\n{s}");
+    }
+
+    #[test]
+    fn voting_or_collapsing_an_off_screen_focus_scrolls_it_back_into_view() {
+        let (width, height) = (110, 16);
+        let (top, bottom) = (4, height as usize - 3);
+        let scroll = |app: &App| match app.mode {
+            Mode::Post { scroll } => scroll,
+            _ => panic!("should still be in post view"),
+        };
+        for (key, done) in [
+            (
+                KeyCode::Char('a'),
+                (|app: &App| app.selected_post().expect("open").comments[0].vote == Vote::Up)
+                    as fn(&App) -> bool,
+            ),
+            (KeyCode::Enter, |app: &App| {
+                app.thread.collapsed.contains(&0)
+            }),
+        ] {
+            let mut app = three_threads();
+            press(&mut app, KeyCode::Char('n'));
+            screen(&mut app, width, height);
+            press(&mut app, KeyCode::Char('G'));
+            let s = screen(&mut app, width, height);
+            assert!(!s.contains("u/alpha"), "{key:?}: scrolled off screen:\n{s}");
+            let off = scroll(&app);
+
+            press(&mut app, key);
+            assert!(done(&app), "{key:?} acted on alpha");
+            let s = screen(&mut app, width, height);
+            assert_eq!(
+                row_of(&s, "u/alpha"),
+                top,
+                "{key:?}: least scroll up puts the header on the first row:\n{s}"
+            );
+            let revealed = scroll(&app);
+            assert!(revealed < off);
+
+            press(&mut app, KeyCode::Char('j'));
+            screen(&mut app, width, height);
+            assert_eq!(scroll(&app), revealed + 1, "{key:?}: j isn't pulled back");
+            let s = screen(&mut app, width, height);
+            assert_eq!(scroll(&app), revealed + 1, "{key:?}: nor on the next frame");
+            assert!((top..=bottom).all(|r| !s.lines().nth(r).expect("row").contains("u/alpha")));
+        }
     }
 }

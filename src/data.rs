@@ -24,6 +24,7 @@ pub(crate) struct Comment {
     pub score: i32,
     pub hours_ago: u32,
     pub replies: Vec<Comment>,
+    pub vote: Vote,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -50,6 +51,7 @@ fn c(author: &'static str, score: i32, hours_ago: u32, body: &'static str) -> Co
         score,
         hours_ago,
         replies: Vec::new(),
+        vote: Vote::None,
     }
 }
 
