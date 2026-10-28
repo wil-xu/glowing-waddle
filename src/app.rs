@@ -1,4 +1,5 @@
 use std::cmp::Reverse;
+use std::ops::Range;
 
 use ratatui::crossterm::event::KeyCode;
 use ratatui::crossterm::event::KeyEvent;
@@ -70,6 +71,8 @@ pub(crate) struct App {
     pub feed: Feed,
     pub mode: Mode,
     pub query: String,
+    /// `query` parsed; refreshed with `view` on every rebuild.
+    pub search: Query,
     pub status: Option<&'static str>,
     pub karma: u32,
     pub should_quit: bool,
@@ -83,6 +86,146 @@ fn hot(post: &Post) -> f64 {
 
 fn rising(post: &Post) -> f64 {
     f64::from(post.score) / (f64::from(post.hours_ago) + 2.0)
+}
+
+/// Lowercases `text` and turns each whitespace run into one space. Each folded
+/// char comes with the range of chars of `text` it stands for: one char, the
+/// whole whitespace run, or the char that lowercased into several.
+fn fold(text: &str) -> (Vec<char>, Vec<Range<usize>>) {
+    let mut folded = Vec::new();
+    let mut origin: Vec<Range<usize>> = Vec::new();
+    for (i, ch) in text.chars().enumerate() {
+        if ch.is_whitespace() {
+            match origin.last_mut() {
+                Some(run) if folded.last() == Some(&' ') && run.end == i => run.end = i + 1,
+                _ => {
+                    folded.push(' ');
+                    origin.push(i..i + 1);
+                }
+            }
+        } else {
+            for lower in ch.to_lowercase() {
+                folded.push(lower);
+                origin.push(i..i + 1);
+            }
+        }
+    }
+    (folded, origin)
+}
+
+fn folded(text: &str) -> String {
+    fold(text).0.into_iter().collect()
+}
+
+/// A parsed search query. Free-text terms must all match; filter values of the
+/// same kind are alternatives. Every string is stored folded (see `fold`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Query {
+    pub text: Vec<String>,
+    pub groups: Vec<String>,
+    pub authors: Vec<String>,
+    pub flairs: Vec<String>,
+}
+
+impl Query {
+    /// Splits on whitespace outside double quotes; an unclosed quote runs to
+    /// the end. An unquoted term starting with `w/`, `u/` or `flair:` (in any
+    /// case) is a filter on the rest of it. Terms and filter values that are
+    /// empty or only whitespace (`""`, `" "`, `w/`) are dropped; others keep
+    /// any leading or trailing space.
+    pub(crate) fn parse(input: &str) -> Query {
+        let mut terms: Vec<(String, bool)> = Vec::new();
+        let mut cur: Option<(String, bool)> = None;
+        let mut quoted = false;
+        for ch in input.chars() {
+            if ch.is_whitespace() && !quoted {
+                terms.extend(cur.take());
+                continue;
+            }
+            let (term, _) = cur.get_or_insert_with(|| (String::new(), ch == '"'));
+            if ch == '"' {
+                quoted = !quoted;
+            } else {
+                term.push(ch);
+            }
+        }
+        terms.extend(cur);
+
+        let mut query = Query::default();
+        for (term, starts_quoted) in terms {
+            let filter = [
+                ("w/", &mut query.groups),
+                ("u/", &mut query.authors),
+                ("flair:", &mut query.flairs),
+            ]
+            .into_iter()
+            .filter(|_| !starts_quoted)
+            .find(|(prefix, _)| {
+                term.get(..prefix.len())
+                    .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+            });
+            let (value, list) = match filter {
+                Some((prefix, list)) => (&term[prefix.len()..], list),
+                None => (term.as_str(), &mut query.text),
+            };
+            let value = folded(value);
+            if value.chars().any(|ch| ch != ' ') {
+                list.push(value);
+            }
+        }
+        query
+    }
+
+    /// True when nothing is left to filter by, as for a blank query.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.text.is_empty()
+            && self.groups.is_empty()
+            && self.authors.is_empty()
+            && self.flairs.is_empty()
+    }
+
+    pub(crate) fn matches(&self, post: &Post, group: &str) -> bool {
+        let starts_with = |values: &[String], field: Option<&str>| {
+            values.is_empty()
+                || field.is_some_and(|field| {
+                    let field = folded(field);
+                    values.iter().any(|v| field.starts_with(v.as_str()))
+                })
+        };
+        if !(starts_with(&self.groups, Some(group))
+            && starts_with(&self.authors, Some(post.author))
+            && starts_with(&self.flairs, post.flair))
+        {
+            return false;
+        }
+        if self.text.is_empty() {
+            return true;
+        }
+        let fields = [post.title, post.body, post.author, group].map(folded);
+        self.text
+            .iter()
+            .all(|term| fields.iter().any(|field| field.contains(term.as_str())))
+    }
+
+    /// For each char of `text`, whether it is part of an occurrence of a
+    /// free-text term. Overlapping occurrences simply mark the same chars.
+    pub(crate) fn highlights(&self, text: &str) -> Vec<bool> {
+        let mut marked = vec![false; text.chars().count()];
+        if self.text.is_empty() {
+            return marked;
+        }
+        let (folded, origin) = fold(text);
+        for term in &self.text {
+            let term: Vec<char> = term.chars().collect();
+            for start in 0..(folded.len() + 1).saturating_sub(term.len()) {
+                if folded[start..start + term.len()] == term[..] {
+                    let chars = origin[start].start..origin[start + term.len() - 1].end;
+                    marked[chars].fill(true);
+                }
+            }
+        }
+        marked
+    }
 }
 
 impl App {
@@ -101,6 +244,7 @@ impl App {
             feed: Feed::Home,
             mode: Mode::Feed,
             query: String::new(),
+            search: Query::default(),
             status: None,
             karma: 1_337,
             should_quit: false,
@@ -133,28 +277,14 @@ impl App {
         }
     }
 
-    fn matches_query(&self, post: &Post) -> bool {
-        if self.query.is_empty() {
-            return true;
-        }
-        let q = self.query.to_lowercase();
-        [
-            post.title,
-            post.body,
-            post.author,
-            self.groups[post.group].name,
-        ]
-        .iter()
-        .any(|field| field.to_lowercase().contains(&q))
-    }
-
     /// Rebuilds `view` and resets the selection to the top of the feed.
     fn refresh(&mut self) {
+        self.search = Query::parse(&self.query);
         let mut view: Vec<usize> = (0..self.posts.len())
             .filter(|&i| {
                 let post = &self.posts[i];
                 self.in_feed(post)
-                    && self.matches_query(post)
+                    && self.search.matches(post, self.groups[post.group].name)
                     && (self.sort != Sort::Rising || post.hours_ago < RISING_MAX_HOURS)
             })
             .collect();
@@ -755,5 +885,253 @@ mod tests {
                 Feed::Home
             ]
         );
+    }
+
+    #[test]
+    fn query_tokenizer() {
+        let q = Query::parse("  Dead \t CODE  ");
+        assert_eq!(q.text, ["dead", "code"], "whitespace runs split terms");
+        assert_eq!(
+            q,
+            Query {
+                text: vec!["dead".into(), "code".into()],
+                ..Query::default()
+            }
+        );
+
+        let q = Query::parse(r#"a "Dead   code" b"#);
+        assert_eq!(q.text, ["a", "dead code", "b"], "a phrase is one term");
+        assert_eq!(
+            Query::parse(r#"x "dead co"#).text,
+            ["x", "dead co"],
+            "an unclosed quote runs to the end"
+        );
+        assert_eq!(Query::parse(r#""" a """#).text, ["a"], "\"\" is ignored");
+
+        let q = Query::parse(r#"W/Eng u/Dana FLAIR:"looking for" Flair:win"#);
+        assert_eq!(q.groups, ["eng"]);
+        assert_eq!(q.authors, ["dana"]);
+        assert_eq!(q.flairs, ["looking for", "win"]);
+        assert!(q.text.is_empty(), "filters aren't free text: {q:?}");
+
+        let q = Query::parse(r#""w/eng" "U/x y""#);
+        assert_eq!(
+            q.text,
+            ["w/eng", "u/x y"],
+            "a quoted term is always free text"
+        );
+        assert!(q.groups.is_empty() && q.authors.is_empty());
+
+        assert_eq!(
+            Query::parse(r#"w/ u/ flair: flair:"" W/ FLAIR:"#),
+            Query::default(),
+            "filters with empty values are ignored"
+        );
+    }
+
+    fn search_sample() -> App {
+        let p = |group, author, flair, title, body| Post {
+            group,
+            author,
+            flair,
+            title,
+            body,
+            score: 100,
+            hours_ago: 1,
+            ..Default::default()
+        };
+        App::with_data(
+            vec![
+                group("Engineering", true),
+                group("OfficeLife", true),
+                group("OncallSurvivors", true),
+                group("Foodies", true),
+            ],
+            vec![
+                p(
+                    0,
+                    "dana_k",
+                    Some("Win"),
+                    "We deleted 40k lines of dead code",
+                    "The build got 30% faster.\nNext: tests.",
+                ),
+                p(
+                    1,
+                    "priya_r",
+                    Some("PSA"),
+                    "Espresso machine is fixed",
+                    "Facilities replaced the grinder.",
+                ),
+                p(
+                    2,
+                    "dana_k",
+                    None,
+                    "Paged at 3am",
+                    "A dashboard had a typo in its alert threshold.",
+                ),
+                p(
+                    3,
+                    "sam_o",
+                    Some("Looking for team"),
+                    "Pizza ranking",
+                    "Pineapple jalapeño was brave.",
+                ),
+            ],
+        )
+    }
+
+    const DEAD: &str = "We deleted 40k lines of dead code";
+    const ESPRESSO: &str = "Espresso machine is fixed";
+    const PAGED: &str = "Paged at 3am";
+    const PIZZA: &str = "Pizza ranking";
+
+    /// Types `query` live into a fresh `search_sample` and returns the titles.
+    fn searched(query: &str) -> Vec<&'static str> {
+        let mut app = search_sample();
+        assert_eq!(titles(&app), [DEAD, ESPRESSO, PAGED, PIZZA]);
+        press(&mut app, KeyCode::Char('/'));
+        press_str(&mut app, query);
+        assert_eq!(app.search, Query::parse(query), "parsed on every rebuild");
+        assert_eq!(app.selected, 0);
+        titles(&app)
+    }
+
+    #[test]
+    fn free_text_terms_and_together() {
+        assert_eq!(searched("dead faster"), [DEAD], "title and body words");
+        assert_eq!(searched("FASTER Dead"), [DEAD], "in any order and case");
+        assert_eq!(
+            searched("dead zebra"),
+            [] as [&str; 0],
+            "every term must match"
+        );
+        assert_eq!(searched("dana"), [DEAD, PAGED], "author is free text too");
+        assert_eq!(searched("engineering"), [DEAD], "and so is the group");
+        assert_eq!(
+            searched(r#""dead faster""#),
+            [] as [&str; 0],
+            "a phrase needs its words together"
+        );
+    }
+
+    #[test]
+    fn phrase_matches_across_newline_in_body() {
+        assert_eq!(searched(r#""faster. next""#), [DEAD]);
+        assert_eq!(
+            searched(r#""faster.   NEXT: tests"#),
+            [DEAD],
+            "unclosed, extra spaces"
+        );
+    }
+
+    #[test]
+    fn filters_match_prefixes_or_within_a_kind_and_across_kinds() {
+        assert_eq!(
+            searched("w/o"),
+            [ESPRESSO, PAGED],
+            "OfficeLife and OncallSurvivors"
+        );
+        assert_eq!(searched("W/ONCALL"), [PAGED]);
+        assert_eq!(searched("w/eng w/food"), [DEAD, PIZZA], "same kind ORs");
+        assert_eq!(searched("u/dana"), [DEAD, PAGED]);
+        assert_eq!(searched("w/eng u/dana"), [DEAD], "different kinds AND");
+        assert_eq!(searched("w/eng u/priya"), [] as [&str; 0]);
+        assert_eq!(searched("w/office facilities"), [ESPRESSO]);
+        assert_eq!(
+            searched("w/office dead"),
+            [] as [&str; 0],
+            "free text ANDs too"
+        );
+        assert_eq!(searched("w/engineer"), [DEAD]);
+        assert_eq!(
+            searched("w/ngineering"),
+            [] as [&str; 0],
+            "prefix, not substring"
+        );
+    }
+
+    #[test]
+    fn flair_filter_never_matches_posts_without_flair() {
+        assert_eq!(searched(r#"flair:"looking for""#), [PIZZA]);
+        assert_eq!(searched("flair:ps flair:WIN"), [DEAD, ESPRESSO]);
+        assert_eq!(searched("u/dana flair:w"), [DEAD], "PAGED has no flair");
+        assert_eq!(
+            searched("flair:team"),
+            [] as [&str; 0],
+            "prefix, not substring"
+        );
+    }
+
+    #[test]
+    fn blank_query_and_empty_filters_match_every_post() {
+        let all = [DEAD, ESPRESSO, PAGED, PIZZA];
+        for query in ["   ", "w/", "u/ flair:", r#"flair:"""#, r#""""#] {
+            assert_eq!(searched(query), all, "{query:?}");
+        }
+        let mut app = search_sample();
+        press_str(&mut app, "]]]]");
+        assert_eq!(app.feed, Feed::Group(0));
+        press(&mut app, KeyCode::Char('/'));
+        press_str(&mut app, "  ");
+        assert_eq!(titles(&app), [DEAD], "every post in the feed, not more");
+    }
+
+    #[test]
+    fn whitespace_only_phrases_are_ignored() {
+        assert_eq!(
+            Query::parse("\" \" \"   \" \"\t \" flair:\" \" w/\"  "),
+            Query::default(),
+            "a phrase or value of only whitespace is no term"
+        );
+        assert!(Query::parse("\"  \"").is_empty());
+        assert_eq!(
+            Query::parse("\"dead \"").text,
+            ["dead "],
+            "real text keeps its space"
+        );
+        assert_eq!(Query::parse("\" dead  \"").text, [" dead "]);
+
+        let all = [DEAD, ESPRESSO, PAGED, PIZZA];
+        assert_eq!(searched("\" \""), all);
+        assert_eq!(searched("\" \"   \"   \" w/"), all);
+        assert_eq!(searched("\"dead \""), [DEAD]);
+        assert_eq!(
+            searched("\"code \""),
+            [] as [&str; 0],
+            "the title ends in \"code\", with no space after it"
+        );
+        assert!(
+            !Query::parse("\" \"").highlights("a b  c").contains(&true),
+            "and nothing is highlighted"
+        );
+    }
+
+    #[test]
+    fn highlights_mark_chars_of_every_term() {
+        let marks = |query: &str, text: &str| -> String {
+            Query::parse(query)
+                .highlights(text)
+                .iter()
+                .map(|&m| if m { '^' } else { '.' })
+                .collect()
+        };
+        assert_eq!(marks("ANA", "Banana"), ".^^^^^", "overlapping occurrences");
+        assert_eq!(marks(r#"dead "ad co""#, "dead code"), "^^^^^^^..");
+        assert_eq!(marks("dead code", "dead  code"), "^^^^..^^^^");
+        assert_eq!(marks(r#""dead code""#, "dead \n code"), "^^^^^^^^^^^");
+        assert_eq!(
+            marks("w/dead u/dead", "dead"),
+            "....",
+            "filters aren't marked"
+        );
+        assert_eq!(marks("°f", "64°F!"), "..^^.");
+        assert_eq!(marks("jalapeño", "a jalapeño"), "..^^^^^^^^");
+        assert_eq!(
+            marks("İs", "xİstanbul"),
+            ".^^......",
+            "İ lowercases to 2 chars"
+        );
+        assert_eq!(marks("i̇ i", "İİ"), "^^");
+        assert_eq!(marks("x", ""), "");
     }
 }

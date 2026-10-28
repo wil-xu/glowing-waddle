@@ -80,8 +80,9 @@ The screen is a header (3 rows), a body, and a footer (1 row).
 
 - **Header:** the `◉ workit` logo on Reddit orange and a search box. The box
   shows a dimmed `Search <feed>` placeholder. While typing it shows the live
-  query with a cursor on a highlighted background. Once a search is kept, it
-  shows the query plus `(esc to clear)`. On the right are `u/you` and the karma.
+  query, raw as typed (quotes and filters included), with a cursor on a
+  highlighted background. Once a search is kept, it shows the query plus
+  `(esc to clear)`. On the right are `u/you` and the karma.
 - **Left nav** (`NAV_WIDTH = 22`): Home / Popular / All / Saved, then every
   group. `●` marks a joined group and `○` an unjoined one, and the mark flips
   as soon as you join or leave. The active feed is orange on a dark
@@ -106,7 +107,8 @@ The screen is a header (3 rows), a body, and a footer (1 row).
     bottom.
 - **Footer:** key hints, which change with the mode. There are separate sets
   for the feed, the feed with a kept search, search mode, and the post view.
-  The plain feed set adds `J join` on a group feed only. Every set must fit on
+  The plain feed set adds `J join` on a group feed only. The search set is
+  `type filter`, `w/ u/ flair: narrow`, `enter keep`, `esc clear`. Every set must fit on
   one line at 80 columns on every feed, so the feed set leaves out `j/k` and `c` (which the
   post view set still shows) and lists only `1-4` for sorting, not `Tab`. A
   status toast (green, `✔ …`) replaces the hints until the next key press.
@@ -135,6 +137,15 @@ preview rows, and 1 action row. Here is what goes on each row:
   with `…`.
 - **Action row:** `▤ N Comments   ↗ Share   ☆ Save   ···`. Save becomes an
   orange `★ Saved`.
+- **Search highlighting:** every occurrence of a free-text search term (see
+  Search) in the title and the two preview rows is drawn black on orange. The
+  title keeps its bold, and the original-case text is shown. Overlapping
+  matches merge into one run, a match that wraps highlights its part on each
+  row (the line break draws nothing), and when the preview is cut only the
+  visible part of a match is highlighted, never the `…`. The meta and action
+  rows aren't highlighted. Highlighting only restyles cells: wrapping,
+  `card_height` and scrolling are the same as without it, and with no
+  free-text terms a card renders exactly as it would with no query.
 
 **Scrolling:** `App.offset` is the index of the first card drawn, and the
 renderer maintains it. It never exceeds `selected`, and it advances until the
@@ -149,7 +160,10 @@ nothing saved. In that case the tab box stays, showing `0 posts`, and a
 centered, wrapped message replaces the cards:
 
 - With an active search: **"Hm... we couldn't find any results"** /
-  "Double-check your spelling, or press esc to clear the search".
+  "Double-check your spelling, or press esc to clear the search". A query
+  only counts when it has a free-text term or a filter. One with no effective
+  terms (`w/`, `   `, `" "`) can't be what emptied the feed, so the message is
+  chosen as if there were no query. The header still shows it.
 - In Saved, when no post is saved: **"No saved posts yet"** / "Press s on any
   post to save it".
 - Otherwise, including Saved when Rising hides every saved post: **"Nothing
@@ -170,6 +184,11 @@ as on Reddit's post page. It shows:
   trailing guide line.
 - "··· N more comments", where N is `comment_count` minus the comments in the
   seeded tree.
+
+Free-text search terms are highlighted in the title and body the same way as
+on the cards, whenever a query is set (so a post opened from a searched feed
+stays highlighted). The meta row and comments are not highlighted, and
+highlighting doesn't change the content height or the scroll clamping.
 
 The renderer clamps the scroll position to the content height and writes it
 back into `Mode::Post { scroll }`. So `G` followed by `k` moves right away,
@@ -213,7 +232,8 @@ enum Vote { Up, None /* default */, Down }
 | `sort: Sort` | `Hot`, `New`, `Top`, `Rising` |
 | `feed: Feed` | `Home`, `Popular`, `All`, `Saved`, `Group(usize)` |
 | `mode: Mode` | `Feed`, `Search`, `Post { scroll: u16 }` |
-| `query: String` | search text. Kept after leaving search mode with Enter |
+| `query: String` | search text, raw as typed. Kept after leaving search mode with Enter |
+| `search: Query` | `query` parsed into free-text terms and filters. Re-parsed on every rebuild of `view`, and used both to filter and to highlight |
 | `status: Option<&'static str>` | toast text. Every toast is a fixed string. Cleared on the next key press |
 | `karma: u32` | fixed at 1,337 (shown as `1.3k`). Votes don't change it |
 | `should_quit` | checked by the event loop in `main.rs` |
@@ -248,9 +268,44 @@ The unit tests rely on that for deterministic results.
 
 ### Search
 
-Search is a case-insensitive substring match over the title, body, author and
-group name. It combines with the current feed and sort, and the view updates
-on every keystroke.
+The query is parsed once per rebuild by `Query::parse` in `app.rs`, into
+`App.search`. The same `Query` filters the feed (`Query::matches`) and tells
+the renderer what to highlight (`Query::highlights`). It combines with the
+current feed and sort, and the view updates on every keystroke.
+
+- **Terms:** the query splits on whitespace, except inside double quotes.
+  `"dead code"` is one phrase term. An unclosed quote runs to the end of the
+  query, so typing `"dead co` already filters by `dead co`. A term that is
+  empty or only whitespace, such as `""` or `" "`, is ignored. A phrase with
+  real text keeps its leading or trailing space, so `"dead "` needs the
+  space after "dead". Quote characters are never part of a term.
+- **Filters:** an unquoted term starting with `w/`, `u/` or `flair:` (the
+  prefix in any case) is a filter. `w/<v>` keeps posts whose group name
+  starts with `<v>`, `u/<v>` those whose author does, and `flair:<v>` those
+  whose flair does (a post with no flair never matches). Values compare
+  case-insensitively and may be quoted: `flair:"looking for"`. A filter with
+  an empty or whitespace-only value (`w/`, `flair:""`, `flair:" "`) is
+  ignored, so typing `w/` doesn't empty the feed. A term that starts with a quote is always free text: `"w/eng"`
+  is a phrase.
+- **Combining:** filters of the same kind are ORed (`w/eng w/food`), and
+  different kinds are ANDed. Every free-text term must also match.
+- **Free text:** each term is a case-insensitive substring of the title,
+  body, author or group name. Whitespace runs count as one space, in both
+  the term and the text, so a phrase matches across a newline in a body.
+- **No terms:** a query with no effective terms (blank, spaces only, or only
+  ignored phrases and filters) matches every post in the feed, highlights
+  nothing, and doesn't count as a search for the empty-feed message.
+- **Folding:** matching works on chars, lowercased one char at a time, and
+  each folded char remembers which original chars it came from. That is how
+  `Query::highlights` maps a match back onto the original text, including
+  non-ASCII text like `jalapeño` or `°F` and chars that lowercase into
+  several (`İ`). Only free-text terms are highlighted, not filter values.
+- **Rendering:** `highlight_rows` in `ui.rs` walks the original text
+  alongside the rows `wrap` made from it. `wrap` only drops whitespace and
+  joins a row's words with one space, which stands for the whitespace run it
+  replaced. `preview` also says how many leading chars of each row are body
+  text, so the `…` of a cut row is never highlighted. A row with no match is
+  styled exactly as before.
 
 ### Selection behavior
 
@@ -300,7 +355,8 @@ acts on the feed, so you go back to the feed to join or leave.
 **Search mode:**
 
 - Every printable key, including `q`, `j`, `J` and digits, is typed into the
-  query.
+  query. Phrases and the `w/`, `u/` and `flair:` filters are described under
+  Search.
 - Backspace deletes a character.
 - Enter returns to the feed and keeps the filter.
 - Esc returns to the feed and clears it.
@@ -313,16 +369,17 @@ workit/
   Cargo.toml    edition 2024, depends on ratatui
   src/
     main.rs     ratatui::init()/restore() (restores the terminal on panic), event loop
-    app.rs      state, feeds, sorts, voting, saving, joining, search, key handling. No rendering
+    app.rs      state, feeds, sorts, voting, saving, joining, search (query parsing,
+                matching, highlight positions), key handling. No rendering
     data.rs     seed groups, posts, comments
     ui.rs       all rendering, including offset upkeep and post-view scroll clamping
 ```
 
 ## Testing
 
-31 unit tests, run with `cargo test`:
+49 unit tests, run with `cargo test`:
 
-- **`app.rs`** (19), on a small custom data set:
+- **`app.rs`** (27), on small custom data sets:
   - Home hides unjoined groups, and Popular hides low scores.
   - The exact order for each sort.
   - Feed cycling wraps in both directions, with Saved between All and the
@@ -339,7 +396,20 @@ workit/
   - Search: live filtering, typing `q` doesn't quit, Esc clears.
   - Esc in the feed never quits.
   - Opening and leaving the post view, and Enter in an empty feed.
-- **`ui.rs`** (12), rendering into a `TestBackend`:
+  - The query tokenizer: whitespace runs, phrases, an unclosed quote, `""`,
+    filter prefixes in mixed case, `flair:"looking for"`, a quoted `"w/eng"`
+    staying free text, and empty filter values being dropped.
+  - Free-text terms ANDing even when not adjacent (`dead faster`), and a
+    term that matches nothing emptying the feed.
+  - A phrase matching across a newline in a body.
+  - `w/` and `u/` prefix filters ORing within a kind and ANDing across kinds.
+  - `flair:` never matching a post without a flair.
+  - Blank queries and ignored filters matching every post in the feed.
+  - Whitespace-only phrases and filter values ignored (they match every post
+    and highlight nothing), while `"dead "` keeps its trailing space.
+  - `Query::highlights`: overlapping terms, whitespace runs, filters not
+    marked, non-ASCII text, and `İ` (which lowercases into two chars).
+- **`ui.rs`** (22), rendering into a `TestBackend`:
   - The helpers `compact`, `age`, `wrap` and `truncate`.
   - The frontpage contents.
   - Sidebars hidden at narrow widths.
@@ -353,7 +423,24 @@ workit/
   - `☆ Saved` right below `◎ All` in the nav, and Saved's sidebar.
   - The group sidebar button and nav mark flipping with `J`.
   - Every hint set (feed, kept search, search, post view) fitting in 80
-    columns on every feed, with `J join` only in the feed set on group feeds.
+    columns on every feed, with `J join` only in the feed set on group feeds,
+    and the exact search-mode set.
+  - Highlight cells: a title match black on orange and still bold, in the
+    original case, with its neighbors untouched, in a kept search too.
+  - A phrase wrapping across two title rows highlighted on both.
+  - Overlapping terms drawn as one run.
+  - `°f` on a card and `jalapeño` in the post view body highlighting exactly
+    their cells, while the comment mentioning it stays plain. `İ` in a post
+    and a query doesn't panic.
+  - A match cut by the preview's `…` highlighted only in its visible part.
+  - Filters alone rendering exactly, styles included, like no query, in the
+    feed and in the post view.
+  - Highlighting never changing the text on screen, the feed offset, or the
+    post-view scroll clamp.
+  - A whitespace-only phrase rendering like no query, with no highlights.
+  - The empty-feed message ignoring a query with no effective terms (`w/`,
+    spaces, `" "`), live and kept, in empty Saved and under Rising, while a
+    real filter that finds nothing still says "couldn't find any results".
 
 Lint with `arc f`, `arc lint` and `arc rust-clippy`. The `arc lint -e extra`
 engine isn't configured for `users/`.

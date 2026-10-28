@@ -17,6 +17,7 @@ use ratatui::widgets::Wrap;
 use crate::app::App;
 use crate::app::Feed;
 use crate::app::Mode;
+use crate::app::Query;
 use crate::app::Sort;
 use crate::data::Comment;
 use crate::data::Post;
@@ -236,7 +237,12 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             ("s", "save"),
             ("q", "quit"),
         ],
-        Mode::Search => &[("type", "filter"), ("enter", "keep"), ("esc", "clear")],
+        Mode::Search => &[
+            ("type", "filter"),
+            ("w/ u/ flair:", "narrow"),
+            ("enter", "keep"),
+            ("esc", "clear"),
+        ],
         Mode::Post { .. } => &[
             ("j/k", "scroll"),
             ("a/z", "vote"),
@@ -458,7 +464,10 @@ fn render_feed(frame: &mut Frame, app: &mut App, area: Rect) {
     );
 
     if app.view.is_empty() {
-        let (headline, hint) = if !app.query.is_empty() {
+        // A query that filters nothing (`w/`, `" "`) didn't empty the feed.
+        // This reads `query`, which the header shows, rather than trusting
+        // that `search` was refreshed; it only runs for an empty feed.
+        let (headline, hint) = if !Query::parse(&app.query).is_empty() {
             (
                 "Hm... we couldn't find any results",
                 "Double-check your spelling, or press esc to clear the search",
@@ -511,15 +520,85 @@ fn render_feed(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-fn preview(post: &Post, width: usize) -> Vec<String> {
+/// `wrap`'s rows, each made entirely of text.
+fn whole(rows: Vec<String>) -> Vec<(String, usize)> {
+    rows.into_iter()
+        .map(|row| {
+            let len = row.chars().count();
+            (row, len)
+        })
+        .collect()
+}
+
+/// The body with newlines flattened, wrapped, and cut to two rows with `…`.
+/// Each row comes with how many of its leading chars are body text: all of
+/// them, except in a cut row, which ends with the `…`.
+fn preview(post: &Post, width: usize) -> Vec<(String, usize)> {
     let flat = post.body.replace('\n', " ");
-    let mut lines = wrap(&flat, width);
+    let mut lines = whole(wrap(&flat, width));
     if lines.len() > PREVIEW_LINES {
         lines.truncate(PREVIEW_LINES);
-        let last = lines.last_mut().expect("should have PREVIEW_LINES lines");
+        let (last, len) = lines.last_mut().expect("should have PREVIEW_LINES lines");
         *last = truncate(&format!("{last} …"), width);
+        *len = (*len).min(width.saturating_sub(1));
     }
     lines
+}
+
+/// Styles `rows`, which `wrap` made from `text`, drawing the chars that
+/// `marked` (indexed by char of `text`) flags black on orange. Each row says
+/// how many of its leading chars come from `text`; the rest is never marked.
+/// A row with nothing marked comes out exactly as `Line::styled` would make it.
+fn highlight_rows(
+    text: &str,
+    marked: &[bool],
+    rows: Vec<(String, usize)>,
+    style: Style,
+) -> Vec<Line<'static>> {
+    let chars: Vec<char> = text.chars().collect();
+    let is_marked = |i: usize| marked.get(i).copied().unwrap_or(false);
+    // Walks `text` alongside the rows. `wrap` drops whitespace and joins the
+    // words of a row with one space, which stands for the run it replaced.
+    let mut cursor = 0;
+    rows.into_iter()
+        .map(|(row, from_text)| {
+            let flags: Vec<bool> = row
+                .chars()
+                .enumerate()
+                .map(|(n, ch)| {
+                    if n >= from_text {
+                        false
+                    } else if ch.is_whitespace() {
+                        is_marked(cursor)
+                    } else {
+                        while chars.get(cursor).is_some_and(|c| c.is_whitespace()) {
+                            cursor += 1;
+                        }
+                        cursor += 1;
+                        is_marked(cursor - 1)
+                    }
+                })
+                .collect();
+            if !flags.contains(&true) {
+                return Line::styled(row, style);
+            }
+            let hit = Style::new().fg(Color::Black).bg(ORANGE);
+            let mut spans: Vec<Span> = Vec::new();
+            let mut run = String::new();
+            for (n, ch) in row.chars().enumerate() {
+                run.push(ch);
+                if flags.get(n + 1) != Some(&flags[n]) {
+                    let run = std::mem::take(&mut run);
+                    spans.push(if flags[n] {
+                        Span::styled(run, hit)
+                    } else {
+                        Span::raw(run)
+                    });
+                }
+            }
+            Line::from(spans).style(style)
+        })
+        .collect()
 }
 
 fn card_height(post: &Post, width: usize) -> u16 {
@@ -628,16 +707,18 @@ fn render_card(frame: &mut Frame, app: &App, post: &Post, area: Rect, selected: 
     let width = usize::from(content.width.saturating_sub(2));
     let title_style = Style::new().fg(Color::White).bold();
     let lines: Vec<Line> = std::iter::once(meta_line(app, post, width))
-        .chain(
-            wrap(post.title, width)
-                .into_iter()
-                .map(|l| Line::styled(l, title_style)),
-        )
-        .chain(
-            preview(post, width)
-                .into_iter()
-                .map(|l| Line::styled(l, Style::new().fg(Color::Gray))),
-        )
+        .chain(highlight_rows(
+            post.title,
+            &app.search.highlights(post.title),
+            whole(wrap(post.title, width)),
+            title_style,
+        ))
+        .chain(highlight_rows(
+            post.body,
+            &app.search.highlights(post.body),
+            preview(post, width),
+            Style::new().fg(Color::Gray),
+        ))
         .chain(std::iter::once(actions_line(post)))
         .collect();
     frame.render_widget(
@@ -694,13 +775,19 @@ fn render_post(frame: &mut Frame, app: &mut App, area: Rect, scroll: u16) {
 
     let color = vote_color(post.vote);
     let mut lines: Vec<Line> = vec![meta_line(app, post, width), Line::raw("")];
-    lines.extend(
-        wrap(post.title, width)
-            .into_iter()
-            .map(|l| Line::styled(l, Style::new().fg(Color::White).bold())),
-    );
+    lines.extend(highlight_rows(
+        post.title,
+        &app.search.highlights(post.title),
+        whole(wrap(post.title, width)),
+        Style::new().fg(Color::White).bold(),
+    ));
     lines.push(Line::raw(""));
-    lines.extend(wrap(post.body, width).into_iter().map(Line::raw));
+    lines.extend(highlight_rows(
+        post.body,
+        &app.search.highlights(post.body),
+        whole(wrap(post.body, width)),
+        Style::default(),
+    ));
     lines.push(Line::raw(""));
     let mut action = actions_line(post);
     action.spans.splice(
@@ -763,23 +850,34 @@ fn render_post(frame: &mut Frame, app: &mut App, area: Rect, scroll: u16) {
 mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
     use ratatui::crossterm::event::KeyCode;
     use ratatui::crossterm::event::KeyEvent;
     use ratatui::crossterm::event::KeyModifiers;
 
     use super::*;
 
-    fn screen(app: &mut App, width: u16, height: u16) -> String {
+    fn buffer(app: &mut App, width: u16, height: u16) -> Buffer {
         let mut terminal =
             Terminal::new(TestBackend::new(width, height)).expect("test backend is infallible");
         terminal
             .draw(|f| render(f, app))
             .expect("test backend is infallible");
-        let buf = terminal.backend().buffer();
-        (0..height)
-            .map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect::<String>())
-            .collect::<Vec<_>>()
-            .join("\n")
+        terminal.backend().buffer().clone()
+    }
+
+    fn rows(buf: &Buffer) -> Vec<String> {
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn screen(app: &mut App, width: u16, height: u16) -> String {
+        rows(&buffer(app, width, height)).join("\n")
     }
 
     #[test]
@@ -1066,6 +1164,10 @@ mod tests {
             press(&mut app, KeyCode::Char('e'));
             let search = footer(&mut app);
             assert!(search.ends_with("esc clear"), "{feed:?}: {search:?}");
+            assert_eq!(
+                search, " type filter  w/ u/ flair: narrow  enter keep  esc clear",
+                "{feed:?}"
+            );
 
             press(&mut app, KeyCode::Enter);
             let kept = footer(&mut app);
@@ -1084,5 +1186,306 @@ mod tests {
             press(&mut app, KeyCode::Char(']'));
         }
         assert_eq!(app.feed, Feed::Home, "visited every feed");
+    }
+
+    fn type_str(app: &mut App, text: &str) {
+        text.chars().for_each(|ch| press(app, KeyCode::Char(ch)));
+    }
+
+    /// The seed app with its posts swapped for one Engineering post, on Home.
+    fn one_post(title: &'static str, body: &'static str) -> App {
+        let mut app = App::new();
+        app.posts = vec![Post {
+            group: 0,
+            author: "dana_k",
+            title,
+            body,
+            score: 10,
+            hours_ago: 1,
+            ..Default::default()
+        }];
+        press(&mut app, KeyCode::Char('1'));
+        assert_eq!(app.view, [0]);
+        app
+    }
+
+    /// Every (x, y) where `needle` starts, in reading order. All glyphs here
+    /// are one cell wide, so a char index is a column.
+    fn find_all(buf: &Buffer, needle: &str) -> Vec<(u16, u16)> {
+        rows(buf)
+            .iter()
+            .enumerate()
+            .flat_map(|(y, row)| {
+                row.match_indices(needle)
+                    .map(|(at, _)| (row[..at].chars().count() as u16, y as u16))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn find(buf: &Buffer, needle: &str) -> (u16, u16) {
+        *find_all(buf, needle)
+            .first()
+            .unwrap_or_else(|| panic!("missing {needle:?} in:\n{}", rows(buf).join("\n")))
+    }
+
+    fn is_hit(buf: &Buffer, x: u16, y: u16) -> bool {
+        let cell = &buf[(x, y)];
+        cell.fg == Color::Black && cell.bg == ORANGE
+    }
+
+    /// One char per cell from `x` for `n` cells: `^` highlighted, `.` not.
+    fn hits(buf: &Buffer, x: u16, y: u16, n: u16) -> String {
+        (x..x + n)
+            .map(|x| if is_hit(buf, x, y) { '^' } else { '.' })
+            .collect()
+    }
+
+    #[test]
+    fn title_match_is_black_on_orange_bold_in_original_case() {
+        let mut app = one_post("Old huge post", "Nothing to see.");
+        press(&mut app, KeyCode::Char('/'));
+        type_str(&mut app, "HUGE");
+        let buf = buffer(&mut app, 60, 20);
+        let (x, y) = find(&buf, "Old huge post");
+        assert_eq!(hits(&buf, x, y, 13), "....^^^^.....", "case is preserved");
+        for dx in 0..13 {
+            let cell = &buf[(x + dx, y)];
+            assert!(cell.modifier.contains(Modifier::BOLD), "title stays bold");
+            if !is_hit(&buf, x + dx, y) {
+                assert_eq!((cell.fg, cell.bg), (Color::White, Color::Reset));
+            }
+        }
+        assert!(
+            find_all(&buf, "HUGE").len() == 1,
+            "the header shows the raw query"
+        );
+
+        press(&mut app, KeyCode::Enter);
+        let kept = buffer(&mut app, 60, 20);
+        assert_eq!(hits(&kept, x, y, 13), "....^^^^.....", "kept search");
+    }
+
+    #[test]
+    fn phrase_wrapping_across_title_lines_is_highlighted_on_both() {
+        // 30 columns leave 20 for the card text: "aaaa bbbb cccc dddd" / "eeee".
+        let mut app = one_post("aaaa bbbb cccc dddd eeee", "");
+        press(&mut app, KeyCode::Char('/'));
+        type_str(&mut app, r#""dddd   eeee""#);
+        assert_eq!(app.view, [0]);
+        let buf = buffer(&mut app, 30, 20);
+        let (x, y) = find(&buf, "aaaa bbbb cccc dddd");
+        assert_eq!(
+            hits(&buf, x, y, 20),
+            "...............^^^^.",
+            "no hit past the break"
+        );
+        assert_eq!(find(&buf, "eeee"), (x, y + 1));
+        assert_eq!(hits(&buf, x, y + 1, 5), "^^^^.");
+    }
+
+    #[test]
+    fn overlapping_terms_make_one_run() {
+        let mut app = one_post("dead code here", "");
+        press(&mut app, KeyCode::Char('/'));
+        type_str(&mut app, r#"dead "ad co" code"#);
+        let buf = buffer(&mut app, 60, 20);
+        let (x, y) = find(&buf, "dead code here");
+        assert_eq!(hits(&buf, x, y, 15), "^^^^^^^^^......");
+
+        let lines = highlight_rows(
+            "dead code here",
+            &app.search.highlights("dead code here"),
+            whole(vec!["dead code here".to_owned()]),
+            Style::new(),
+        );
+        let spans: Vec<&str> = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(spans, ["dead code", " here"], "drawn once, as one run");
+    }
+
+    #[test]
+    fn non_ascii_matches_highlight_exact_cells() {
+        let mut app = App::new();
+        press(&mut app, KeyCode::Char('/'));
+        type_str(&mut app, "°f");
+        let buf = buffer(&mut app, 110, 24);
+        let (x, y) = find(&buf, "64°F");
+        assert_eq!(hits(&buf, x, y, 5), "..^^.");
+
+        // In the post view the body match lights up; the comment's doesn't.
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('/'));
+        type_str(&mut app, "JALAPEÑO");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        let buf = buffer(&mut app, 110, 60);
+        let found = find_all(&buf, "jalapeño");
+        assert!(found.len() >= 2, "body and a comment: {found:?}");
+        let (x, y) = found[0];
+        assert_eq!(hits(&buf, x - 1, y, 10), ".^^^^^^^^.");
+        let (x, y) = found[found.len() - 1];
+        assert_eq!(
+            hits(&buf, x, y, 8),
+            "........",
+            "comments aren't highlighted"
+        );
+    }
+
+    #[test]
+    fn lowercase_expanding_chars_dont_panic() {
+        let mut app = one_post("İstanbul İİ office", "İ\nİİ İstanbul İ");
+        press(&mut app, KeyCode::Char('/'));
+        type_str(&mut app, "İ i̇s");
+        let buf = buffer(&mut app, 60, 20);
+        let (x, y) = find(&buf, "İstanbul İİ office");
+        assert_eq!(hits(&buf, x, y, 18), "^^.......^^.......");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        buffer(&mut app, 60, 20);
+        buffer(&mut app, 12, 20);
+    }
+
+    #[test]
+    fn match_cut_by_preview_ellipsis_highlights_only_visible_part() {
+        // 20 columns: "one two three four" / "five six seven eigh…", "nine ten" cut.
+        let mut app = one_post("Title", "one two three four five six seven eight nine ten");
+        press(&mut app, KeyCode::Char('/'));
+        type_str(&mut app, "eight ten");
+        assert_eq!(app.view, [0], "ten is past the cut but still matches");
+        let buf = buffer(&mut app, 30, 20);
+        let (x, y) = find(&buf, "five six seven eigh…");
+        assert_eq!(hits(&buf, x, y, 21), "...............^^^^..");
+        assert_eq!(
+            buf[(x + 19, y)].fg,
+            Color::Gray,
+            "the … keeps the preview style"
+        );
+
+        // " …" appended to a shorter row: neither the space nor `…` is marked.
+        let mut app = one_post("Title", "one two three four five six seven xxxxxxxxxx");
+        press(&mut app, KeyCode::Char('/'));
+        type_str(&mut app, r#""seven xxx""#);
+        let buf = buffer(&mut app, 30, 20);
+        let (x, y) = find(&buf, "five six seven …");
+        assert_eq!(hits(&buf, x, y, 17), ".........^^^^^...");
+    }
+
+    #[test]
+    fn filters_alone_render_exactly_like_no_query() {
+        let mut app = App::new();
+        type_str(&mut app, "]]]]");
+        assert_eq!(app.feed, Feed::Group(0));
+        let view = app.view.clone();
+        let plain_feed = buffer(&mut app, 110, 24);
+        press(&mut app, KeyCode::Enter);
+        let plain_post = buffer(&mut app, 110, 24);
+        press(&mut app, KeyCode::Esc);
+
+        press(&mut app, KeyCode::Char('/'));
+        type_str(&mut app, "W/eng u/ flair:");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.view, view, "every Engineering post still matches");
+        let filtered_feed = buffer(&mut app, 110, 24);
+        press(&mut app, KeyCode::Enter);
+        let filtered_post = buffer(&mut app, 110, 24);
+
+        // Everything between the header (search box) and the footer (hints).
+        for (plain, filtered) in [(plain_feed, filtered_feed), (plain_post, filtered_post)] {
+            for y in 3..23 {
+                for x in 0..110 {
+                    assert_eq!(plain[(x, y)], filtered[(x, y)], "cell ({x}, {y})");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn highlighting_never_changes_layout() {
+        let mut app = App::new();
+        press(&mut app, KeyCode::Char('/'));
+        type_str(&mut app, "the");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('G'));
+        let lit = buffer(&mut app, 110, 24);
+        let offset = app.offset;
+        assert!(offset > 0, "should have scrolled");
+        let search = std::mem::take(&mut app.search);
+        let unlit = buffer(&mut app, 110, 24);
+        assert_eq!(rows(&lit), rows(&unlit));
+        assert_eq!(app.offset, offset);
+        assert_ne!(lit, unlit, "only the styles differ");
+
+        app.search = search;
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('G'));
+        let lit = buffer(&mut app, 110, 24);
+        let mode = app.mode;
+        app.search = Default::default();
+        let unlit = buffer(&mut app, 110, 24);
+        assert_eq!(rows(&lit), rows(&unlit));
+        assert_eq!(app.mode, mode, "same scroll clamp");
+    }
+
+    #[test]
+    fn whitespace_only_phrase_draws_no_highlights() {
+        let mut plain = one_post("dead code here", "some body text");
+        let expected = buffer(&mut plain, 60, 20);
+        let mut app = one_post("dead code here", "some body text");
+        press(&mut app, KeyCode::Char('/'));
+        type_str(&mut app, r#"" " "   "#);
+        assert_eq!(app.view, [0], "the post still matches");
+        assert!(app.search.is_empty());
+        let buf = buffer(&mut app, 60, 20);
+        let (x, y) = find(&buf, "dead code here");
+        assert_eq!(hits(&buf, x, y, 14), "..............");
+        for y in 3..19 {
+            for x in 0..60 {
+                assert_eq!(buf[(x, y)], expected[(x, y)], "cell ({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
+    fn empty_feed_message_ignores_query_without_terms() {
+        let mut app = App::new();
+        type_str(&mut app, "]]]");
+        assert_eq!(app.feed, Feed::Saved);
+        for query in ["w/", "   ", r#"" ""#, "u/ flair:"] {
+            press(&mut app, KeyCode::Char('/'));
+            type_str(&mut app, query);
+            assert!(app.view.is_empty(), "nothing is saved");
+            let s = screen(&mut app, 110, 24);
+            assert!(s.contains("No saved posts yet"), "{query:?}:\n{s}");
+            assert!(!s.contains("couldn't find any results"), "{query:?}");
+            press(&mut app, KeyCode::Enter);
+            let s = screen(&mut app, 110, 24);
+            assert!(s.contains("No saved posts yet"), "kept {query:?}:\n{s}");
+            press(&mut app, KeyCode::Esc);
+        }
+
+        press(&mut app, KeyCode::Char('/'));
+        type_str(&mut app, "w/eng");
+        let s = screen(&mut app, 110, 24);
+        assert!(
+            s.contains("couldn't find any results"),
+            "a real filter:\n{s}"
+        );
+        assert!(!s.contains("No saved posts yet"));
+        press(&mut app, KeyCode::Esc);
+
+        // Rising hides the only saved post; `w/` doesn't change the reason.
+        let old = app
+            .posts
+            .iter()
+            .position(|p| p.hours_ago >= 24)
+            .expect("seed data has posts a day old");
+        app.posts[old].saved = true;
+        press(&mut app, KeyCode::Char('4'));
+        press(&mut app, KeyCode::Char('/'));
+        type_str(&mut app, "w/");
+        assert!(app.view.is_empty());
+        let s = screen(&mut app, 110, 24);
+        assert!(s.contains("Nothing here yet"), "{s}");
+        assert!(!s.contains("couldn't find any results"));
     }
 }
