@@ -1,4 +1,5 @@
 use std::cmp::Reverse;
+use std::collections::HashSet;
 use std::ops::Range;
 
 use ratatui::crossterm::event::KeyCode;
@@ -6,6 +7,7 @@ use ratatui::crossterm::event::KeyEvent;
 use ratatui::crossterm::event::KeyModifiers;
 
 use crate::data;
+use crate::data::Comment;
 use crate::data::Group;
 use crate::data::Post;
 use crate::data::Vote;
@@ -59,6 +61,125 @@ pub(crate) enum Mode {
     Post { scroll: u16 },
 }
 
+/// A comment's position in a post's tree: its index among the top-level
+/// comments, then among that comment's replies, and so on. The tree never
+/// changes, so a path always names the same comment.
+pub(crate) type CommentPath = Vec<usize>;
+
+/// The open post's comment state. Reset whenever a post is opened.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Thread {
+    pub focus: Option<CommentPath>,
+    pub collapsed: HashSet<CommentPath>,
+    /// Set when `focus` moves. The renderer scrolls the focused comment into
+    /// view once and clears it, so scrolling afterwards is free.
+    pub reveal: bool,
+}
+
+/// A comment that isn't hidden under a collapsed ancestor.
+pub(crate) struct Shown<'a> {
+    pub path: CommentPath,
+    pub comment: &'a Comment,
+    pub collapsed: bool,
+}
+
+impl Shown<'_> {
+    pub(crate) fn depth(&self) -> usize {
+        self.path.len() - 1
+    }
+}
+
+impl Thread {
+    /// The comments of `comments` not hidden by a collapsed ancestor, in
+    /// display order: a comment, then its replies, then its next sibling.
+    /// This is the only walk over the tree; moving the focus and rendering
+    /// both use it.
+    pub(crate) fn visible<'a>(&self, comments: &'a [Comment]) -> Vec<Shown<'a>> {
+        fn walk<'a>(
+            thread: &Thread,
+            comments: &'a [Comment],
+            parent: &[usize],
+            out: &mut Vec<Shown<'a>>,
+        ) {
+            for (i, comment) in comments.iter().enumerate() {
+                let path = [parent, &[i]].concat();
+                let collapsed = thread.collapsed.contains(&path);
+                out.push(Shown {
+                    path: path.clone(),
+                    comment,
+                    collapsed,
+                });
+                if !collapsed {
+                    walk(thread, &comment.replies, &path, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(self, comments, &[], &mut out);
+        out
+    }
+
+    /// Moves the focus to the next (or previous) visible comment, stopping at
+    /// the ends. With no focus, only forward picks the first comment.
+    fn step(&mut self, comments: &[Comment], forward: bool) {
+        let shown = self.visible(comments);
+        let at = match &self.focus {
+            None if forward => 0,
+            None => return,
+            Some(focus) => {
+                let at = shown
+                    .iter()
+                    .position(|s| &s.path == focus)
+                    .expect("the focused comment should always be visible");
+                if forward {
+                    at + 1
+                } else if at == 0 {
+                    return;
+                } else {
+                    at - 1
+                }
+            }
+        };
+        if let Some(next) = shown.into_iter().nth(at) {
+            self.focus = Some(next.path);
+            self.reveal = true;
+        }
+    }
+
+    fn toggle_collapse(&mut self) {
+        let Some(focus) = &self.focus else {
+            return;
+        };
+        if !self.collapsed.remove(focus) {
+            self.collapsed.insert(focus.clone());
+        }
+    }
+}
+
+/// The comment at `path` in `comments` (see `CommentPath`).
+fn comment_mut<'a>(comments: &'a mut [Comment], path: &[usize]) -> Option<&'a mut Comment> {
+    let (&first, rest) = path.split_first()?;
+    let comment = comments.get_mut(first)?;
+    if rest.is_empty() {
+        Some(comment)
+    } else {
+        comment_mut(&mut comment.replies, rest)
+    }
+}
+
+/// Applies `vote` to a post's or comment's `current` vote and `score`: ±1, or
+/// ±2 when flipping, and repeating a vote clears it.
+fn cast(current: &mut Vote, score: &mut i32, vote: Vote) {
+    let value = |v: Vote| match v {
+        Vote::Up => 1,
+        Vote::None => 0,
+        Vote::Down => -1,
+    };
+    let new = if *current == vote { Vote::None } else { vote };
+    *score += value(new) - value(*current);
+    *current = new;
+}
+
 pub(crate) struct App {
     pub groups: Vec<Group>,
     pub posts: Vec<Post>,
@@ -73,6 +194,8 @@ pub(crate) struct App {
     pub query: String,
     /// `query` parsed; refreshed with `view` on every rebuild.
     pub search: Query,
+    /// Comment focus and collapse state of the open post.
+    pub thread: Thread,
     pub status: Option<&'static str>,
     pub karma: u32,
     pub should_quit: bool,
@@ -245,6 +368,7 @@ impl App {
             mode: Mode::Feed,
             query: String::new(),
             search: Query::default(),
+            thread: Thread::default(),
             status: None,
             karma: 1_337,
             should_quit: false,
@@ -341,14 +465,30 @@ impl App {
             return;
         };
         let post = &mut self.posts[i];
-        let value = |v: Vote| match v {
-            Vote::Up => 1,
-            Vote::None => 0,
-            Vote::Down => -1,
+        cast(&mut post.vote, &mut post.score, vote);
+    }
+
+    /// Votes on the open post's comment at `path`. Comments are never
+    /// reordered.
+    fn vote_comment(&mut self, path: &[usize], vote: Vote) {
+        let Some(&i) = self.view.get(self.selected) else {
+            return;
         };
-        let new = if post.vote == vote { Vote::None } else { vote };
-        post.score += value(new) - value(post.vote);
-        post.vote = new;
+        if let Some(comment) = comment_mut(&mut self.posts[i].comments, path) {
+            cast(&mut comment.vote, &mut comment.score, vote);
+        }
+    }
+
+    fn open_post(&mut self) {
+        self.thread = Thread::default();
+        self.mode = Mode::Post { scroll: 0 };
+    }
+
+    fn step_focus(&mut self, forward: bool) {
+        let Some(&i) = self.view.get(self.selected) else {
+            return;
+        };
+        self.thread.step(&self.posts[i].comments, forward);
     }
 
     fn toggle_save(&mut self) {
@@ -411,7 +551,7 @@ impl App {
             KeyCode::Char('s') => self.toggle_save(),
             KeyCode::Char('J') => self.toggle_join(),
             KeyCode::Char('c') => self.status = Some("Link copied to clipboard!"),
-            KeyCode::Enter if !self.view.is_empty() => self.mode = Mode::Post { scroll: 0 },
+            KeyCode::Enter if !self.view.is_empty() => self.open_post(),
             KeyCode::Char(ch @ '1'..='4') => self.set_sort(Sort::ALL[usize::from(ch as u8 - b'1')]),
             KeyCode::Tab => self.set_sort(self.sort.next()),
             KeyCode::Char(']') => self.cycle_feed(true),
@@ -442,9 +582,15 @@ impl App {
     }
 
     /// The renderer clamps `scroll` to the content height, so scrolling past
-    /// the end here is harmless.
+    /// the end here is harmless. It also scrolls a newly focused comment into
+    /// view.
     fn on_post_key(&mut self, code: KeyCode, scroll: u16) {
+        let focus = self.thread.focus.clone();
         let scroll = match code {
+            KeyCode::Esc if focus.is_some() => {
+                self.thread.focus = None;
+                scroll
+            }
             KeyCode::Char('q') | KeyCode::Esc | KeyCode::Backspace => {
                 self.mode = Mode::Feed;
                 return;
@@ -455,12 +601,24 @@ impl App {
             KeyCode::PageUp => scroll.saturating_sub(10),
             KeyCode::Char('g') | KeyCode::Home => 0,
             KeyCode::Char('G') | KeyCode::End => u16::MAX,
-            KeyCode::Char('a') => {
-                self.vote(Vote::Up);
+            KeyCode::Char('n') => {
+                self.step_focus(true);
                 scroll
             }
-            KeyCode::Char('z') => {
-                self.vote(Vote::Down);
+            KeyCode::Char('p') => {
+                self.step_focus(false);
+                scroll
+            }
+            KeyCode::Enter => {
+                self.thread.toggle_collapse();
+                scroll
+            }
+            KeyCode::Char(key @ ('a' | 'z')) => {
+                let vote = if key == 'a' { Vote::Up } else { Vote::Down };
+                match focus {
+                    Some(path) => self.vote_comment(&path, vote),
+                    None => self.vote(vote),
+                }
                 scroll
             }
             KeyCode::Char('s') => {
@@ -1133,5 +1291,230 @@ mod tests {
         );
         assert_eq!(marks("i̇ i", "İİ"), "^^");
         assert_eq!(marks("x", ""), "");
+    }
+
+    /// One post whose comments, in display order, are a, b, c, d, e, f, g:
+    ///
+    /// ```text
+    /// a
+    /// │ b
+    /// │ │ c
+    /// │ │ │ d
+    /// │ e
+    /// f
+    /// │ g
+    /// ```
+    fn thread_sample() -> App {
+        let c = |author, score| data::c(author, score, 1, "");
+        let mut thread = post(0, 50, 1, "thread");
+        thread.comments = vec![
+            c("a", 10).with(vec![
+                c("b", 20).with(vec![c("c", 30).with(vec![c("d", 40)])]),
+                c("e", 50),
+            ]),
+            c("f", 60).with(vec![c("g", 70)]),
+        ];
+        App::with_data(vec![group("Joined", true)], vec![thread])
+    }
+
+    fn focused(app: &App) -> Option<&'static str> {
+        let focus = app.thread.focus.as_ref()?;
+        let comments = &app.posts[app.view[app.selected]].comments;
+        let shown = app.thread.visible(comments);
+        Some(shown.iter().find(|s| &s.path == focus)?.comment.author)
+    }
+
+    fn visible_authors(app: &App) -> Vec<&'static str> {
+        let comments = &app.posts[app.view[app.selected]].comments;
+        app.thread
+            .visible(comments)
+            .iter()
+            .map(|s| s.comment.author)
+            .collect()
+    }
+
+    #[test]
+    fn comment_keys_on_post_without_comments_do_nothing() {
+        let mut app = sample();
+        press(&mut app, KeyCode::Enter);
+        assert!(app.posts[app.view[0]].comments.is_empty());
+        for key in [KeyCode::Char('n'), KeyCode::Char('p'), KeyCode::Enter] {
+            press(&mut app, key);
+            assert_eq!(app.thread, Thread::default(), "{key:?}");
+            assert_eq!(app.mode, Mode::Post { scroll: 0 });
+        }
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(
+            app.posts[app.view[0]].vote,
+            Vote::Up,
+            "a still votes the post"
+        );
+    }
+
+    #[test]
+    fn focus_walks_comments_in_pre_order_and_stops_at_both_ends() {
+        let mut app = thread_sample();
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(focused(&app), None, "nothing is focused on open");
+        press(&mut app, KeyCode::Char('p'));
+        assert_eq!(focused(&app), None, "p with no focus does nothing");
+        assert!(!app.thread.reveal);
+
+        let mut order = Vec::new();
+        for _ in 0..7 {
+            press(&mut app, KeyCode::Char('n'));
+            assert!(app.thread.reveal, "moving the focus asks for a reveal");
+            app.thread.reveal = false;
+            order.extend(focused(&app));
+        }
+        assert_eq!(order, ["a", "b", "c", "d", "e", "f", "g"]);
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(focused(&app), Some("g"), "n stops at the last comment");
+        assert!(!app.thread.reveal, "and doesn't count as a move");
+
+        let mut order = Vec::new();
+        for _ in 0..6 {
+            press(&mut app, KeyCode::Char('p'));
+            order.extend(focused(&app));
+        }
+        assert_eq!(order, ["f", "e", "d", "c", "b", "a"]);
+        app.thread.reveal = false;
+        press(&mut app, KeyCode::Char('p'));
+        assert_eq!(focused(&app), Some("a"), "p stops at the first comment");
+        assert!(!app.thread.reveal);
+        assert_eq!(app.mode, Mode::Post { scroll: 0 });
+    }
+
+    #[test]
+    fn focus_skips_collapsed_replies_and_each_comment_keeps_its_state() {
+        let mut app = thread_sample();
+        press(&mut app, KeyCode::Enter);
+        press_str(&mut app, "nn");
+        assert_eq!(focused(&app), Some("b"));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            focused(&app),
+            Some("b"),
+            "focus stays on a collapsed comment"
+        );
+        assert_eq!(visible_authors(&app), ["a", "b", "e", "f", "g"]);
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(focused(&app), Some("e"), "c and d are skipped");
+        press(&mut app, KeyCode::Char('p'));
+        assert_eq!(focused(&app), Some("b"));
+
+        press(&mut app, KeyCode::Char('p'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(visible_authors(&app), ["a", "f", "g"]);
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(focused(&app), Some("f"), "everything under a is skipped");
+        press(&mut app, KeyCode::Char('p'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            visible_authors(&app),
+            ["a", "b", "e", "f", "g"],
+            "b is still collapsed after expanding a"
+        );
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(focused(&app), Some("b"));
+        assert_eq!(visible_authors(&app), ["a", "b", "c", "d", "e", "f", "g"]);
+    }
+
+    #[test]
+    fn comment_votes_toggle_and_flip_without_touching_the_post() {
+        let mut app = thread_sample();
+        press(&mut app, KeyCode::Enter);
+        press_str(&mut app, "nnn");
+        assert_eq!(focused(&app), Some("c"));
+        let comment = |app: &App| {
+            let c = &app.posts[0].comments[0].replies[0].replies[0];
+            (c.score, c.vote)
+        };
+        let order = visible_authors(&app);
+
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(comment(&app), (31, Vote::Up));
+        press(&mut app, KeyCode::Char('z'));
+        assert_eq!(comment(&app), (29, Vote::Down), "flipping is -2");
+        press(&mut app, KeyCode::Char('z'));
+        assert_eq!(comment(&app), (30, Vote::None), "repeating clears it");
+        press(&mut app, KeyCode::Char('z'));
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(comment(&app), (31, Vote::Up), "flipping is +2");
+
+        assert_eq!((app.posts[0].score, app.posts[0].vote), (50, Vote::None));
+        assert_eq!(visible_authors(&app), order, "votes never reorder comments");
+        assert_eq!(app.posts[0].comments[0].replies[1].vote, Vote::None);
+    }
+
+    #[test]
+    fn comment_votes_survive_reopening_but_focus_and_collapse_reset() {
+        let mut app = thread_sample();
+        press(&mut app, KeyCode::Enter);
+        press_str(&mut app, "na");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(visible_authors(&app), ["a", "f", "g"]);
+        press(&mut app, KeyCode::Char('q'));
+        assert_eq!(app.mode, Mode::Feed);
+
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.thread, Thread::default(), "focus and collapse reset");
+        assert_eq!(visible_authors(&app), ["a", "b", "c", "d", "e", "f", "g"]);
+        let a = &app.posts[0].comments[0];
+        assert_eq!((a.score, a.vote), (11, Vote::Up), "the vote is kept");
+    }
+
+    #[test]
+    fn esc_unfocuses_before_leaving_and_q_leaves_directly() {
+        let mut app = thread_sample();
+        press(&mut app, KeyCode::Enter);
+        press_str(&mut app, "jn");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.thread.focus, None);
+        assert_eq!(app.mode, Mode::Post { scroll: 1 }, "still in the post");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.mode, Mode::Feed);
+
+        for leave in [KeyCode::Char('q'), KeyCode::Backspace] {
+            press(&mut app, KeyCode::Enter);
+            press(&mut app, KeyCode::Char('n'));
+            assert!(app.thread.focus.is_some());
+            press(&mut app, leave);
+            assert_eq!(app.mode, Mode::Feed, "{leave:?}");
+            assert!(!app.should_quit);
+        }
+    }
+
+    #[test]
+    fn save_and_share_act_on_the_post_and_enter_needs_focus() {
+        let mut app = thread_sample();
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.thread, Thread::default(), "Enter with no focus");
+        assert_eq!(app.mode, Mode::Post { scroll: 0 });
+
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Char('s'));
+        assert!(app.posts[0].saved);
+        assert_eq!(app.status, Some("Post saved"));
+        press(&mut app, KeyCode::Char('c'));
+        assert_eq!(app.status, Some("Link copied to clipboard!"));
+        assert_eq!(focused(&app), Some("a"), "still focused");
+        assert!(app.thread.collapsed.is_empty());
+    }
+
+    #[test]
+    fn comment_keys_mean_nothing_in_the_feed_and_are_typed_in_search() {
+        let mut app = thread_sample();
+        press_str(&mut app, "np");
+        assert_eq!(app.mode, Mode::Feed);
+        assert_eq!((app.view.clone(), app.selected), (vec![0], 0));
+        assert_eq!(app.thread, Thread::default());
+
+        press(&mut app, KeyCode::Char('/'));
+        press_str(&mut app, "np");
+        assert_eq!(app.query, "np");
+        assert_eq!(app.mode, Mode::Search);
     }
 }

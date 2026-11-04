@@ -15,7 +15,8 @@ fix whichever one is wrong. Don't let them drift apart.
   community info.
 - It responds the way Reddit does: voting, sort tabs (Hot / New / Top /
   Rising), filtering by group, joining and leaving groups, opening a post to
-  read its comment tree, saving posts and listing them in a Saved feed.
+  read its comment tree (voting on comments and collapsing threads), saving
+  posts and listing them in a Saved feed.
 - One self-contained binary. No network and no real Workplace data: all
   content is hard-coded, fictional, and safe for work.
 
@@ -106,10 +107,14 @@ The screen is a header (3 rows), a body, and a footer (1 row).
     About is drawn when there isn't room for it, and it is clipped at the
     bottom.
 - **Footer:** key hints, which change with the mode. There are separate sets
-  for the feed, the feed with a kept search, search mode, and the post view.
-  The plain feed set adds `J join` on a group feed only. The search set is
-  `type filter`, `w/ u/ flair: narrow`, `enter keep`, `esc clear`. Every set must fit on
-  one line at 80 columns on every feed, so the feed set leaves out `j/k` and `c` (which the
+  for the feed, the feed with a kept search, search mode, and the post view
+  with and without a focused comment. The plain feed set adds `J join` on a
+  group feed only. The search set is `type filter`, `w/ u/ flair: narrow`,
+  `enter keep`, `esc clear`. The post view set is `j/k scroll`,
+  `n/p comments`, `a/z vote`, `s save`, `c share`, `esc back`, and with a
+  comment focused `j/k scroll`, `n/p comments`, `a/z vote comment`,
+  `enter collapse`, `esc unfocus`. Every set must fit on one line at 80
+  columns on every feed, so the feed set leaves out `j/k` and `c` (which the
   post view set still shows) and lists only `1-4` for sorting, not `Tab`. A
   status toast (green, `✔ …`) replaces the hints until the next key press.
 - **Responsive:** the left nav shows only when the body is at least 70 columns
@@ -179,26 +184,65 @@ as on Reddit's post page. It shows:
 - the meta row, the full title, the full body (newlines kept), and an action
   row with the votes,
 - a rule and "Sort by: Best ▾" (decorative),
-- the comment tree. Each reply level adds a `│ ` guide. Each comment shows its
+- the comment tree, in pre-order (a comment, then its replies, then its next
+  sibling). Each reply level adds a `│ ` guide. Each comment shows its
   author and age, its wrapped body, `▲ score ▼   Reply   Share`, and a
-  trailing guide line.
+  trailing guide line. `Reply` and `Share` are decorative.
 - "··· N more comments", where N is `comment_count` minus the comments in the
-  seeded tree.
+  seeded tree. It counts the whole tree, so collapsing doesn't change it.
+
+**Comment focus.** When a post is opened, no comment is focused. `n` focuses
+the next visible comment in display order (the first one when nothing is
+focused), and `p` the previous one (nothing when nothing is focused). Both
+stop at the ends, and do nothing on a post without seeded comments. The
+focused comment's header row (`u/<author> · <age>`, and the `[+]` and reply
+count when collapsed) is drawn like the active nav entry: orange on the
+highlight background, bold. `Esc` clears the focus and stays in the post; the
+next `Esc` goes back to the feed. `q` and `Backspace` always go back.
+
+**Comment votes.** With a comment focused, `a`/`z` vote on it instead of the
+post, with the same arithmetic (see Selection behavior). An upvote draws its
+`▲` and score orange, a downvote its `▼` and score periwinkle; with no vote
+they stay dim. Scores of 1,000 or more are compacted, as on cards. Voting
+never reorders comments ("Sort by: Best" is decorative). Votes are stored on
+the `Comment`, so they last for the session like post votes. `s` and `c`
+always act on the post.
+
+**Collapsing.** `Enter` toggles collapse on the focused comment, and does
+nothing with no focus. A collapsed comment is two rows: its header with a
+`[+] ` prefix before `u/<author>`, ending in ` (N replies)` (` (1 reply)`, or
+nothing for none) where N is `Comment::total() - 1`, and its trailing guide
+row. Its body, action row and every descendant are hidden, and `n`/`p` skip
+the descendants. Expanded comments carry no marker. Each comment keeps its
+own state, so a collapsed reply is still collapsed after its parent is
+collapsed and expanded again. Focus and collapse state reset every time a
+post is opened from the feed; votes don't.
+
+**Keeping the focus on screen.** After `n` or `p` moves the focus, the next
+render scrolls by the least amount that brings the focused comment's header
+row into view, up or down (none if it is already visible). It happens once:
+`n`/`p` set `Thread.reveal` and the renderer clears it, so `j`/`k`/`PgUp`/
+`PgDn`/`Space`/`g`/`G` then scroll freely. `n` or `p` stopped at an end
+doesn't move the focus and doesn't scroll. Collapsing doesn't scroll either:
+it only removes rows below the focused header, so a header on screen stays
+on screen even when the scroll is clamped to the shorter content.
 
 Free-text search terms are highlighted in the title and body the same way as
 on the cards, whenever a query is set (so a post opened from a searched feed
-stays highlighted). The meta row and comments are not highlighted, and
-highlighting doesn't change the content height or the scroll clamping.
+stays highlighted), whether or not a comment is focused. The meta row and
+comments, `[+]` headers included, are not highlighted, and highlighting
+doesn't change the content height or the scroll clamping.
 
-The renderer clamps the scroll position to the content height and writes it
-back into `Mode::Post { scroll }`. So `G` followed by `k` moves right away,
-instead of first counting down from `u16::MAX`.
+The renderer clamps the scroll position to the content height (after any
+collapse) and writes it back into `Mode::Post { scroll }`. So `G` followed by
+`k` moves right away, instead of first counting down from `u16::MAX`.
 
 ## Data model (`src/data.rs`)
 
 ```rust
 struct Group   { name, description, members, online, joined: bool }
-struct Comment { author, body, score, hours_ago, replies: Vec<Comment> }
+struct Comment { author, body, score, hours_ago, replies: Vec<Comment>,
+                 vote: Vote }
 struct Post    { group: usize, author, title, body, flair: Option<&str>,
                  score, hours_ago, comment_count: u32,
                  comments: Vec<Comment>, vote: Vote, saved: bool }
@@ -212,6 +256,15 @@ enum Vote { Up, None /* default */, Down }
   as "N more comments".
 - **Posts have no ID.** They're identified by their index in `App.posts`,
   which never changes after startup.
+- **Comments have no ID either.** The post view identifies a comment by its
+  path (`CommentPath` in `app.rs`): its index among the top-level comments,
+  then among that comment's replies, and so on. The tree never changes, so
+  a path always names the same comment. `Thread::visible` is the only walk
+  over the tree. It lists the visible comments in display order, with their
+  paths and collapse state, and both `n`/`p` and the renderer use it. A
+  vote just follows the focused path down the tree.
+- **Comments are built with `c(…)`** (and `.with(replies)`), which sets
+  `vote` to `Vote::None`. The tests use the same helpers.
 - **Ages:** stored as `hours_ago`, not timestamps, so ordering and the tests
   are deterministic.
 - **Groups:** 8 groups. Six start joined: Engineering, RemoteWork, OfficeLife,
@@ -231,9 +284,10 @@ enum Vote { Up, None /* default */, Down }
 | `offset` | first card drawn. Maintained by the renderer (see Scrolling) |
 | `sort: Sort` | `Hot`, `New`, `Top`, `Rising` |
 | `feed: Feed` | `Home`, `Popular`, `All`, `Saved`, `Group(usize)` |
-| `mode: Mode` | `Feed`, `Search`, `Post { scroll: u16 }` |
+| `mode: Mode` | `Feed`, `Search`, `Post { scroll: u16 }`. `scroll` is clamped, and moved to reveal a newly focused comment, by the renderer |
 | `query: String` | search text, raw as typed. Kept after leaving search mode with Enter |
 | `search: Query` | `query` parsed into free-text terms and filters. Re-parsed on every rebuild of `view`, and used both to filter and to highlight |
+| `thread: Thread` | the open post's comment state: `focus: Option<CommentPath>`, `collapsed: HashSet<CommentPath>` (see Data model) and `reveal: bool` (set when `focus` moves, cleared by the renderer once it has scrolled). Reset to the default whenever a post is opened. Only read in the post view |
 | `status: Option<&'static str>` | toast text. Every toast is a fixed string. Cleared on the next key press |
 | `karma: u32` | fixed at 1,337 (shown as `1.3k`). Votes don't change it |
 | `should_quit` | checked by the event loop in `main.rs` |
@@ -322,6 +376,8 @@ current feed and sort, and the view updates on every keystroke.
 - **Joining and leaving don't rebuild either.** A group feed's posts don't
   depend on membership, so `J` keeps `view` and `selected` as they are, and
   a kept search stays too.
+- **Comment votes follow the same rules.** Posts and comments share one
+  function for the arithmetic, and comments are never reordered.
 - **These rules differ on purpose.** You change feed, sort or search to
   get a new list, so landing at its top is expected. You vote on a card while
   looking at it, so it should stay put.
@@ -336,15 +392,16 @@ current feed and sort, and the view updates on every keystroke.
 | `PgDn` / `PgUp` | move 5 cards | scroll 10 lines |
 | `Space` | — | scroll 10 lines |
 | `g`/`Home`, `G`/`End` | first / last card | top / bottom |
-| `a` / `z` | upvote / downvote | same, for the post |
-| `s` | save / unsave (toast) | same |
+| `a` / `z` | upvote / downvote | same, for the focused comment, or the post with none focused |
+| `n` / `p` | — | focus next / previous visible comment |
+| `s` | save / unsave (toast) | same, always for the post |
 | `J` | join / leave the group (toast). Only on a group feed, with or without a kept search | — |
-| `c` | "Link copied to clipboard!" toast | same |
-| `Enter` | open post (does nothing in an empty feed) | — |
+| `c` | "Link copied to clipboard!" toast | same, always for the post |
+| `Enter` | open post (does nothing in an empty feed) | collapse / expand the focused comment (nothing with none focused) |
 | `1`-`4` / `Tab` | set / cycle sort | — |
 | `[` / `]` | prev / next feed | — |
 | `/` | enter search mode, editing any kept query | — |
-| `Esc` | clear a kept search. Otherwise nothing, so it never quits | back to feed |
+| `Esc` | clear a kept search. Otherwise nothing, so it never quits | unfocus the comment, or back to feed with none focused |
 | `q` | quit | back to feed |
 | `Backspace` | — | back to feed |
 
@@ -354,8 +411,8 @@ acts on the feed, so you go back to the feed to join or leave.
 
 **Search mode:**
 
-- Every printable key, including `q`, `j`, `J` and digits, is typed into the
-  query. Phrases and the `w/`, `u/` and `flair:` filters are described under
+- Every printable key, including `q`, `j`, `J`, `n`, `p` and digits, is typed
+  into the query. Phrases and the `w/`, `u/` and `flair:` filters are described under
   Search.
 - Backspace deletes a character.
 - Enter returns to the feed and keeps the filter.
@@ -370,16 +427,18 @@ workit/
   src/
     main.rs     ratatui::init()/restore() (restores the terminal on panic), event loop
     app.rs      state, feeds, sorts, voting, saving, joining, search (query parsing,
-                matching, highlight positions), key handling. No rendering
+                matching, highlight positions), comment focus and collapse,
+                key handling. No rendering
     data.rs     seed groups, posts, comments
-    ui.rs       all rendering, including offset upkeep and post-view scroll clamping
+    ui.rs       all rendering, including offset upkeep, post-view scroll clamping and
+                revealing the focused comment
 ```
 
 ## Testing
 
-49 unit tests, run with `cargo test`:
+65 unit tests, run with `cargo test`:
 
-- **`app.rs`** (27), on small custom data sets:
+- **`app.rs`** (35), on small custom data sets:
   - Home hides unjoined groups, and Popular hides low scores.
   - The exact order for each sort.
   - Feed cycling wraps in both directions, with Saved between All and the
@@ -409,7 +468,18 @@ workit/
     and highlight nothing), while `"dead "` keeps its trailing space.
   - `Query::highlights`: overlapping terms, whitespace runs, filters not
     marked, non-ASCII text, and `İ` (which lowercases into two chars).
-- **`ui.rs`** (22), rendering into a `TestBackend`:
+  - Comments, on a tree four levels deep: `n`, `p` and `Enter` doing
+    nothing (and not panicking) on a post without comments; pre-order focus
+    stopping at both ends, `p` with no focus doing nothing, and a reveal
+    asked for only when the focus moves; `n`/`p` skipping a collapsed
+    comment's replies, and a reply staying collapsed while its parent is
+    collapsed and expanded; comment vote toggling and flipping without
+    touching the post or the order; comment votes kept across reopening
+    while focus and collapse reset; `Esc` unfocusing before leaving, and `q`
+    and `Backspace` leaving while focused; `s` and `c` acting on the post
+    while focused, and `Enter` with no focus doing nothing; `n` and `p`
+    doing nothing in the feed and being typed in search mode.
+- **`ui.rs`** (30), rendering into a `TestBackend`:
   - The helpers `compact`, `age`, `wrap` and `truncate`.
   - The frontpage contents.
   - Sidebars hidden at narrow widths.
@@ -422,9 +492,11 @@ workit/
   - Comments in the post view, and scroll clamping.
   - `☆ Saved` right below `◎ All` in the nav, and Saved's sidebar.
   - The group sidebar button and nav mark flipping with `J`.
-  - Every hint set (feed, kept search, search, post view) fitting in 80
-    columns on every feed, with `J join` only in the feed set on group feeds,
-    and the exact search-mode set.
+  - Every hint set (feed, kept search, search, post view unfocused and
+    focused) fitting in 80 columns on every feed, with `J join` only in the
+    feed set on group feeds, the exact search-mode and post-view sets, a
+    toast replacing the focused set, and `Esc` bringing back the unfocused
+    one.
   - Highlight cells: a title match black on orange and still bold, in the
     original case, with its neighbors untouched, in a kept search too.
   - A phrase wrapping across two title rows highlighted on both.
@@ -441,10 +513,32 @@ workit/
   - The empty-feed message ignoring a query with no effective terms (`w/`,
     spaces, `" "`), live and kept, in empty Saved and under Rising, while a
     real filter that finds nothing still says "couldn't find any results".
+  - Collapsed comments: `[+]` headers ending in ` (2 replies)`,
+    ` (1 reply)` and nothing, each followed by its guide row, with bodies,
+    action rows and nested replies gone, no marker on expanded comments, and
+    the focused header (only) in the focus style.
+  - Comment vote colors (orange up, periwinkle down, dim otherwise, `1.2k`
+    compacted) and the post's score left alone.
+  - "N more comments" unchanged by collapsing, and a collapse re-clamping
+    the scroll so `k` moves right away.
+  - The focused comment scrolled into view by the least amount, down and
+    up, not at all when already visible, and not pulled back after `k`.
+  - A kept search still highlighting the title with a comment focused,
+    while the comment, its header and its `[+]` header stay plain.
+  - The seed data: the first Home post's three top-level comments
+    collapsed by key presses alone, with the exact `[+] u/marco_p · 3h ago
+    (1 reply)`, `[+] u/lin_tran · 2h ago (2 replies)` and
+    `[+] u/sam_builds · 1h ago` headers, and `··· 188 more comments` before
+    and after.
+  - Tiny post views (40×12 and 30×8, no sidebars) on a thread five levels
+    deep, rendering after every key: walking `n` to the end and `p` back,
+    collapsing and expanding, voting on the deepest reply, and `g`/`G`/`k`,
+    with the focused header on screen after every `n`/`p` and `scroll`
+    always within the clamp.
 
 Lint with `arc f`, `arc lint` and `arc rust-clippy`. The `arc lint -e extra`
 engine isn't configured for `users/`.
 
 ## Ideas
 
-Voting on comments, collapsible threads, mouse support.
+Mouse support.

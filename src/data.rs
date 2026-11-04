@@ -24,6 +24,7 @@ pub(crate) struct Comment {
     pub score: i32,
     pub hours_ago: u32,
     pub replies: Vec<Comment>,
+    pub vote: Vote,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -43,13 +44,14 @@ pub(crate) struct Post {
     pub saved: bool,
 }
 
-fn c(author: &'static str, score: i32, hours_ago: u32, body: &'static str) -> Comment {
+pub(crate) fn c(author: &'static str, score: i32, hours_ago: u32, body: &'static str) -> Comment {
     Comment {
         author,
         body,
         score,
         hours_ago,
         replies: Vec::new(),
+        vote: Vote::None,
     }
 }
 
@@ -59,7 +61,7 @@ impl Comment {
         1 + self.replies.iter().map(Comment::total).sum::<u32>()
     }
 
-    fn with(mut self, replies: Vec<Comment>) -> Self {
+    pub(crate) fn with(mut self, replies: Vec<Comment>) -> Self {
         self.replies = replies;
         self
     }
