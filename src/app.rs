@@ -5,6 +5,11 @@ use std::ops::Range;
 use ratatui::crossterm::event::KeyCode;
 use ratatui::crossterm::event::KeyEvent;
 use ratatui::crossterm::event::KeyModifiers;
+use ratatui::crossterm::event::MouseButton;
+use ratatui::crossterm::event::MouseEvent;
+use ratatui::crossterm::event::MouseEventKind;
+use ratatui::layout::Position;
+use ratatui::layout::Rect;
 
 use crate::data;
 use crate::data::Comment;
@@ -156,6 +161,48 @@ impl Thread {
     }
 }
 
+/// Something on screen that a left click acts on. What it does depends on
+/// the mode (see `App::on_mouse`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Target {
+    /// A card, by index into `view`: any cell of its drawn rectangle.
+    Card(usize),
+    /// A card's `▲` (`Vote::Up`) or `▼` (`Vote::Down`).
+    Vote(usize, Vote),
+    /// A card's `☆ Save` or `★ Saved` label.
+    Save(usize),
+    /// A sort tab: its number and label.
+    Sort(Sort),
+    /// A nav entry.
+    Feed(Feed),
+    /// The header search box.
+    Search,
+    /// A comment's header row in the post view.
+    Comment(CommentPath),
+}
+
+/// What the most recent frame drew where, written by the renderer on every
+/// frame so that a click acts on what is on screen.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Hits {
+    /// Clickable regions in drawing order. Where they overlap (a card's `▲`
+    /// inside the card), the later one wins.
+    pub regions: Vec<(Rect, Target)>,
+    /// The post view's scroll clamp. 0 outside the post view.
+    pub max_scroll: u16,
+}
+
+impl Hits {
+    fn at(&self, column: u16, row: u16) -> Option<&Target> {
+        let pos = Position::new(column, row);
+        self.regions
+            .iter()
+            .rev()
+            .find(|(rect, _)| rect.contains(pos))
+            .map(|(_, target)| target)
+    }
+}
+
 /// The comment at `path` in `comments` (see `CommentPath`).
 fn comment_mut<'a>(comments: &'a mut [Comment], path: &[usize]) -> Option<&'a mut Comment> {
     let (&first, rest) = path.split_first()?;
@@ -196,6 +243,8 @@ pub(crate) struct App {
     pub search: Query,
     /// Comment focus and collapse state of the open post.
     pub thread: Thread,
+    /// Clickable regions of the most recent frame; `None` until the first.
+    pub hits: Option<Hits>,
     pub status: Option<&'static str>,
     pub karma: u32,
     pub should_quit: bool,
@@ -369,6 +418,7 @@ impl App {
             query: String::new(),
             search: Query::default(),
             thread: Thread::default(),
+            hits: None,
             status: None,
             karma: 1_337,
             should_quit: false,
@@ -530,6 +580,107 @@ impl App {
             Mode::Feed => self.on_feed_key(key.code),
             Mode::Search => self.on_search_key(key.code),
             Mode::Post { scroll } => self.on_post_key(key.code, scroll),
+        }
+    }
+
+    /// Whether `on_mouse` acts on `event` at all: a left press or the wheel,
+    /// after the first frame, outside search mode. The rest change nothing,
+    /// so the event loop doesn't redraw for them.
+    pub(crate) fn handles_mouse(&self, event: &MouseEvent) -> bool {
+        self.hits.is_some()
+            && self.mode != Mode::Search
+            && matches!(
+                event.kind,
+                MouseEventKind::Down(MouseButton::Left)
+                    | MouseEventKind::ScrollDown
+                    | MouseEventKind::ScrollUp
+            )
+    }
+
+    /// Left presses act on whatever the last frame drew under the pointer, and
+    /// the wheel moves like `j`/`k`. Events `handles_mouse` rejects do nothing
+    /// at all, not even clear the toast.
+    pub(crate) fn on_mouse(&mut self, event: MouseEvent) {
+        if !self.handles_mouse(&event) {
+            return;
+        }
+        let Some(hits) = &self.hits else {
+            return;
+        };
+        let wheel = match event.kind {
+            MouseEventKind::ScrollDown => Some(1),
+            MouseEventKind::ScrollUp => Some(-1),
+            _ => None,
+        };
+        let target = hits.at(event.column, event.row).cloned();
+        let max_scroll = hits.max_scroll;
+        self.status = None;
+        match (self.mode, wheel) {
+            (Mode::Feed, Some(delta)) => self.move_selection(delta),
+            (Mode::Feed, None) => {
+                if let Some(target) = target {
+                    self.on_feed_click(target);
+                }
+            }
+            (Mode::Post { scroll }, Some(delta)) => {
+                // 3 lines per notch, clamped as the last frame drew it.
+                let scroll = if delta > 0 {
+                    scroll.saturating_add(3).min(max_scroll.max(scroll))
+                } else {
+                    scroll.saturating_sub(3)
+                };
+                self.mode = Mode::Post { scroll };
+            }
+            (Mode::Post { .. }, None) => {
+                if let Some(Target::Comment(path)) = target {
+                    self.click_comment(path);
+                }
+            }
+            (Mode::Search, _) => {}
+        }
+    }
+
+    fn on_feed_click(&mut self, target: Target) {
+        match target {
+            Target::Card(i) if i < self.view.len() => {
+                self.selected = i;
+                self.open_post();
+            }
+            Target::Vote(i, vote) if i < self.view.len() => {
+                self.selected = i;
+                self.vote(vote);
+            }
+            Target::Save(i) if i < self.view.len() => {
+                self.selected = i;
+                self.toggle_save();
+            }
+            Target::Sort(sort) => self.set_sort(sort),
+            Target::Feed(feed) if feed != self.feed => {
+                self.feed = feed;
+                self.refresh();
+            }
+            Target::Search => self.mode = Mode::Search,
+            _ => {}
+        }
+    }
+
+    /// Focuses the comment, or toggles its collapse when it already has the
+    /// focus. Never scrolls: unlike `n`/`p`, it asks for no reveal, since the
+    /// header is on screen where it was clicked.
+    fn click_comment(&mut self, path: CommentPath) {
+        let Some(&i) = self.view.get(self.selected) else {
+            return;
+        };
+        if self.thread.focus.as_ref() == Some(&path) {
+            self.thread.toggle_collapse();
+        } else if self
+            .thread
+            .visible(&self.posts[i].comments)
+            .iter()
+            .any(|s| s.path == path)
+        {
+            self.thread.focus = Some(path);
+            self.thread.reveal = false;
         }
     }
 
@@ -1516,5 +1667,59 @@ mod tests {
         press_str(&mut app, "np");
         assert_eq!(app.query, "np");
         assert_eq!(app.mode, Mode::Search);
+    }
+
+    fn mouse(app: &mut App, kind: MouseEventKind, column: u16, row: u16) {
+        app.on_mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+
+    #[test]
+    fn mouse_before_the_first_frame_does_nothing() {
+        let mut app = sample();
+        press(&mut app, KeyCode::Char('c'));
+        assert_eq!(app.hits, None, "nothing drawn yet");
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::ScrollDown,
+            MouseEventKind::ScrollUp,
+        ] {
+            for (x, y) in [(0, 0), (5, 5), (30, 8), (20, 1)] {
+                mouse(&mut app, kind, x, y);
+                assert_eq!(app.status, Some("Link copied to clipboard!"));
+                assert_eq!((app.mode, app.selected), (Mode::Feed, 0));
+                assert_eq!((app.feed, app.sort), (Feed::Home, Sort::Hot));
+            }
+        }
+    }
+
+    #[test]
+    fn stale_regions_never_break_invariants() {
+        let mut app = thread_sample();
+        let everywhere = Rect::new(0, 0, 100, 100);
+        app.hits = Some(Hits {
+            regions: vec![(everywhere, Target::Card(5))],
+            max_scroll: 0,
+        });
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 1, 1);
+        assert_eq!((app.mode, app.selected), (Mode::Feed, 0), "no such card");
+
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(visible_authors(&app), ["a", "f", "g"]);
+        // b is hidden under the collapsed a, so it can't take the focus.
+        app.hits = Some(Hits {
+            regions: vec![(everywhere, Target::Comment(vec![0, 0]))],
+            max_scroll: 0,
+        });
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 1, 1);
+        assert_eq!(focused(&app), Some("a"));
+        press_str(&mut app, "np");
+        assert_eq!(focused(&app), Some("a"));
     }
 }

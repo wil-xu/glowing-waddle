@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use ratatui::Frame;
 use ratatui::layout::Constraint;
 use ratatui::layout::Layout;
@@ -15,10 +17,13 @@ use ratatui::widgets::Paragraph;
 use ratatui::widgets::Wrap;
 
 use crate::app::App;
+use crate::app::CommentPath;
 use crate::app::Feed;
+use crate::app::Hits;
 use crate::app::Mode;
 use crate::app::Query;
 use crate::app::Sort;
+use crate::app::Target;
 use crate::data::Comment;
 use crate::data::Post;
 use crate::data::Vote;
@@ -99,7 +104,10 @@ fn vote_color(vote: Vote) -> Color {
     }
 }
 
+/// Draws the whole screen and records in `app.hits` where each clickable
+/// thing ended up.
 pub(crate) fn render(frame: &mut Frame, app: &mut App) {
+    let mut hits = Hits::default();
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(0),
@@ -107,7 +115,7 @@ pub(crate) fn render(frame: &mut Frame, app: &mut App) {
     ])
     .areas(frame.area());
 
-    render_header(frame, app, header);
+    render_header(frame, app, header, &mut hits);
     render_footer(frame, app, footer);
 
     let show_nav = body.width >= 70;
@@ -120,18 +128,19 @@ pub(crate) fn render(frame: &mut Frame, app: &mut App) {
     .areas(body);
 
     if show_nav {
-        render_nav(frame, app, nav);
+        render_nav(frame, app, nav, &mut hits);
     }
     if show_sidebar {
         render_sidebar(frame, app, sidebar);
     }
     match app.mode {
-        Mode::Post { scroll } => render_post(frame, app, main, scroll),
-        Mode::Feed | Mode::Search => render_feed(frame, app, main),
+        Mode::Post { scroll } => render_post(frame, app, main, scroll, &mut hits),
+        Mode::Feed | Mode::Search => render_feed(frame, app, main, &mut hits),
     }
+    app.hits = Some(hits);
 }
 
-fn render_header(frame: &mut Frame, app: &App, area: Rect) {
+fn render_header(frame: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(BORDER);
@@ -182,6 +191,7 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         Color::Reset
     };
     frame.render_widget(Paragraph::new(search_line).bg(bg), search);
+    hits.regions.push((search, Target::Search));
 
     frame.render_widget(
         Line::from(vec![
@@ -271,7 +281,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Line::from(spans), area);
 }
 
-fn render_nav(frame: &mut Frame, app: &App, area: Rect) {
+fn render_nav(frame: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
     let item = |label: String, feed: Feed| {
         let style = if app.feed == feed {
             Style::new().fg(ORANGE).bg(HIGHLIGHT_BG).bold()
@@ -284,32 +294,43 @@ fn render_nav(frame: &mut Frame, app: &App, area: Rect) {
         ))
     };
 
-    let lines: Vec<Line> = [
-        item("⌂ Home".to_owned(), Feed::Home),
-        item("↗ Popular".to_owned(), Feed::Popular),
-        item("◎ All".to_owned(), Feed::All),
-        item("☆ Saved".to_owned(), Feed::Saved),
-        Line::raw(""),
-        Line::styled(" GROUPS", Style::new().fg(DIM)),
+    // Each row, with the feed a click on it switches to.
+    let rows: Vec<(Line, Option<Feed>)> = [
+        (item("⌂ Home".to_owned(), Feed::Home), Some(Feed::Home)),
+        (
+            item("↗ Popular".to_owned(), Feed::Popular),
+            Some(Feed::Popular),
+        ),
+        (item("◎ All".to_owned(), Feed::All), Some(Feed::All)),
+        (item("☆ Saved".to_owned(), Feed::Saved), Some(Feed::Saved)),
+        (Line::raw(""), None),
+        (Line::styled(" GROUPS", Style::new().fg(DIM)), None),
     ]
     .into_iter()
     .chain(app.groups.iter().enumerate().map(|(i, g)| {
         let mark = if g.joined { "●" } else { "○" };
-        item(
-            truncate(&format!("{mark} w/{}", g.name), usize::from(NAV_WIDTH) - 3),
-            Feed::Group(i),
-        )
+        let label = truncate(&format!("{mark} w/{}", g.name), usize::from(NAV_WIDTH) - 3);
+        (item(label, Feed::Group(i)), Some(Feed::Group(i)))
     }))
     .collect();
 
-    frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::bordered()
-                .border_type(BorderType::Rounded)
-                .border_style(BORDER),
-        ),
-        area,
-    );
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(BORDER);
+    let inner = block.inner(area);
+    let (lines, feeds): (Vec<Line>, Vec<Option<Feed>>) = rows.into_iter().unzip();
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+
+    for (y, feed) in (inner.y..inner.bottom()).zip(feeds) {
+        if let Some(feed) = feed {
+            let row = Rect {
+                y,
+                height: 1,
+                ..inner
+            };
+            hits.regions.push((row, Target::Feed(feed)));
+        }
+    }
 }
 
 fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
@@ -432,7 +453,7 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn render_feed(frame: &mut Frame, app: &mut App, area: Rect) {
+fn render_feed(frame: &mut Frame, app: &mut App, area: Rect, hits: &mut Hits) {
     let [tabs, cards] = Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).areas(area);
 
     let tab_spans: Vec<Span> = Sort::ALL
@@ -454,22 +475,30 @@ fn render_feed(frame: &mut Frame, app: &mut App, area: Rect) {
             ]
         })
         .collect();
-    frame.render_widget(
-        Paragraph::new(Line::from(tab_spans)).block(
-            Block::bordered()
-                .border_type(BorderType::Rounded)
-                .border_style(BORDER)
-                .title(Span::styled(
-                    format!(" {} ", app.feed_name()),
-                    Style::new().fg(Color::White).bold(),
-                ))
-                .title_bottom(
-                    Line::styled(format!(" {} posts ", app.view.len()), Style::new().fg(DIM))
-                        .right_aligned(),
-                ),
-        ),
-        tabs,
-    );
+    let tab_block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(BORDER)
+        .title(Span::styled(
+            format!(" {} ", app.feed_name()),
+            Style::new().fg(Color::White).bold(),
+        ))
+        .title_bottom(
+            Line::styled(format!(" {} posts ", app.view.len()), Style::new().fg(DIM))
+                .right_aligned(),
+        );
+    let tab_row = tab_block.inner(tabs);
+    // Each tab is 3 spans: " N ", the label and a gap. The number and the
+    // label are clickable, as far as they are drawn.
+    let mut x = tab_row.x;
+    for (&sort, spans) in Sort::ALL.iter().zip(tab_spans.chunks(3)) {
+        let [number, label, gap] = [0, 1, 2].map(|i| spans[i].width() as u16);
+        let rect = Rect::new(x + 1, tab_row.y, number - 1 + label, 1).intersection(tab_row);
+        if !rect.is_empty() {
+            hits.regions.push((rect, Target::Sort(sort)));
+        }
+        x += number + label + gap;
+    }
+    frame.render_widget(Paragraph::new(Line::from(tab_spans)).block(tab_block), tabs);
 
     if app.view.is_empty() {
         // A query that filters nothing (`w/`, `" "`) didn't empty the feed.
@@ -523,7 +552,8 @@ fn render_feed(frame: &mut Frame, app: &mut App, area: Rect) {
             break;
         }
         let rect = Rect::new(cards.x, y, cards.width, heights[vi].min(bottom - y));
-        render_card(frame, app, &app.posts[pi], rect, vi == app.selected);
+        hits.regions.push((rect, Target::Card(vi)));
+        render_card(frame, app, vi, &app.posts[pi], rect, hits);
         y += heights[vi];
     }
 }
@@ -663,14 +693,15 @@ fn flair_color(flair: &str) -> Color {
     }
 }
 
-fn actions_line(post: &Post) -> Line<'static> {
+/// The action row, and the columns of its Save label within it.
+fn actions_line(post: &Post) -> (Line<'static>, Range<u16>) {
     let dim = Style::new().fg(DIM).bold();
     let save = if post.saved {
         Span::styled("★ Saved", Style::new().fg(ORANGE).bold())
     } else {
         Span::styled("☆ Save", dim)
     };
-    Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             format!("▤ {} Comments", compact(i64::from(post.comment_count))),
             dim,
@@ -678,13 +709,23 @@ fn actions_line(post: &Post) -> Line<'static> {
         Span::raw("   "),
         Span::styled("↗ Share", dim),
         Span::raw("   "),
-        save,
-        Span::raw("   "),
-        Span::styled("···", dim),
-    ])
+    ];
+    let start = Line::from(spans.clone()).width() as u16;
+    let save_columns = start..start + save.width() as u16;
+    spans.extend([save, Span::raw("   "), Span::styled("···", dim)]);
+    (Line::from(spans), save_columns)
 }
 
-fn render_card(frame: &mut Frame, app: &App, post: &Post, area: Rect, selected: bool) {
+/// Draws the card for `view[index]`, recording its arrows and Save label.
+fn render_card(
+    frame: &mut Frame,
+    app: &App,
+    index: usize,
+    post: &Post,
+    area: Rect,
+    hits: &mut Hits,
+) {
+    let selected = index == app.selected;
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(if selected { ORANGE } else { BORDER });
@@ -695,22 +736,33 @@ fn render_card(frame: &mut Frame, app: &App, post: &Post, area: Rect, selected: 
         Layout::horizontal([Constraint::Length(VOTE_WIDTH), Constraint::Min(0)]).areas(inner);
 
     let color = vote_color(post.vote);
-    let arrow = |active: bool, glyph: &'static str, c: Color| {
-        Span::styled(glyph, Style::new().fg(if active { c } else { DIM }).bold())
-    };
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from(arrow(post.vote == Vote::Up, "▲", ORANGE)),
+            Line::raw(""),
             Line::styled(
                 compact(i64::from(post.score)),
                 Style::new().fg(color).bold(),
             ),
-            Line::from(arrow(post.vote == Vote::Down, "▼", PERIWINKLE)),
         ])
         .centered()
         .bg(if selected { HIGHLIGHT_BG } else { Color::Reset }),
         votes,
     );
+    // The arrows go in the cells a centered one-cell line would, drawn one by
+    // one so that the cell drawn is the cell recorded.
+    for (row, glyph, vote, c) in [(0, "▲", Vote::Up, ORANGE), (2, "▼", Vote::Down, PERIWINKLE)]
+    {
+        let cell = Rect::new(votes.x + votes.width / 2, votes.y + row, 1, 1);
+        if votes.width == 0 || cell.y >= votes.bottom() {
+            continue;
+        }
+        let active = post.vote == vote;
+        frame.render_widget(
+            Span::styled(glyph, Style::new().fg(if active { c } else { DIM }).bold()),
+            cell,
+        );
+        hits.regions.push((cell, Target::Vote(index, vote)));
+    }
 
     let width = usize::from(content.width.saturating_sub(2));
     let title_style = Style::new().fg(Color::White).bold();
@@ -727,16 +779,21 @@ fn render_card(frame: &mut Frame, app: &App, post: &Post, area: Rect, selected: 
             preview(post, width),
             Style::new().fg(Color::Gray),
         ))
-        .chain(std::iter::once(actions_line(post)))
         .collect();
-    frame.render_widget(
-        Paragraph::new(lines),
-        Rect {
-            x: content.x + 1,
-            width: content.width.saturating_sub(1),
-            ..content
-        },
-    );
+    let (actions, save) = actions_line(post);
+    let text = Rect {
+        x: content.x + 1,
+        width: content.width.saturating_sub(1),
+        ..content
+    };
+    // The action row is the last line, unless the card is clipped above it.
+    let y = text.y + lines.len() as u16;
+    let save = Rect::new(text.x + save.start, y, save.end - save.start, 1).intersection(text);
+    if !save.is_empty() {
+        hits.regions.push((save, Target::Save(index)));
+    }
+    let lines: Vec<Line> = lines.into_iter().chain([actions]).collect();
+    frame.render_widget(Paragraph::new(lines), text);
 }
 
 /// One comment, without its replies. A collapsed one is only its header,
@@ -806,7 +863,7 @@ fn comment_lines(
     out.push(Line::styled(format!("{prefix}│"), guide));
 }
 
-fn render_post(frame: &mut Frame, app: &mut App, area: Rect, scroll: u16) {
+fn render_post(frame: &mut Frame, app: &mut App, area: Rect, scroll: u16, hits: &mut Hits) {
     let Some(post) = app.selected_post() else {
         return;
     };
@@ -814,6 +871,7 @@ fn render_post(frame: &mut Frame, app: &mut App, area: Rect, scroll: u16) {
         .border_type(BorderType::Rounded)
         .border_style(ORANGE);
     let inner = block.inner(area);
+    let text = block.clone().padding(Padding::horizontal(1)).inner(area);
     let width = usize::from(inner.width.saturating_sub(2));
 
     let color = vote_color(post.vote);
@@ -832,7 +890,7 @@ fn render_post(frame: &mut Frame, app: &mut App, area: Rect, scroll: u16) {
         Style::default(),
     ));
     lines.push(Line::raw(""));
-    let mut action = actions_line(post);
+    let (mut action, _) = actions_line(post);
     action.spans.splice(
         0..0,
         [
@@ -864,11 +922,13 @@ fn render_post(frame: &mut Frame, app: &mut App, area: Rect, scroll: u16) {
     lines.push(Line::raw(""));
 
     let mut focus_row = None;
+    let mut headers: Vec<(u16, CommentPath)> = Vec::new();
     for shown in app.thread.visible(&post.comments) {
         let focused = app.thread.focus.as_ref() == Some(&shown.path);
         if focused {
             focus_row = Some(lines.len() as u16);
         }
+        headers.push((lines.len() as u16, shown.path.clone()));
         comment_lines(
             shown.comment,
             shown.depth(),
@@ -899,6 +959,18 @@ fn render_post(frame: &mut Frame, app: &mut App, area: Rect, scroll: u16) {
     app.thread.reveal = false;
     app.mode = Mode::Post { scroll };
 
+    hits.max_scroll = max_scroll;
+    for (row, path) in headers {
+        if let Some(y) = row.checked_sub(scroll).filter(|&dy| dy < text.height) {
+            let rect = Rect {
+                y: text.y + y,
+                height: 1,
+                ..text
+            };
+            hits.regions.push((rect, Target::Comment(path)));
+        }
+    }
+
     frame.render_widget(
         Paragraph::new(lines)
             .scroll((scroll, 0))
@@ -915,6 +987,9 @@ mod tests {
     use ratatui::crossterm::event::KeyCode;
     use ratatui::crossterm::event::KeyEvent;
     use ratatui::crossterm::event::KeyModifiers;
+    use ratatui::crossterm::event::MouseButton;
+    use ratatui::crossterm::event::MouseEvent;
+    use ratatui::crossterm::event::MouseEventKind;
 
     use super::*;
     use crate::data;
@@ -1952,6 +2027,600 @@ mod tests {
                 }
             );
             assert_eq!(app.thread.focus, None);
+        }
+    }
+
+    fn mouse(app: &mut App, kind: MouseEventKind, (column, row): (u16, u16)) {
+        app.on_mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+
+    fn click(app: &mut App, at: (u16, u16)) {
+        mouse(app, MouseEventKind::Down(MouseButton::Left), at);
+    }
+
+    fn title_of(app: &App, view_index: usize) -> String {
+        app.posts[app.view[view_index]]
+            .title
+            .chars()
+            .take(20)
+            .collect()
+    }
+
+    #[test]
+    fn clicking_a_card_after_scrolling_opens_that_post() {
+        let mut app = App::new();
+        press(&mut app, KeyCode::Char('G'));
+        buffer(&mut app, 110, 24);
+        let offset = app.offset;
+        assert!(offset > 0 && offset < app.selected, "scrolled: {offset}");
+        press(&mut app, KeyCode::Char('k'));
+        let buf = buffer(&mut app, 110, 24);
+        assert_eq!(app.offset, offset);
+
+        // The first card drawn is view[offset], not view[0].
+        let title = title_of(&app, offset);
+        let (x, y) = find(&buf, &title);
+        click(&mut app, (x + 3, y));
+        assert_eq!(app.mode, Mode::Post { scroll: 0 });
+        assert_eq!(app.selected, offset);
+        assert_eq!(app.thread, Default::default());
+
+        // A border cell counts too: the card's left edge, beside its title.
+        press(&mut app, KeyCode::Esc);
+        let buf = buffer(&mut app, 110, 24);
+        let title = title_of(&app, offset + 1);
+        let (x, y) = find(&buf, &title);
+        let border = (x - 8, y);
+        assert_eq!(buf[border].symbol(), "│");
+        click(&mut app, border);
+        assert_eq!(app.mode, Mode::Post { scroll: 0 });
+        assert_eq!(app.selected, offset + 1);
+    }
+
+    #[test]
+    fn clicking_the_visible_part_of_a_clipped_card_opens_it() {
+        let mut app = App::new();
+        // At 27 rows the third card shows its top border, meta row and two
+        // title rows, then is cut off by the bottom of the screen.
+        let buf = buffer(&mut app, 110, 27);
+        let s = rows(&buf).join("\n");
+        let title = title_of(&app, 2);
+        let (x, y) = find(&buf, &title);
+        assert_eq!(y, 23, "{s}");
+        assert_eq!(find_all(&buf, "Comments").len(), 2, "no action row:\n{s}");
+        assert_eq!(buf[(x, 25)].symbol(), "─", "the clipped bottom edge");
+
+        click(&mut app, (x, 25));
+        assert_eq!(app.mode, Mode::Post { scroll: 0 });
+        assert_eq!(app.selected, 2);
+
+        press(&mut app, KeyCode::Esc);
+        app.selected = 0;
+        buffer(&mut app, 110, 27);
+        click(&mut app, (x + 5, y));
+        assert_eq!((app.mode, app.selected), (Mode::Post { scroll: 0 }, 2));
+
+        // At 24 rows only its two border rows are left; they still count.
+        press(&mut app, KeyCode::Esc);
+        app.selected = 0;
+        let buf = buffer(&mut app, 110, 24);
+        assert_eq!(buf[(x, 21)].symbol(), "─");
+        assert_eq!(buf[(x, 22)].symbol(), "─");
+        click(&mut app, (x, 22));
+        assert_eq!((app.mode, app.selected), (Mode::Post { scroll: 0 }, 2));
+    }
+
+    #[test]
+    fn clicking_arrows_votes_and_flips_without_opening_or_resorting() {
+        let mut app = App::new();
+        let view = app.view.clone();
+        let i = app.view[1];
+        let base = app.posts[i].score;
+        let arrow = |app: &mut App, glyph: &str| {
+            let buf = buffer(app, 110, 24);
+            let found = find_all(&buf, glyph);
+            assert_eq!(found.len(), 2, "two cards with arrows");
+            found[1]
+        };
+
+        let up = arrow(&mut app, "▲");
+        click(&mut app, up);
+        assert_eq!(app.selected, 1, "the clicked card is selected");
+        assert_eq!(
+            (app.posts[i].vote, app.posts[i].score),
+            (Vote::Up, base + 1)
+        );
+        assert_eq!(app.mode, Mode::Feed, "the post isn't opened");
+
+        let down = arrow(&mut app, "▼");
+        assert_eq!(down, (up.0, up.1 + 2));
+        click(&mut app, down);
+        assert_eq!(
+            (app.posts[i].vote, app.posts[i].score),
+            (Vote::Down, base - 1),
+            "flipping is -2"
+        );
+        let buf = buffer(&mut app, 110, 24);
+        assert_eq!(buf[down].fg, PERIWINKLE);
+        click(&mut app, down);
+        assert_eq!(
+            (app.posts[i].vote, app.posts[i].score),
+            (Vote::None, base),
+            "repeating clears it"
+        );
+        assert_eq!(app.view, view, "voting never re-sorts");
+        assert_eq!(app.mode, Mode::Feed);
+
+        // The blank cells beside an arrow belong to the card.
+        buffer(&mut app, 110, 24);
+        click(&mut app, (up.0 - 1, up.1));
+        assert_eq!(app.mode, Mode::Post { scroll: 0 });
+        assert_eq!(app.posts[i].vote, Vote::None);
+    }
+
+    #[test]
+    fn clicking_save_toggles_it_with_a_toast() {
+        let mut app = App::new();
+        let i = app.view[1];
+        let buf = buffer(&mut app, 110, 24);
+        // The last match: the nav's "☆ Saved" and card 0 come first.
+        let save = *find_all(&buf, "☆ Save").last().expect("card 1 is drawn");
+        assert_eq!(find_all(&buf, "☆ Save").len(), 3);
+        click(&mut app, (save.0 + 5, save.1));
+        assert!(app.posts[i].saved);
+        assert_eq!(app.selected, 1);
+        assert_eq!(app.mode, Mode::Feed, "the post isn't opened");
+        assert_eq!(app.status, Some("Post saved"));
+        let buf = buffer(&mut app, 110, 24);
+        assert!(rows(&buf)[23].starts_with(" ✔ Post saved "));
+
+        assert_eq!(find(&buf, "★ Saved"), save);
+        click(&mut app, (save.0 + 6, save.1));
+        assert!(!app.posts[i].saved);
+        assert_eq!(app.status, Some("Post unsaved"));
+        assert_eq!(app.mode, Mode::Feed);
+    }
+
+    #[test]
+    fn clicking_a_sort_tab_is_like_its_digit() {
+        let mut app = App::new();
+        let buf = buffer(&mut app, 110, 24);
+        let (x, y) = find(&buf, "3 Top");
+        click(&mut app, (x + 4, y));
+        assert_eq!(app.sort, Sort::Top);
+        let mut by_key = App::new();
+        press(&mut by_key, KeyCode::Char('3'));
+        assert_eq!(app.view, by_key.view);
+
+        // On the digit, and on the current tab, which resets the selection.
+        press(&mut app, KeyCode::Char('j'));
+        buffer(&mut app, 110, 24);
+        click(&mut app, (x, y));
+        assert_eq!((app.sort, app.selected), (Sort::Top, 0));
+        let (x, y) = find(&buf, "4 Rising");
+        click(&mut app, (x, y));
+        assert_eq!(app.sort, Sort::Rising);
+
+        // The gaps between tabs do nothing.
+        buffer(&mut app, 110, 24);
+        click(&mut app, (x - 2, y));
+        assert_eq!(app.sort, Sort::Rising);
+    }
+
+    #[test]
+    fn clicking_the_nav_switches_feeds() {
+        let mut app = App::new();
+        let buf = buffer(&mut app, 110, 24);
+        // Anywhere on the entry's row inside the nav.
+        let (x, y) = find(&buf, "↗ Popular");
+        click(&mut app, (x + 15, y));
+        assert_eq!(app.feed, Feed::Popular);
+
+        // A kept search stays.
+        press(&mut app, KeyCode::Char('/'));
+        type_str(&mut app, "the");
+        press(&mut app, KeyCode::Enter);
+        buffer(&mut app, 110, 24);
+        click(&mut app, find(&buf, "◎ All"));
+        assert_eq!(app.feed, Feed::All);
+        assert_eq!(app.query, "the");
+        let mut by_key = App::new();
+        type_str(&mut by_key, "]]/the");
+        assert_eq!(app.view, by_key.view);
+
+        // The current feed keeps its view and selection.
+        press(&mut app, KeyCode::Char('j'));
+        let view = app.view.clone();
+        buffer(&mut app, 110, 24);
+        click(&mut app, find(&buf, "◎ All"));
+        assert_eq!((app.feed, app.selected), (Feed::All, 1));
+        assert_eq!(app.view, view);
+
+        // The heading, the blank row and the border do nothing.
+        let (gx, gy) = find(&buf, "GROUPS");
+        for at in [(gx, gy), (gx + 10, gy), (gx, gy - 1), (0, gy), (gx, 3)] {
+            buffer(&mut app, 110, 24);
+            click(&mut app, at);
+            assert_eq!((app.feed, app.selected), (Feed::All, 1), "{at:?}");
+            assert_eq!(app.mode, Mode::Feed);
+        }
+
+        buffer(&mut app, 110, 24);
+        click(&mut app, find(&buf, "w/Foodies"));
+        assert_eq!(app.feed, Feed::Group(5));
+        assert_eq!(app.groups[5].name, "Foodies");
+        buffer(&mut app, 110, 24);
+        click(&mut app, find(&buf, "⌂ Home"));
+        assert_eq!(app.feed, Feed::Home);
+    }
+
+    #[test]
+    fn nav_is_not_clickable_when_not_drawn() {
+        let mut app = App::new();
+        let wide = buffer(&mut app, 110, 30);
+        let popular = find(&wide, "↗ Popular");
+        let narrow = buffer(&mut app, 60, 30);
+        assert!(find_all(&narrow, "Popular").is_empty());
+        let hits = app.hits.as_ref().expect("rendered");
+        assert!(
+            !hits
+                .regions
+                .iter()
+                .any(|(_, t)| matches!(t, Target::Feed(_))),
+            "{hits:?}"
+        );
+        // Where Popular would be is the tab box's bottom border.
+        click(&mut app, popular);
+        assert_eq!((app.feed, app.mode), (Feed::Home, Mode::Feed));
+    }
+
+    #[test]
+    fn clicking_the_search_box_enters_search_mode() {
+        let mut app = App::new();
+        let buf = buffer(&mut app, 110, 24);
+        click(&mut app, find(&buf, "Search Home"));
+        assert_eq!(app.mode, Mode::Search);
+        type_str(&mut app, "dead");
+        press(&mut app, KeyCode::Enter);
+
+        // Anywhere in the box, with a kept search: editing it, like `/`.
+        let buf = buffer(&mut app, 110, 24);
+        let (x, y) = find(&buf, "(esc to clear)");
+        click(&mut app, (x + 30, y));
+        assert_eq!(app.mode, Mode::Search);
+        assert_eq!(app.query, "dead");
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(app.query, "dea");
+    }
+
+    #[test]
+    fn mouse_does_nothing_in_search_mode() {
+        let mut app = App::new();
+        let feed = buffer(&mut app, 110, 24);
+        press(&mut app, KeyCode::Char('/'));
+        type_str(&mut app, "e");
+        let buf = buffer(&mut app, 110, 24);
+        let view = app.view.clone();
+        let title = title_of(&app, 1);
+        let targets = [
+            find(&buf, &title),
+            find_all(&buf, "▲")[0],
+            *find_all(&buf, "☆ Save").last().expect("a card is drawn"),
+            find(&buf, "3 Top"),
+            find(&feed, "↗ Popular"),
+            find(&buf, "⌕"),
+        ];
+        for at in targets {
+            for kind in [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::ScrollDown,
+                MouseEventKind::ScrollUp,
+            ] {
+                mouse(&mut app, kind, at);
+                assert_eq!(app.mode, Mode::Search, "{kind:?} at {at:?}");
+                assert_eq!(app.query, "e");
+                assert_eq!((app.view.clone(), app.selected), (view.clone(), 0));
+                assert_eq!((app.feed, app.sort), (Feed::Home, Sort::Hot));
+                buffer(&mut app, 110, 24);
+            }
+        }
+        assert!(app.posts.iter().all(|p| p.vote == Vote::None && !p.saved));
+    }
+
+    #[test]
+    fn only_left_presses_and_the_wheel_clear_the_toast() {
+        let mut app = App::new();
+        press(&mut app, KeyCode::Char('c'));
+        let buf = buffer(&mut app, 110, 24);
+        let title = title_of(&app, 1);
+        let card = find(&buf, &title);
+        let save = *find_all(&buf, "☆ Save").last().expect("card 1 is drawn");
+        for (kind, at) in [
+            (MouseEventKind::Moved, card),
+            (MouseEventKind::Up(MouseButton::Left), card),
+            (MouseEventKind::Drag(MouseButton::Left), card),
+            (MouseEventKind::Down(MouseButton::Right), card),
+            (MouseEventKind::Down(MouseButton::Middle), card),
+            (MouseEventKind::Down(MouseButton::Right), save),
+            (MouseEventKind::Up(MouseButton::Right), save),
+        ] {
+            mouse(&mut app, kind, at);
+            assert_eq!(app.status, Some("Link copied to clipboard!"), "{kind:?}");
+            assert_eq!((app.mode, app.selected), (Mode::Feed, 0), "{kind:?}");
+            assert!(!app.posts[app.view[1]].saved);
+        }
+
+        // A left click on nothing (the logo) clears it and does nothing else.
+        click(&mut app, find(&buf, "workit"));
+        assert_eq!(app.status, None);
+        assert_eq!((app.mode, app.selected), (Mode::Feed, 0));
+
+        press(&mut app, KeyCode::Char('c'));
+        buffer(&mut app, 110, 24);
+        mouse(&mut app, MouseEventKind::ScrollDown, (100, 1));
+        assert_eq!(app.status, None, "the wheel clears it too");
+        assert_eq!(app.selected, 1);
+    }
+
+    #[test]
+    fn wheel_moves_the_feed_selection_and_is_clamped() {
+        let mut app = App::new();
+        let last = app.view.len() - 1;
+        let wheel = |app: &mut App, kind, at| {
+            buffer(app, 110, 24);
+            mouse(app, kind, at);
+            app.selected
+        };
+        // Wherever the pointer is: a card, the nav, the sidebar, the footer.
+        assert_eq!(wheel(&mut app, MouseEventKind::ScrollDown, (30, 8)), 1);
+        assert_eq!(wheel(&mut app, MouseEventKind::ScrollDown, (5, 15)), 2);
+        assert_eq!(wheel(&mut app, MouseEventKind::ScrollUp, (90, 12)), 1);
+        assert_eq!(wheel(&mut app, MouseEventKind::ScrollUp, (40, 23)), 0);
+        assert_eq!(wheel(&mut app, MouseEventKind::ScrollUp, (30, 8)), 0);
+        for _ in 0..last + 5 {
+            wheel(&mut app, MouseEventKind::ScrollDown, (30, 8));
+        }
+        assert_eq!(app.selected, last);
+        assert_eq!(app.mode, Mode::Feed);
+        buffer(&mut app, 110, 24);
+        assert!(app.offset > 0, "the renderer follows the selection");
+    }
+
+    #[test]
+    fn wheel_scrolls_the_post_view_three_lines_and_is_clamped() {
+        let mut app = thread_post();
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('G'));
+        buffer(&mut app, 110, 16);
+        let max = scroll(&app);
+        assert!(max > 9, "{max}");
+        press(&mut app, KeyCode::Char('g'));
+        buffer(&mut app, 110, 16);
+
+        let wheel = |app: &mut App, kind| {
+            mouse(app, kind, (40, 8));
+            buffer(app, 110, 16);
+            scroll(app)
+        };
+        assert_eq!(wheel(&mut app, MouseEventKind::ScrollDown), 3);
+        assert_eq!(wheel(&mut app, MouseEventKind::ScrollDown), 6);
+        assert_eq!(wheel(&mut app, MouseEventKind::ScrollUp), 3);
+        assert_eq!(wheel(&mut app, MouseEventKind::ScrollUp), 0);
+        assert_eq!(wheel(&mut app, MouseEventKind::ScrollUp), 0, "top");
+        for _ in 0..20 {
+            wheel(&mut app, MouseEventKind::ScrollDown);
+        }
+        assert_eq!(scroll(&app), max, "bottom");
+        assert_eq!(wheel(&mut app, MouseEventKind::ScrollUp), max - 3);
+        assert_eq!(app.thread, Default::default(), "no focus, no collapse");
+    }
+
+    #[test]
+    fn clicking_a_comment_header_focuses_it_without_scrolling() {
+        let mut app = thread_post();
+        let feed = buffer(&mut app, 110, 16);
+        press(&mut app, KeyCode::Enter);
+        buffer(&mut app, 110, 16);
+        for _ in 0..3 {
+            mouse(&mut app, MouseEventKind::ScrollDown, (40, 8));
+            buffer(&mut app, 110, 16);
+        }
+        assert_eq!(scroll(&app), 9);
+        let buf = buffer(&mut app, 110, 16);
+        let s = rows(&buf).join("\n");
+
+        // Bodies, action rows, guides below the header, the post, the nav,
+        // the search box and where the tabs were do nothing.
+        let (bx, by) = find(&buf, "bob replies");
+        let (_, ry) = find_all(&buf, "Reply")[0];
+        for at in [
+            (bx, by),
+            (bx, ry),
+            (bx - 2, by),
+            find(&feed, "⌕"),
+            find(&feed, "↗ Popular"),
+            find(&feed, "3 Top"),
+            find(&feed, "Thread title"),
+        ] {
+            click(&mut app, at);
+            assert_eq!(app.thread, Default::default(), "{at:?}:\n{s}");
+            assert_eq!(app.mode, Mode::Post { scroll: 9 });
+            buffer(&mut app, 110, 16);
+        }
+
+        // bob's header: on the name, or anywhere else on its row.
+        let (x, y) = find(&buf, "u/bob · 1h ago");
+        click(&mut app, (x + 30, y));
+        assert_eq!(app.thread.focus, Some(vec![0, 0]));
+        assert!(!app.thread.reveal, "a click never asks for a scroll");
+        assert_eq!(app.mode, Mode::Post { scroll: 9 });
+        let buf = buffer(&mut app, 110, 16);
+        assert_eq!(scroll(&app), 9);
+        assert!(is_focus_style(&buf, x, y));
+
+        // A header on the last row of the post view, with its body below
+        // the edge.
+        let (x, y) = find(&buf, "u/cat · 1h ago");
+        assert_eq!(y, 13, "the last row of the post view:\n{s}");
+        click(&mut app, (x, y));
+        assert_eq!(app.thread.focus, Some(vec![0, 0, 0]));
+        buffer(&mut app, 110, 16);
+        assert_eq!(scroll(&app), 9, "not scrolled to show cat's body");
+    }
+
+    #[test]
+    fn clicking_the_focused_header_collapses_and_expands_it() {
+        let mut app = thread_post();
+        press(&mut app, KeyCode::Enter);
+        let buf = buffer(&mut app, 110, 40);
+        let (x, y) = find(&buf, "u/ann · 1h ago");
+        click(&mut app, (x, y));
+        assert_eq!(app.thread.focus, Some(vec![0]));
+        assert!(
+            app.thread.collapsed.is_empty(),
+            "the first click only focuses"
+        );
+
+        buffer(&mut app, 110, 40);
+        click(&mut app, (x + 5, y));
+        let buf = buffer(&mut app, 110, 40);
+        let header = find(&buf, "[+] u/ann · 1h ago (2 replies)");
+        assert_eq!(header, (x, y));
+        assert_eq!(app.thread.focus, Some(vec![0]));
+
+        // The `[+]` itself is part of the header.
+        click(&mut app, header);
+        let buf = buffer(&mut app, 110, 40);
+        assert!(app.thread.collapsed.is_empty());
+        assert!(find_all(&buf, "[+]").is_empty());
+        assert_eq!(find(&buf, "ann says hi").1, y + 1);
+
+        // A collapsed header that isn't focused is focused, not expanded.
+        let (dx, dy) = find(&buf, "u/dan · 1h ago");
+        click(&mut app, (dx, dy));
+        buffer(&mut app, 110, 40);
+        click(&mut app, (dx, dy));
+        let buf = buffer(&mut app, 110, 40);
+        let dan = find(&buf, "[+] u/dan · 1h ago (1 reply)");
+        click(&mut app, (x, y));
+        assert_eq!(app.thread.focus, Some(vec![0]));
+        buffer(&mut app, 110, 40);
+        click(&mut app, dan);
+        assert_eq!(app.thread.focus, Some(vec![1]));
+        assert!(app.thread.collapsed.contains(&vec![1]), "still collapsed");
+        buffer(&mut app, 110, 40);
+        click(&mut app, dan);
+        assert!(app.thread.collapsed.is_empty());
+        assert_eq!(app.mode, Mode::Post { scroll: 0 });
+    }
+
+    #[test]
+    fn mouse_works_in_an_empty_feed() {
+        let mut app = App::new();
+        type_str(&mut app, "]]]");
+        assert_eq!(app.feed, Feed::Saved);
+        assert!(app.view.is_empty());
+        let buf = buffer(&mut app, 110, 24);
+        let (x, y) = find(&buf, "No saved posts yet");
+        click(&mut app, (x, y));
+        mouse(&mut app, MouseEventKind::ScrollDown, (x, y));
+        assert_eq!((app.mode, app.selected), (Mode::Feed, 0));
+
+        click(&mut app, find(&buf, "3 Top"));
+        assert_eq!(app.sort, Sort::Top);
+        buffer(&mut app, 110, 24);
+        click(&mut app, find(&buf, "Search Saved"));
+        assert_eq!(app.mode, Mode::Search);
+        press(&mut app, KeyCode::Esc);
+        buffer(&mut app, 110, 24);
+        click(&mut app, find(&buf, "◎ All"));
+        assert_eq!(app.feed, Feed::All);
+        assert!(!app.view.is_empty());
+    }
+
+    /// Every field of `app`, so that "changes nothing" means nothing.
+    fn state(app: &App) -> String {
+        format!(
+            "{:?}",
+            (
+                (&app.groups, &app.posts, &app.view, app.selected, app.offset),
+                (app.sort, app.feed, app.mode, &app.query, &app.search),
+                (
+                    &app.thread,
+                    &app.hits,
+                    app.status,
+                    app.karma,
+                    app.should_quit
+                ),
+            )
+        )
+    }
+
+    #[test]
+    fn mouse_events_the_app_ignores_change_nothing() {
+        let kinds = [
+            MouseEventKind::Moved,
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Down(MouseButton::Right),
+            MouseEventKind::Up(MouseButton::Right),
+            MouseEventKind::Drag(MouseButton::Right),
+            MouseEventKind::Down(MouseButton::Middle),
+            MouseEventKind::ScrollDown,
+            MouseEventKind::ScrollUp,
+            MouseEventKind::ScrollLeft,
+            MouseEventKind::ScrollRight,
+        ];
+        let counts = |kind: MouseEventKind| {
+            matches!(
+                kind,
+                MouseEventKind::Down(MouseButton::Left)
+                    | MouseEventKind::ScrollDown
+                    | MouseEventKind::ScrollUp
+            )
+        };
+        // (setup keys, whether the app should handle anything).
+        let setups: [(&str, bool); 4] = [("", true), ("/e", false), ("\nn", true), ("", false)];
+        for (n, (keys, handles)) in setups.into_iter().enumerate() {
+            let mut app = thread_post();
+            press(&mut app, KeyCode::Char('c'));
+            for ch in keys.chars() {
+                press(
+                    &mut app,
+                    if ch == '\n' {
+                        KeyCode::Enter
+                    } else {
+                        KeyCode::Char(ch)
+                    },
+                );
+            }
+            // The last setup is before the first frame.
+            let buf = (n < 3).then(|| buffer(&mut app, 110, 24));
+            assert_eq!(app.hits.is_some(), n < 3);
+            let title = buf.map_or((40, 8), |buf| find(&buf, "Thread"));
+            for at in [title, (5, 5), (40, 8), (60, 1), (0, 23)] {
+                for kind in kinds {
+                    let event = MouseEvent {
+                        kind,
+                        column: at.0,
+                        row: at.1,
+                        modifiers: KeyModifiers::NONE,
+                    };
+                    let expected = handles && counts(kind);
+                    assert_eq!(app.handles_mouse(&event), expected, "{n}: {kind:?}");
+                    if !expected {
+                        let before = state(&app);
+                        app.on_mouse(event);
+                        assert_eq!(state(&app), before, "{n}: {kind:?} at {at:?}");
+                    }
+                }
+            }
         }
     }
 }

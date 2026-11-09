@@ -26,7 +26,6 @@ fix whichever one is wrong. Don't let them drift apart.
   concerns).
 - Persisting state between runs. Votes, saves and group membership reset on
   restart.
-- Mouse support.
 
 ## Build & run
 
@@ -40,7 +39,7 @@ cargo test
 - **Dependencies:** just `ratatui` (0.30). It re-exports `crossterm` as
   `ratatui::crossterm`, which keeps the backend and the event types on the same
   version.
-- **Edition:** 2024, which the event loop needs for its let-chain.
+- **Edition:** 2024, which the renderer needs for its let-chain.
 
 ## Layout
 
@@ -95,7 +94,7 @@ The screen is a header (3 rows), a body, and a footer (1 row).
 - **Right sidebar** (`SIDEBAR_WIDTH = 32`):
   - In a group feed, the top box is "About w/<group>": description, member and
     online counts, and a Joined/Join button showing the current membership.
-    There's no mouse support, so `J` is what toggles it.
+    The button isn't clickable: `J` is what toggles it.
   - In Home, Popular, All and Saved, it is titled with the feed name and
     shows a generic blurb with a "Create Post" button, which is decorative.
   - Below that are "Trending today" (the 4 posts with the most comments,
@@ -116,7 +115,8 @@ The screen is a header (3 rows), a body, and a footer (1 row).
   `enter collapse`, `esc unfocus`. Every set must fit on one line at 80
   columns on every feed, so the feed set leaves out `j/k` and `c` (which the
   post view set still shows) and lists only `1-4` for sorting, not `Tab`. A
-  status toast (green, `✔ …`) replaces the hints until the next key press.
+  status toast (green, `✔ …`) replaces the hints until the next key press,
+  left click or wheel event (see Mouse).
 - **Responsive:** the left nav shows only when the body is at least 70 columns
   wide, and the right sidebar only at 100 or more.
 
@@ -287,8 +287,9 @@ enum Vote { Up, None /* default */, Down }
 | `mode: Mode` | `Feed`, `Search`, `Post { scroll: u16 }`. `scroll` is clamped, and moved to reveal a newly focused comment, by the renderer |
 | `query: String` | search text, raw as typed. Kept after leaving search mode with Enter |
 | `search: Query` | `query` parsed into free-text terms and filters. Re-parsed on every rebuild of `view`, and used both to filter and to highlight |
+| `hits: Option<Hits>` | where the most recent frame drew each clickable thing, written by the renderer on every frame. `None` until the first frame (see Mouse) |
 | `thread: Thread` | the open post's comment state: `focus: Option<CommentPath>`, `collapsed: HashSet<CommentPath>` (see Data model) and `reveal: bool` (set when `focus` moves, cleared by the renderer once it has scrolled). Reset to the default whenever a post is opened. Only read in the post view |
-| `status: Option<&'static str>` | toast text. Every toast is a fixed string. Cleared on the next key press |
+| `status: Option<&'static str>` | toast text. Every toast is a fixed string. Cleared on the next key press, left click or wheel event |
 | `karma: u32` | fixed at 1,337 (shown as `1.3k`). Votes don't change it |
 | `should_quit` | checked by the event loop in `main.rs` |
 
@@ -418,6 +419,82 @@ acts on the feed, so you go back to the feed to join or leave.
 - Enter returns to the feed and keeps the filter.
 - Esc returns to the feed and clears it.
 
+## Mouse
+
+`main.rs` turns mouse capture on after `ratatui::init()` and off again
+before `ratatui::restore()`. ratatui's panic hook restores the terminal but
+knows nothing of mouse capture, so `main` chains its own hook in front of it
+that turns capture off first. A panic never leaves the terminal reporting
+mouse events. `App::handles_mouse` says whether a mouse event counts (see
+below), and only those go to `App::on_mouse`.
+
+**Which events count.** Only left-button presses and the wheel (up and
+down). Releases, drags, moves, right and middle clicks and horizontal scrolls
+are ignored completely, so they don't even clear the toast. A left press or
+a wheel event clears the toast first, as a key press does, even when it
+lands on nothing. In search mode every mouse event is ignored, and so is any
+event before the first frame is drawn. `handles_mouse` is that rule, and
+`on_mouse` checks it first, so an event it rejects changes no state.
+
+| Where | Feed | Post view |
+|---|---|---|
+| a card: any cell of its drawn rectangle, borders and the visible part of a clipped card included | select it and open it, like `Enter` | — |
+| a card's `▲` / `▼` | select it and vote, like `a` / `z`. Doesn't open the post or re-sort | — |
+| a card's `☆ Save` / `★ Saved` | select it and save / unsave (toast), like `s` | — |
+| a sort tab, its number or label | like its digit, `1`-`4` | not drawn |
+| a nav entry's row | switch to that feed, as `[`/`]` would landing on it. A kept search stays. The current feed: nothing, so the view and selection stay | — |
+| the header search box | enter search mode, like `/` | — |
+| a comment's header row (`u/<author> · <age>`, `[+]` headers included), across the post box | not drawn | focus it. If it is already focused, collapse / expand it, like `Enter` |
+| the wheel, anywhere | select the next / previous card, like `j` / `k` | scroll 3 lines, clamped like `j` / `k` |
+
+`—` means the click does nothing. So do the `GROUPS` heading, the blank nav
+row, every border outside a card, the logo, the user and karma, the sidebar
+(its Join button included) and the footer. In the post view only comment
+headers are clickable: bodies, action rows, the post itself, the nav and the
+search box do nothing. The nav isn't drawn below 70 columns, and then
+nothing in it is clickable.
+
+A click never scrolls. Focusing a comment by clicking it doesn't set
+`Thread.reveal`, since its header is already on screen. Collapsing by click
+works like `Enter`: it only removes rows below the header, and the renderer
+re-clamps the scroll to the shorter content.
+
+**Click regions.** On every frame the renderer records what it drew where in
+`App.hits` (`Hits` in `app.rs`): `regions`, a list of `(Rect, Target)` in
+drawing order, and `max_scroll`, the post view's scroll clamp (0 outside the
+post view). `Target` is `Card(i)`, `Vote(i, Vote)` or `Save(i)` with `i` an
+index into `view`, `Sort(Sort)`, `Feed(Feed)`, `Search` or
+`Comment(CommentPath)`. A click takes the last region containing the cell,
+so a card's arrows and Save label, recorded after the card, win over it.
+
+- Regions cover only what was drawn: nav rows only when the nav is drawn and
+  only the rows that fit, a clipped card's visible part, arrows and Save
+  labels only when their row is drawn, and comment headers only inside the
+  scrolled viewport. Everything is clipped like the widgets, so a click
+  follows the responsive layout, the feed offset and the post-view scroll.
+- The arrows are drawn one cell each, where a centered one-cell line goes,
+  so the cell recorded is the cell drawn. The Save label's columns come from
+  `actions_line`, which builds the row.
+- `on_mouse` decides what a target does from the mode: card, sort, nav and
+  search targets only act in the feed, `Comment` only in the post view. It
+  ignores a target that no longer applies, such as a card index past the end
+  of `view` or a comment hidden under a collapsed ancestor, so a stale
+  region can't break the focus invariants.
+- The wheel in the post view clamps to `max_scroll` straight away, and the
+  renderer clamps again as it does for `j`.
+- `app.rs` only hit-tests rectangles. It has no rendering code.
+
+**No redraw for ignored events.** Mouse capture turns on any-motion
+tracking, so the terminal sends a steady stream of `Moved` events while the
+pointer moves. The event loop draws a frame only after an event that may
+have changed something: a key press, a mouse event `handles_mouse` accepts,
+or any non-mouse event (a resize, for one). A mouse event it rejects changes
+nothing, so the frame on screen, and the click regions recorded with it,
+are still current. Measured in a 110×24 tmux pane, 300 pointer moves and
+a click used to cost 302 full renders, and now cost 2 (startup and the
+click). One render takes about 0.3 ms in a release build and 2.6 ms in a
+debug build at that size.
+
 ## Files
 
 ```
@@ -425,20 +502,23 @@ workit/
   PLAN.md
   Cargo.toml    edition 2024, depends on ratatui
   src/
-    main.rs     ratatui::init()/restore() (restores the terminal on panic), event loop
+    main.rs     ratatui::init()/restore() (restores the terminal on panic), mouse
+                capture (also turned off on panic), event loop (no redraw for
+                ignored mouse events)
     app.rs      state, feeds, sorts, voting, saving, joining, search (query parsing,
                 matching, highlight positions), comment focus and collapse,
-                key handling. No rendering
+                key handling, mouse handling (hit-testing the click regions).
+                No rendering
     data.rs     seed groups, posts, comments
-    ui.rs       all rendering, including offset upkeep, post-view scroll clamping and
-                revealing the focused comment
+    ui.rs       all rendering, including offset upkeep, post-view scroll clamping,
+                revealing the focused comment and recording the click regions
 ```
 
 ## Testing
 
-65 unit tests, run with `cargo test`:
+83 unit tests, run with `cargo test`:
 
-- **`app.rs`** (35), on small custom data sets:
+- **`app.rs`** (37), on small custom data sets:
   - Home hides unjoined groups, and Popular hides low scores.
   - The exact order for each sort.
   - Feed cycling wraps in both directions, with Saved between All and the
@@ -479,7 +559,10 @@ workit/
     and `Backspace` leaving while focused; `s` and `c` acting on the post
     while focused, and `Enter` with no focus doing nothing; `n` and `p`
     doing nothing in the feed and being typed in search mode.
-- **`ui.rs`** (30), rendering into a `TestBackend`:
+  - Mouse events before the first frame doing nothing, toast included, and
+    stale regions (a card past the end of `view`, a comment hidden under a
+    collapsed one) being ignored.
+- **`ui.rs`** (46), rendering into a `TestBackend`:
   - The helpers `compact`, `age`, `wrap` and `truncate`.
   - The frontpage contents.
   - Sidebars hidden at narrow widths.
@@ -535,10 +618,41 @@ workit/
     collapsing and expanding, voting on the deepest reply, and `g`/`G`/`k`,
     with the focused header on screen after every `n`/`p` and `scroll`
     always within the clamp.
+  - Mouse, with coordinates found in the rendered buffer and a render
+    between events, as in the event loop:
+    - A card click after scrolling opening `view[offset]`, not `view[0]`,
+      and a border cell counting.
+    - The visible part of a card clipped at the bottom, down to its two
+      border rows, opening it.
+    - `▲` and `▼` selecting the card and voting, flipping and clearing,
+      without opening or re-sorting. The blank cell beside an arrow opens
+      the card.
+    - Save and Saved toggling with the toast, without opening.
+    - Sort tabs by label and by digit, the current tab resetting the
+      selection, and the gap between tabs doing nothing.
+    - Nav clicks anywhere on an entry's row, a kept search staying, the
+      current feed keeping view and selection, and the heading, blank row
+      and border doing nothing. At 60 columns no nav region exists.
+    - The search box entering search mode, editing a kept query.
+    - Every mouse event in search mode leaving the query, view, feed and
+      mode alone.
+    - Moves, releases, drags and right and middle clicks leaving the toast,
+      and a left click on nothing or a wheel event clearing it.
+    - The wheel moving the feed selection from anywhere, clamped at both
+      ends, and scrolling the post view by 3, clamped at both ends.
+    - Focusing a comment by its header after scrolling, the scroll staying
+      put, and bodies, action rows, guides, the post, the nav, the tabs
+      area and the search box doing nothing in the post view.
+    - Clicking the focused header collapsing it and its `[+]` header
+      expanding it, and a collapsed unfocused header being focused, not
+      expanded.
+    - Tabs, nav and search box working in an empty feed, where the message
+      isn't clickable.
+    - `handles_mouse` accepting exactly left presses and the vertical
+      wheel, in the feed and the post view, and nothing in search mode or
+      before the first frame. Every event it rejects (moves, releases,
+      drags, right and middle buttons, horizontal scroll) leaves every
+      field of `App` unchanged, the toast included.
 
 Lint with `arc f`, `arc lint` and `arc rust-clippy`. The `arc lint -e extra`
 engine isn't configured for `users/`.
-
-## Ideas
-
-Mouse support.
