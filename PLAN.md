@@ -17,6 +17,7 @@ fix whichever one is wrong. Don't let them drift apart.
   Rising), filtering by group, joining and leaving groups, opening a post to
   read its comment tree (voting on comments and collapsing threads), saving
   posts and listing them in a Saved feed.
+- Votes, saves and group membership survive a restart (see Persistence).
 - One self-contained binary. No network and no real Workplace data: all
   content is hard-coded, fictional, and safe for work.
 
@@ -24,8 +25,9 @@ fix whichever one is wrong. Don't let them drift apart.
 
 - Fetching real Workplace content (would need auth and APIs, and raises privacy
   concerns).
-- Persisting state between runs. Votes, saves and group membership reset on
-  restart.
+- Persisting anything beyond votes, saves and group membership. The feed,
+  sort, search, selection, scroll, comment focus and collapse state and the
+  toast start fresh on every run, on Home, Hot, at the top.
 
 ## Build & run
 
@@ -36,6 +38,8 @@ cargo run
 cargo test
 ```
 
+- **State file:** `WORKIT_STATE=/tmp/scratch cargo run` keeps votes, saves
+  and membership somewhere other than the default (see Persistence).
 - **Dependencies:** just `ratatui` (0.30). It re-exports `crossterm` as
   `ratatui::crossterm`, which keeps the backend and the event types on the same
   version.
@@ -205,7 +209,8 @@ post, with the same arithmetic (see Selection behavior). An upvote draws its
 `▲` and score orange, a downvote its `▼` and score periwinkle; with no vote
 they stay dim. Scores of 1,000 or more are compacted, as on cards. Voting
 never reorders comments ("Sort by: Best" is decorative). Votes are stored on
-the `Comment`, so they last for the session like post votes. `s` and `c`
+the `Comment`, so they last for the session like post votes, and are saved
+on quit like them (see Persistence). `s` and `c`
 always act on the post.
 
 **Collapsing.** `Enter` toggles collapse on the focused comment, and does
@@ -254,12 +259,15 @@ enum Vote { Up, None /* default */, Down }
   Reddit thread sits behind "load more". Don't "fix" the count to
   `comments.len()` or `Comment::total()`. The post view shows the difference
   as "N more comments".
-- **Posts have no ID.** They're identified by their index in `App.posts`,
-  which never changes after startup.
+- **Posts have no ID.** While running, they're identified by their index in
+  `App.posts`, which never changes after startup. Indices shift whenever the
+  seed changes, so the state file names a post by its content instead (see
+  Persistence).
 - **Comments have no ID either.** The post view identifies a comment by its
   path (`CommentPath` in `app.rs`): its index among the top-level comments,
-  then among that comment's replies, and so on. The tree never changes, so
-  a path always names the same comment. `Thread::visible` is the only walk
+  then among that comment's replies, and so on. The tree never changes while
+  running, so a path always names the same comment. The state file names a
+  comment by content, not by path. `Thread::visible` is the only walk
   over the tree. It lists the visible comments in display order, with their
   paths and collapse state, and both `n`/`p` and the renderer use it. A
   vote just follows the focused path down the tree.
@@ -278,7 +286,7 @@ enum Vote { Up, None /* default */, Down }
 
 | Field | Meaning |
 |---|---|
-| `groups`, `posts` | seed data. `posts` is mutated in place by votes and saves, `groups[g].joined` by `J` |
+| `groups`, `posts` | seed data, with the state file applied by `main` before the first frame. `posts` is mutated in place by votes and saves, `groups[g].joined` by `J` |
 | `view: Vec<usize>` | indices into `posts` after feed filter, search and sort |
 | `selected` | index into `view` |
 | `offset` | first card drawn. Maintained by the renderer (see Scrolling) |
@@ -291,7 +299,7 @@ enum Vote { Up, None /* default */, Down }
 | `thread: Thread` | the open post's comment state: `focus: Option<CommentPath>`, `collapsed: HashSet<CommentPath>` (see Data model) and `reveal: bool` (set when `focus` moves, cleared by the renderer once it has scrolled). Reset to the default whenever a post is opened. Only read in the post view |
 | `status: Option<&'static str>` | toast text. Every toast is a fixed string. Cleared on the next key press, left click or wheel event |
 | `karma: u32` | fixed at 1,337 (shown as `1.3k`). Votes don't change it |
-| `should_quit` | checked by the event loop in `main.rs` |
+| `should_quit` | checked by the event loop in `main.rs`, and by `main`, which saves the state file only when it is set |
 
 ### Feeds (which posts are shown)
 
@@ -385,7 +393,8 @@ current feed and sort, and the view updates on every keystroke.
 
 ## Key bindings
 
-**Global:** Ctrl-C quits from any mode, including search.
+**Global:** Ctrl-C quits from any mode, including search. Like `q` in the
+feed, it saves the state file (see Persistence).
 
 | Key | Feed | Post view |
 |---|---|---|
@@ -495,6 +504,120 @@ a click used to cost 302 full renders, and now cost 2 (startup and the
 click). One render takes about 0.3 ms in a release build and 2.6 ms in a
 debug build at that size.
 
+## Persistence (`src/state.rs`)
+
+Your vote on each post and on each comment, each post's `saved` flag and
+each group's `joined` flag are kept in a small text file between runs.
+Nothing else is: every run starts on Home, Hot, at the top, with no query,
+focus, collapse or toast.
+
+**What is stored.** Only differences from the seed: a group whose `joined`
+differs from the seed's (both joining an unjoined group and leaving a joined
+one), each saved post, and each post or comment with a vote. The seed has no
+votes and no saves (a test checks it). An entry you undo (vote again, unsave,
+re-join) isn't written by the next save, so it doesn't come back. Scores are
+not stored: a post's or comment's `score` already includes your vote, so the
+file keeps the vote and loading applies it to the seed score with `cast`'s
+arithmetic. An upvoted post comes back at seed + 1, and `a` clears it back to
+the seed score.
+
+**Keys.** The seed keeps changing, so indices and `CommentPath`s can't be
+keys. Every key is built from content instead:
+
+- a group: its `name`;
+- a post: its group's `name`, its `author` and its `title`;
+- a comment: its post's key, then the `author` and `body` of each comment on
+  the way down to it, from the top-level ancestor to the comment itself.
+
+So state follows the same item when groups, posts or sibling comments are
+reordered or new ones are inserted anywhere. Changing any field in a key
+(renaming a group, editing a title or body, moving a post to another group or
+a reply to another parent) makes it a different item, and its old entry stops
+matching. A record whose key matches nothing in the current seed is dropped
+without an error, and the next save leaves it out. No hashing is involved,
+so keys don't depend on the Rust release.
+
+**Shared keys.** Two items could share a key, say two posts with the same
+group, author and title, or two sibling replies with the same author and
+body. Then the first in seed order (groups, then each post followed by its
+comments in pre-order) owns the key. The others are never written or loaded:
+their votes and saves last for the session only. A test checks that every
+key in the real seed is unique, so this only matters if a duplicate is added.
+
+**Format.** UTF-8 text. The first line is the version, `workit-state 1`.
+Every other line is one record: tab-separated fields, ending in a newline.
+In each field, `\` is written `\\`, a tab `\t`, a newline `\n` and a
+carriage return `\r`, and everything else as is (`=` and non-ASCII
+included), so any string round-trips. The records, in seed order:
+
+```
+workit-state 1
+group	left	Engineering
+group	joined	Announcements
+vote	up	Engineering	dana_k	We deleted 40k lines of dead code and the build got 30% faster
+vote	down	Engineering	dana_k	We deleted 40k lines of dead code and the build got 30% faster	lin_tran	212 diffs?! Who reviewed all of these, and are they okay?	oz_reviewer	I have seen things you people wouldn't believe.
+saved	OfficeLife	priya_r	PSA: the espresso machine on floor 3 is FIXED
+```
+
+- `group`, `joined` or `left`, the group's name.
+- `saved`, then the post's key (3 fields).
+- `vote`, `up` or `down`, then the key of a post (3 fields) or a comment
+  (3 + 2 per level).
+
+**Location.** `$WORKIT_STATE` if it is set and non-empty, used as given.
+Otherwise `$XDG_STATE_HOME/workit/state` when `XDG_STATE_HOME` is an absolute
+path. Otherwise `$HOME/.local/state/workit/state` when `HOME` is an absolute
+path. When none applies, the app runs without persistence. `state::path`
+takes the three values as arguments, so the tests never touch the process
+environment.
+
+**When.** `main` builds the `App` with `App::new()` and loads the file into it
+before `ratatui::init()`, so before the first frame. Loading applies each
+record as the keys would (`cast` for votes), then rebuilds `view`, so restored
+state behaves as if you had made those changes by hand: a restored membership
+is in Home's first build and a restored save is in Saved. `App::new()` and
+`App::with_data` stay pure and never touch the file. Saving happens after
+`ratatui::restore()`, and only when `should_quit` is set, by `q` in the feed
+or Ctrl-C in any mode. A panic, or an I/O error that ends the event loop,
+doesn't save. When nothing differs from the seed and there is no file, none is
+created. Otherwise the whole file is rewritten atomically: missing parent
+directories are created, the new contents go to a temp file
+`.<name>.<pid>.tmp` (`.state.<pid>.tmp` by default) in the same directory and
+are synced, and the temp file is renamed over the old one. When a regular file
+is already there (after following symlinks), the temp file gets its
+permissions before anything is written to it, so a `0600` file stays `0600`. A
+new file gets the default mode. The file always holds either the old contents
+or the new ones. A run killed in the middle can leave the temp file behind,
+but never a truncated state file. With two instances running at once, each
+writes what it saw, and the last one to quit wins.
+
+**Errors.** Bad input never crashes the app or loses the file:
+
+- A missing file means the seed, silently.
+- Only a regular file of at most 1 MiB is read (symlinks are followed; the
+  seed with every item changed comes to a few dozen KiB). The metadata is
+  checked before the file is opened, so a FIFO is never opened and can't
+  hang the app before the first frame, and a device such as `/dev/zero`
+  can't exhaust memory. The opened file is checked again, and at most 1 MiB
+  plus one byte is read, in case it changed in between. Anything else
+  (a directory, a FIFO, a device, a bigger file) is handled like a read
+  error, below.
+- A malformed line (a bad escape, an unknown record kind or value, the wrong
+  number of fields, invalid UTF-8) is skipped and the rest still loads. Blank
+  lines are ignored. A record repeated in the file sets the same state again,
+  so a vote isn't toggled off. The next save drops the bad lines.
+- A file whose first line isn't exactly `workit-state 1` (empty, garbage,
+  binary, a future `workit-state 2`) loads nothing and is never overwritten.
+- A read error other than a missing file (permissions, not a regular file,
+  over 1 MiB) loads nothing, and that run doesn't save, so a file it couldn't
+  read is never replaced.
+- On a save error (a directory that can't be created, a full disk, a failed
+  rename), the temp file is removed and the old file stays as it was.
+
+Each of these except the missing file is reported as one `workit: …` line on
+stderr after the terminal is restored, never in the TUI, and the exit carries
+on normally.
+
 ## Files
 
 ```
@@ -504,19 +627,22 @@ workit/
   src/
     main.rs     ratatui::init()/restore() (restores the terminal on panic), mouse
                 capture (also turned off on panic), event loop (no redraw for
-                ignored mouse events)
+                ignored mouse events), loading the state file before the first
+                frame and saving it after the restore, messages on stderr
     app.rs      state, feeds, sorts, voting, saving, joining, search (query parsing,
                 matching, highlight positions), comment focus and collapse,
                 key handling, mouse handling (hit-testing the click regions).
                 No rendering
     data.rs     seed groups, posts, comments
+    state.rs    the state file: content keys, format, loading, atomic saving,
+                path selection
     ui.rs       all rendering, including offset upkeep, post-view scroll clamping,
                 revealing the focused comment and recording the click regions
 ```
 
 ## Testing
 
-83 unit tests, run with `cargo test`:
+101 unit tests, run with `cargo test`:
 
 - **`app.rs`** (37), on small custom data sets:
   - Home hides unjoined groups, and Popular hides low scores.
@@ -653,6 +779,50 @@ workit/
       before the first frame. Every event it rejects (moves, releases,
       drags, right and middle buttons, horizontal scroll) leaves every
       field of `App` unchanged, the toast included.
+- **`state.rs`** (18), on in-memory strings and on files in a directory
+  under the system temp dir that each test creates and removes itself. No
+  test reads or writes a real state file or reads `HOME`, `XDG_STATE_HOME`
+  or `WORKIT_STATE`:
+  - A round trip, by key presses, of a post upvote and downvote, a comment
+    downvote at depth 2 and an upvote at depth 0, a save, joining an
+    unjoined group and leaving a joined one: the exact file contents, the
+    exact restored scores (seed ± 1), untouched neighbors, Home's first
+    build with the restored membership and Saved with the restored save.
+  - A saved upvote, loaded and undone with `a`, giving the seed score and a
+    file with no entries; undoing every change leaving a file with only the
+    version line; no file, and no directory, created when nothing changed.
+  - Keys surviving a seed whose groups, posts and comments are reordered,
+    with a new group, a new post and new sibling comments at depths 0 and 2:
+    the right items restored, the new ones untouched, and the records written
+    back in the new seed order.
+  - Keys matching nothing (an unknown group, post or comment, a reply named
+    as top-level) dropped without counting as malformed.
+  - Keys holding a tab, a newline, a carriage return, backslashes, `=` and
+    non-ASCII text round-tripping, next to a post whose title is the first
+    one's escaped form, which stays untouched.
+  - Every kind of malformed line (bad escape, trailing `\`, unknown kind and
+    vote value, missing or extra fields, invalid UTF-8) skipped and counted
+    while valid lines load, a repeated vote not toggling, and a last line
+    with no newline.
+  - An empty, blank, garbage, binary, `workit-state 2` or
+    `workit-state 1 ` (trailing space) first line loading nothing and the
+    file left byte for byte as it was after a save.
+  - A directory at the path: reported, nothing written on save; and as a
+    save error, reported with no temp file left.
+  - A directory, `/dev/zero`, a FIFO and a symlink to the FIFO each refused
+    without blocking: reported, nothing loaded, nothing written. The FIFO
+    comes from `mkfifo`, and that case is skipped when `mkfifo` isn't
+    available. A symlink to a regular file loads.
+  - A file of exactly 1 MiB loading, and one byte more refused and left as
+    it was.
+  - A save keeping the old file's `0600`, `0640` and `0400` modes, and a new
+    file getting the default.
+  - Path selection from the three values, including an empty
+    `WORKIT_STATE`, a relative `XDG_STATE_HOME` and a relative or missing
+    `HOME`.
+  - A save creating missing directories and leaving no temp file behind.
+  - A shared key belonging to the first item, for posts and comments.
+  - Every key in the real seed unique, and the seed with no votes or saves.
 
 Lint with `arc f`, `arc lint` and `arc rust-clippy`. The `arc lint -e extra`
 engine isn't configured for `users/`.
