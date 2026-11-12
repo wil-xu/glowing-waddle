@@ -204,7 +204,10 @@ impl Hits {
 }
 
 /// The comment at `path` in `comments` (see `CommentPath`).
-fn comment_mut<'a>(comments: &'a mut [Comment], path: &[usize]) -> Option<&'a mut Comment> {
+pub(crate) fn comment_mut<'a>(
+    comments: &'a mut [Comment],
+    path: &[usize],
+) -> Option<&'a mut Comment> {
     let (&first, rest) = path.split_first()?;
     let comment = comments.get_mut(first)?;
     if rest.is_empty() {
@@ -216,7 +219,7 @@ fn comment_mut<'a>(comments: &'a mut [Comment], path: &[usize]) -> Option<&'a mu
 
 /// Applies `vote` to a post's or comment's `current` vote and `score`: ±1, or
 /// ±2 when flipping, and repeating a vote clears it.
-fn cast(current: &mut Vote, score: &mut i32, vote: Vote) {
+pub(crate) fn cast(current: &mut Vote, score: &mut i32, vote: Vote) {
     let value = |v: Vote| match v {
         Vote::Up => 1,
         Vote::None => 0,
@@ -405,7 +408,7 @@ impl App {
         Self::with_data(data::groups(), data::posts())
     }
 
-    fn with_data(groups: Vec<Group>, posts: Vec<Post>) -> Self {
+    pub(crate) fn with_data(groups: Vec<Group>, posts: Vec<Post>) -> Self {
         let mut app = App {
             groups,
             posts,
@@ -452,7 +455,7 @@ impl App {
     }
 
     /// Rebuilds `view` and resets the selection to the top of the feed.
-    fn refresh(&mut self) {
+    pub(crate) fn refresh(&mut self) {
         self.search = Query::parse(&self.query);
         let mut view: Vec<usize> = (0..self.posts.len())
             .filter(|&i| {
