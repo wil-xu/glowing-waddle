@@ -16,8 +16,10 @@ fix whichever one is wrong. Don't let them drift apart.
 - It responds the way Reddit does: voting, sort tabs (Hot / New / Top /
   Rising), filtering by group, joining and leaving groups, opening a post to
   read its comment tree (voting on comments and collapsing threads), saving
-  posts and listing them in a Saved feed.
-- Votes, saves and group membership survive a restart (see Persistence).
+  posts and listing them in a Saved feed, and hiding posts, which then show up
+  only in a Hidden feed where they can be unhidden.
+- Votes, saves, hidden posts and group membership survive a restart (see
+  Persistence).
 - One self-contained binary. No network and no real Workplace data: all
   content is hard-coded, fictional, and safe for work.
 
@@ -25,9 +27,9 @@ fix whichever one is wrong. Don't let them drift apart.
 
 - Fetching real Workplace content (would need auth and APIs, and raises privacy
   concerns).
-- Persisting anything beyond votes, saves and group membership. The feed,
-  sort, search, selection, scroll, comment focus and collapse state and the
-  toast start fresh on every run, on Home, Hot, at the top.
+- Persisting anything beyond votes, saves, hidden posts and group membership.
+  The feed, sort, search, selection, scroll, comment focus and collapse state
+  and the toast start fresh on every run, on Home, Hot, at the top.
 
 ## Build & run
 
@@ -38,8 +40,9 @@ cargo run
 cargo test
 ```
 
-- **State file:** `WORKIT_STATE=/tmp/scratch cargo run` keeps votes, saves
-  and membership somewhere other than the default (see Persistence).
+- **State file:** `WORKIT_STATE=/tmp/scratch cargo run` keeps votes, saves,
+  hidden posts and membership somewhere other than the default (see
+  Persistence).
 - **Dependencies:** just `ratatui` (0.30). It re-exports `crossterm` as
   `ratatui::crossterm`, which keeps the backend and the event types on the same
   version.
@@ -58,27 +61,28 @@ Captured from the real binary in a 110×24 tmux pane:
 │ ↗ Popular          │╰──────────────────────────────────────────── 19 posts ╯│ frontpage. Come here to      │
 │ ◎ All              │╭──────────────────────────────────────────────────────╮│ check in with your favorite  │
 │ ☆ Saved            ││   ▲   w/Engineering · u/dana_k · 3h ago   Win        ││ groups.                      │
-│                    ││ 1.2k  We deleted 40k lines of dead code and the      ││                              │
-│ GROUPS             ││   ▼   build got 30% faster                           ││          Create Post         │
-│ ● w/Engineering    ││       After six months of slowly untangling flags    │╰──────────────────────────────╯
-│ ● w/RemoteWork     ││       that had been fully rolled out since 2021, th… │╭ Trending today ──────────────╮
-│ ● w/OfficeLife     ││       ▤ 194 Comments   ↗ Share   ☆ Save   ···        ││ Hackathon 2026 is happening… │
-│ ● w/Hackathon      │╰──────────────────────────────────────────────────────╯│ w/Announcements · 545 comme… │
-│ ○ w/Announcements  │╭──────────────────────────────────────────────────────╮│ Biscuit got his own visitor… │
-│ ● w/Foodies        ││   ▲   w/OfficeLife · u/priya_r · 1h ago   PSA        ││ w/DogsOfTheOffice · 406 com… │
-│ ○ w/DogsOfTheOffice││  856  PSA: the espresso machine on floor 3 is FIXED  ││ Unpopular opinion: most of … │
-│ ● w/OncallSurvivors││   ▼   Facilities replaced the grinder this morning.  ││ w/Engineering · 393 comments │
-│                    ││       It now makes coffee instead of angry grinding… ││ New building opens Monday: … │
+│ ⊘ Hidden           ││ 1.2k  We deleted 40k lines of dead code and the      ││                              │
+│                    ││   ▼   build got 30% faster                           ││          Create Post         │
+│ GROUPS             ││       After six months of slowly untangling flags    │╰──────────────────────────────╯
+│ ● w/Engineering    ││       that had been fully rolled out since 2021, th… │╭ Trending today ──────────────╮
+│ ● w/RemoteWork     ││       ▤ 194 Comments   ↗ Share   ☆ Save   ···        ││ Hackathon 2026 is happening… │
+│ ● w/OfficeLife     │╰──────────────────────────────────────────────────────╯│ w/Announcements · 545 comme… │
+│ ● w/Hackathon      │╭──────────────────────────────────────────────────────╮│ Biscuit got his own visitor… │
+│ ○ w/Announcements  ││   ▲   w/OfficeLife · u/priya_r · 1h ago   PSA        ││ w/DogsOfTheOffice · 406 com… │
+│ ● w/Foodies        ││  856  PSA: the espresso machine on floor 3 is FIXED  ││ Unpopular opinion: most of … │
+│ ○ w/DogsOfTheOffice││   ▼   Facilities replaced the grinder this morning.  ││ w/Engineering · 393 comments │
+│ ● w/OncallSurvivors││       It now makes coffee instead of angry grinding… ││ New building opens Monday: … │
 │                    ││       ▤ 100 Comments   ↗ Share   ☆ Save   ···        ││ w/Announcements · 332 comme… │
 │                    │╰──────────────────────────────────────────────────────╯╰──────────────────────────────╯
 │                    │╭──────────────────────────────────────────────────────╮
 ╰────────────────────╯╰──────────────────────────────────────────────────────╯
- a/z vote  enter open  1-4 sort  [/] feed  / search  s save  q quit
+ a/z vote  enter open  1-4 sort  [/] feed  / search  s save  h hide  q quit
 ```
 
-**No emoji, on purpose.** Every glyph is a single-width character: `◉ ⌕ ✦ ⌂ ↗ ◎ ● ○ ▲ ▼ ▤ ☆ ★ ··· ✔`. Emoji such as 🔥 or 💬 render two
-cells wide in most terminals, and widely in tmux, which breaks the alignment
-of the bordered cards. Don't add them.
+**No emoji, on purpose.** Every glyph is a single-width character:
+`◉ ⌕ ✦ ⌂ ↗ ◎ ● ○ ▲ ▼ ▤ ☆ ★ ⊘ ··· ✔`. Emoji such as 🔥 or 💬 render two cells
+wide in most terminals, and widely in tmux, which breaks the alignment of the
+bordered cards. Don't add them.
 
 The screen is a header (3 rows), a body, and a footer (1 row).
 
@@ -87,10 +91,10 @@ The screen is a header (3 rows), a body, and a footer (1 row).
   query, raw as typed (quotes and filters included), with a cursor on a
   highlighted background. Once a search is kept, it shows the query plus
   `(esc to clear)`. On the right are `u/you` and the karma.
-- **Left nav** (`NAV_WIDTH = 22`): Home / Popular / All / Saved, then every
-  group. `●` marks a joined group and `○` an unjoined one, and the mark flips
-  as soon as you join or leave. The active feed is orange on a dark
-  background.
+- **Left nav** (`NAV_WIDTH = 22`): Home / Popular / All / Saved / Hidden
+  (`⊘ Hidden`, right below `☆ Saved`), then every group. `●` marks a joined
+  group and `○` an unjoined one, and the mark flips as soon as you join or
+  leave. The active feed is orange on a dark background.
 - **Feed:** a box titled with the feed name holds the numbered sort tabs. The
   active tab is orange and underlined, and the box's bottom edge shows the
   post count. Post cards follow. The selected card has an orange border and a
@@ -99,11 +103,11 @@ The screen is a header (3 rows), a body, and a footer (1 row).
   - In a group feed, the top box is "About w/<group>": description, member and
     online counts, and a Joined/Join button showing the current membership.
     The button isn't clickable: `J` is what toggles it.
-  - In Home, Popular, All and Saved, it is titled with the feed name and
-    shows a generic blurb with a "Create Post" button, which is decorative.
+  - In Home, Popular, All, Saved and Hidden, it is titled with the feed name
+    and shows a generic blurb with a decorative "Create Post" button.
   - Below that are "Trending today" (the 4 posts with the most comments,
-    across all posts regardless of feed) and "Popular groups" (top 5 by
-    members).
+    across all posts regardless of feed, except hidden ones: hiding a trending
+    post lets the 5th take its place) and "Popular groups" (top 5 by members).
   - **Short terminals:** boxes stack in that priority order. A lower box
     that doesn't fit whole is skipped rather than squeezed, so About always
     keeps its button. At 24 rows, Popular groups disappears first. Only
@@ -111,16 +115,19 @@ The screen is a header (3 rows), a body, and a footer (1 row).
     bottom.
 - **Footer:** key hints, which change with the mode. There are separate sets
   for the feed, the feed with a kept search, search mode, and the post view
-  with and without a focused comment. The plain feed set adds `J join` on a
-  group feed only. The search set is `type filter`, `w/ u/ flair: narrow`,
-  `enter keep`, `esc clear`. The post view set is `j/k scroll`,
-  `n/p comments`, `a/z vote`, `s save`, `c share`, `esc back`, and with a
-  comment focused `j/k scroll`, `n/p comments`, `a/z vote comment`,
-  `enter collapse`, `esc unfocus`. Every set must fit on one line at 80
-  columns on every feed, so the feed set leaves out `j/k` and `c` (which the
-  post view set still shows) and lists only `1-4` for sorting, not `Tab`. A
-  status toast (green, `✔ …`) replaces the hints until the next key press,
-  left click or wheel event (see Mouse).
+  with and without a focused comment. The plain feed set is `a/z vote`,
+  `enter open`, `1-4 sort`, `[/] feed`, `/ search`, `s save`, `h hide`,
+  `q quit` (76 columns). On a group feed it adds `J join` and, to stay within
+  80 columns (84 otherwise), drops `enter open`: Enter is the most guessable
+  key, and a click on a card opens it too (72 columns). The search set is
+  `type filter`, `w/ u/ flair: narrow`, `enter keep`, `esc clear`. The post
+  view set is `j/k scroll`, `n/p comments`, `a/z vote`, `s save`, `c share`,
+  `esc back`, and with a comment focused `j/k scroll`, `n/p comments`,
+  `a/z vote comment`, `enter collapse`, `esc unfocus`. Every set must fit on
+  one line at 80 columns on every feed, Hidden included, so the feed set
+  leaves out `j/k` and `c` (which the post view set still shows) and lists
+  only `1-4` for sorting, not `Tab`. A status toast (green, `✔ …`) replaces
+  the hints until the next key press, left click or wheel event (see Mouse).
 - **Responsive:** the left nav shows only when the body is at least 70 columns
   wide, and the right sidebar only at 100 or more.
 
@@ -164,9 +171,10 @@ bottom edge.
 ### Empty feed
 
 A feed can end up with nothing to show: a search with no hits, Rising +
-Popular, Rising on a group whose posts are all 24h or older, or Saved with
-nothing saved. In that case the tab box stays, showing `0 posts`, and a
-centered, wrapped message replaces the cards:
+Popular, Rising on a group whose posts are all 24h or older, Saved with
+nothing saved, Hidden with nothing hidden, or a feed whose last card was
+hidden. In that case the tab box stays, showing `0 posts`, and a centered,
+wrapped message replaces the cards:
 
 - With an active search: **"Hm... we couldn't find any results"** /
   "Double-check your spelling, or press esc to clear the search". A query
@@ -175,10 +183,13 @@ centered, wrapped message replaces the cards:
   chosen as if there were no query. The header still shows it.
 - In Saved, when no post is saved: **"No saved posts yet"** / "Press s on any
   post to save it".
-- Otherwise, including Saved when Rising hides every saved post: **"Nothing
+- In Hidden, when no post is hidden: **"No hidden posts"** / "Press h on any
+  post to hide it".
+- Otherwise, including Saved when Rising hides every saved post or every saved
+  post is hidden, and Hidden when Rising hides every hidden post: **"Nothing
   here yet"** / "Try another sort with 1-4, or another feed with [ and ]".
 
-In an empty feed, Enter, voting and saving do nothing.
+In an empty feed, Enter, voting, saving and hiding do nothing.
 
 ### Post view (Enter)
 
@@ -250,7 +261,8 @@ struct Comment { author, body, score, hours_ago, replies: Vec<Comment>,
                  vote: Vote }
 struct Post    { group: usize, author, title, body, flair: Option<&str>,
                  score, hours_ago, comment_count: u32,
-                 comments: Vec<Comment>, vote: Vote, saved: bool }
+                 comments: Vec<Comment>, vote: Vote, saved: bool,
+                 hidden: bool }
 enum Vote { Up, None /* default */, Down }
 ```
 
@@ -280,18 +292,21 @@ enum Vote { Up, None /* default */, Down }
   start unjoined, so their posts appear in Popular, All and their own group
   feed, but not in Home. `J` on a group's feed joins or leaves it.
 - **Posts:** 24, built as `Post { …, ..Default::default() }` literals. Every
-  name in the seed data is invented.
+  name in the seed data is invented. None starts saved or hidden.
+- **`hidden`** decides which feeds list the post (see Feeds) and keeps it out
+  of Trending today. Its score, votes, comments and save work as usual while
+  it is hidden.
 
 ## App state (`src/app.rs`)
 
 | Field | Meaning |
 |---|---|
-| `groups`, `posts` | seed data, with the state file applied by `main` before the first frame. `posts` is mutated in place by votes and saves, `groups[g].joined` by `J` |
-| `view: Vec<usize>` | indices into `posts` after feed filter, search and sort |
+| `groups`, `posts` | seed data, with the state file applied by `main` before the first frame. `posts` is mutated in place by votes, saves and hides, `groups[g].joined` by `J` |
+| `view: Vec<usize>` | indices into `posts` after feed filter, search and sort. Changed only by a rebuild, except that `h` removes the card it takes out of the feed (see Selection behavior) |
 | `selected` | index into `view` |
 | `offset` | first card drawn. Maintained by the renderer (see Scrolling) |
 | `sort: Sort` | `Hot`, `New`, `Top`, `Rising` |
-| `feed: Feed` | `Home`, `Popular`, `All`, `Saved`, `Group(usize)` |
+| `feed: Feed` | `Home`, `Popular`, `All`, `Saved`, `Hidden`, `Group(usize)` |
 | `mode: Mode` | `Feed`, `Search`, `Post { scroll: u16 }`. `scroll` is clamped, and moved to reveal a newly focused comment, by the renderer |
 | `query: String` | search text, raw as typed. Kept after leaving search mode with Enter |
 | `search: Query` | `query` parsed into free-text terms and filters. Re-parsed on every rebuild of `view`, and used both to filter and to highlight |
@@ -303,17 +318,23 @@ enum Vote { Up, None /* default */, Down }
 
 ### Feeds (which posts are shown)
 
+A hidden post is in the Hidden feed and in no other: every feed below but
+Hidden first leaves out hidden posts, then applies its own rule.
+
 - **Home:** posts from the groups that are joined when it is rebuilt. `J`
   only works on a group feed, so Home is never on screen while membership
   changes. Going back to it rebuilds it with the new membership.
 - **Popular:** posts with score ≥ 500, under whatever sort is active. It is a
   filter only and doesn't force Hot.
 - **All:** every post.
-- **Saved:** posts with `saved` set, from any group, joined or not.
+- **Saved:** posts with `saved` set, from any group, joined or not, that
+  aren't hidden.
+- **Hidden:** every post with `hidden` set, saved or not, from any group.
+  Sorts and search apply as in any other feed.
 - **Group(g):** posts in group `g`, whether or not you've joined it.
 
-`[` and `]` cycle Home → Popular → All → Saved → each group in seed order,
-wrapping in both directions.
+`[` and `]` cycle Home → Popular → All → Saved → Hidden → each group in seed
+order, wrapping in both directions.
 
 ### Sorts (what order they're in)
 
@@ -382,14 +403,27 @@ current feed and sort, and the view updates on every keystroke.
   Unsaving in the Saved feed works the same way, whether from the card or
   from the post view: the card stays, now showing `☆ Save`, and leaves the
   feed at the next rebuild.
+- **Hiding takes the card out at once, without a rebuild.** When `h` makes the
+  selected post stop belonging to the feed (hiding it anywhere but Hidden,
+  unhiding it in Hidden), its card is removed from `view` right away. Nothing
+  is re-sorted: the other cards keep their order, `selected` keeps its index
+  so the next card takes the removed one's place (or the new last card is
+  selected when the last one went), and `offset` is clamped to `selected`, so
+  it is never past it or past the end of `view`. Hiding the only card leaves
+  the empty-feed message. A kept search, the sort and the feed stay. The
+  renderer then scrolls as usual, and it records the click regions afresh, so
+  the next click hits the card now drawn there.
 - **Joining and leaving don't rebuild either.** A group feed's posts don't
   depend on membership, so `J` keeps `view` and `selected` as they are, and
   a kept search stays too.
 - **Comment votes follow the same rules.** Posts and comments share one
   function for the arithmetic, and comments are never reordered.
-- **These rules differ on purpose.** You change feed, sort or search to
-  get a new list, so landing at its top is expected. You vote on a card while
-  looking at it, so it should stay put.
+- **These rules differ on purpose.** You change feed, sort or search to get a
+  new list, so landing at its top is expected. You vote on a card while
+  looking at it, so it should stay put. Hiding is different again: you hide a
+  post because you don't want to see it, so leaving its card on screen until
+  the next rebuild (as an unsave does) would defeat the point, while a full
+  rebuild would throw away your place in the feed.
 
 ## Key bindings
 
@@ -405,6 +439,7 @@ feed, it saves the state file (see Persistence).
 | `a` / `z` | upvote / downvote | same, for the focused comment, or the post with none focused |
 | `n` / `p` | — | focus next / previous visible comment |
 | `s` | save / unsave (toast) | same, always for the post |
+| `h` | hide / unhide (toast: `Post hidden` / `Post unhidden`). Does nothing in an empty feed | — |
 | `J` | join / leave the group (toast). Only on a group feed, with or without a kept search | — |
 | `c` | "Link copied to clipboard!" toast | same, always for the post |
 | `Enter` | open post (does nothing in an empty feed) | collapse / expand the focused comment (nothing with none focused) |
@@ -417,13 +452,15 @@ feed, it saves the state file (see Persistence).
 
 `—` means the key does nothing. In particular, `J` does nothing in the post
 view, even on a post from a group feed. Like sorting and switching feeds, it
-acts on the feed, so you go back to the feed to join or leave.
+acts on the feed, so you go back to the feed to join or leave. `h` does
+nothing in the post view either: like `J`, hiding acts on the feed. The `···`
+on a card's action row stays decorative.
 
 **Search mode:**
 
-- Every printable key, including `q`, `j`, `J`, `n`, `p` and digits, is typed
-  into the query. Phrases and the `w/`, `u/` and `flair:` filters are described under
-  Search.
+- Every printable key, including `q`, `j`, `J`, `h`, `n`, `p` and digits, is
+  typed into the query. Phrases and the `w/`, `u/` and `flair:` filters are
+  described under Search.
 - Backspace deletes a character.
 - Enter returns to the feed and keeps the filter.
 - Esc returns to the feed and clears it.
@@ -451,7 +488,7 @@ event before the first frame is drawn. `handles_mouse` is that rule, and
 | a card's `▲` / `▼` | select it and vote, like `a` / `z`. Doesn't open the post or re-sort | — |
 | a card's `☆ Save` / `★ Saved` | select it and save / unsave (toast), like `s` | — |
 | a sort tab, its number or label | like its digit, `1`-`4` | not drawn |
-| a nav entry's row | switch to that feed, as `[`/`]` would landing on it. A kept search stays. The current feed: nothing, so the view and selection stay | — |
+| a nav entry's row (`⊘ Hidden` included) | switch to that feed, as `[`/`]` would landing on it. A kept search stays. The current feed: nothing, so the view and selection stay | — |
 | the header search box | enter search mode, like `/` | — |
 | a comment's header row (`u/<author> · <age>`, `[+]` headers included), across the post box | not drawn | focus it. If it is already focused, collapse / expand it, like `Enter` |
 | the wheel, anywhere | select the next / previous card, like `j` / `k` | scroll 3 lines, clamped like `j` / `k` |
@@ -506,20 +543,20 @@ debug build at that size.
 
 ## Persistence (`src/state.rs`)
 
-Your vote on each post and on each comment, each post's `saved` flag and
-each group's `joined` flag are kept in a small text file between runs.
-Nothing else is: every run starts on Home, Hot, at the top, with no query,
-focus, collapse or toast.
+Your vote on each post and on each comment, each post's `saved` and `hidden`
+flags and each group's `joined` flag are kept in a small text file between
+runs. Nothing else is: every run starts on Home, Hot, at the top, with no
+query, focus, collapse or toast.
 
 **What is stored.** Only differences from the seed: a group whose `joined`
 differs from the seed's (both joining an unjoined group and leaving a joined
-one), each saved post, and each post or comment with a vote. The seed has no
-votes and no saves (a test checks it). An entry you undo (vote again, unsave,
-re-join) isn't written by the next save, so it doesn't come back. Scores are
-not stored: a post's or comment's `score` already includes your vote, so the
-file keeps the vote and loading applies it to the seed score with `cast`'s
-arithmetic. An upvoted post comes back at seed + 1, and `a` clears it back to
-the seed score.
+one), each saved post, each hidden post, and each post or comment with a vote.
+The seed has no votes, saves or hidden posts (a test checks it). An entry you
+undo (vote again, unsave, unhide, re-join) isn't written by the next save, so
+it doesn't come back. Scores are not stored: a post's or comment's `score`
+already includes your vote, so the file keeps the vote and loading applies it
+to the seed score with `cast`'s arithmetic. An upvoted post comes back at
+seed + 1, and `a` clears it back to the seed score.
 
 **Keys.** The seed keeps changing, so indices and `CommentPath`s can't be
 keys. Every key is built from content instead:
@@ -538,17 +575,17 @@ without an error, and the next save leaves it out. No hashing is involved,
 so keys don't depend on the Rust release.
 
 **Shared keys.** Two items could share a key, say two posts with the same
-group, author and title, or two sibling replies with the same author and
-body. Then the first in seed order (groups, then each post followed by its
-comments in pre-order) owns the key. The others are never written or loaded:
-their votes and saves last for the session only. A test checks that every
-key in the real seed is unique, so this only matters if a duplicate is added.
+group, author and title, or two sibling replies with the same author and body.
+Then the first in seed order (groups, then each post followed by its comments
+in pre-order) owns the key. The others are never written or loaded: their
+votes, saves and hides last for the session only. A test checks that every key
+in the real seed is unique, so this only matters if a duplicate is added.
 
-**Format.** UTF-8 text. The first line is the version, `workit-state 1`.
-Every other line is one record: tab-separated fields, ending in a newline.
-In each field, `\` is written `\\`, a tab `\t`, a newline `\n` and a
-carriage return `\r`, and everything else as is (`=` and non-ASCII
-included), so any string round-trips. The records, in seed order:
+**Format.** UTF-8 text. The first line is the version, `workit-state 1` or
+`workit-state 2` (see Versions). Every other line is one record: tab-separated
+fields, ending in a newline. In each field, `\` is written `\\`, a tab `\t`, a
+newline `\n` and a carriage return `\r`, and everything else as is (`=` and
+non-ASCII included), so any string round-trips. The records, in seed order:
 
 ```
 workit-state 1
@@ -561,8 +598,34 @@ saved	OfficeLife	priya_r	PSA: the espresso machine on floor 3 is FIXED
 
 - `group`, `joined` or `left`, the group's name.
 - `saved`, then the post's key (3 fields).
+- `hidden`, then the post's key (3 fields). Only in a `workit-state 2` file.
 - `vote`, `up` or `down`, then the key of a post (3 fields) or a comment
   (3 + 2 per level).
+
+A post's records come in the order `saved`, `hidden`, then its `vote`,
+followed by its comments' votes. With a hidden post the same file reads:
+
+```
+workit-state 2
+group	left	Engineering
+group	joined	Announcements
+vote	up	Engineering	dana_k	We deleted 40k lines of dead code and the build got 30% faster
+vote	down	Engineering	dana_k	We deleted 40k lines of dead code and the build got 30% faster	lin_tran	212 diffs?! Who reviewed all of these, and are they okay?	oz_reviewer	I have seen things you people wouldn't believe.
+saved	OfficeLife	priya_r	PSA: the espresso machine on floor 3 is FIXED
+hidden	OfficeLife	priya_r	PSA: the espresso machine on floor 3 is FIXED
+```
+
+**Versions.** A build from before hiding existed reads only `workit-state 1`,
+skips a record kind it doesn't know as malformed, and then drops it on its
+next save. So that such a build can never silently delete hidden posts, a save
+writes `workit-state 2` when it writes at least one `hidden` record, and
+`workit-state 1` otherwise. An older build then refuses a file with hidden
+posts and leaves it alone, while someone who never hides a post can still go
+back to it. Unhiding the last hidden post brings the file back to
+`workit-state 1` on the next save. Both versions load. They differ only in
+`hidden`: in a `workit-state 1` file a `hidden` line is malformed (skipped and
+counted, like any bad line). A `workit-state 1` file from before hiding loads
+exactly as before, and is written back byte for byte when nothing changed.
 
 **Location.** `$WORKIT_STATE` if it is set and non-empty, used as given.
 Otherwise `$XDG_STATE_HOME/workit/state` when `XDG_STATE_HOME` is an absolute
@@ -575,21 +638,21 @@ environment.
 before `ratatui::init()`, so before the first frame. Loading applies each
 record as the keys would (`cast` for votes), then rebuilds `view`, so restored
 state behaves as if you had made those changes by hand: a restored membership
-is in Home's first build and a restored save is in Saved. `App::new()` and
-`App::with_data` stay pure and never touch the file. Saving happens after
-`ratatui::restore()`, and only when `should_quit` is set, by `q` in the feed
-or Ctrl-C in any mode. A panic, or an I/O error that ends the event loop,
-doesn't save. When nothing differs from the seed and there is no file, none is
-created. Otherwise the whole file is rewritten atomically: missing parent
-directories are created, the new contents go to a temp file
-`.<name>.<pid>.tmp` (`.state.<pid>.tmp` by default) in the same directory and
-are synced, and the temp file is renamed over the old one. When a regular file
-is already there (after following symlinks), the temp file gets its
-permissions before anything is written to it, so a `0600` file stays `0600`. A
-new file gets the default mode. The file always holds either the old contents
-or the new ones. A run killed in the middle can leave the temp file behind,
-but never a truncated state file. With two instances running at once, each
-writes what it saw, and the last one to quit wins.
+is in Home's first build, a restored save is in Saved, and a restored hidden
+post is only in Hidden. `App::new()` and `App::with_data` stay pure and never
+touch the file. Saving happens after `ratatui::restore()`, and only when
+`should_quit` is set, by `q` in the feed or Ctrl-C in any mode. A panic, or an
+I/O error that ends the event loop, doesn't save. When nothing differs from
+the seed and there is no file, none is created. Otherwise the whole file is
+rewritten atomically: missing parent directories are created, the new contents
+go to a temp file `.<name>.<pid>.tmp` (`.state.<pid>.tmp` by default) in the
+same directory and are synced, and the temp file is renamed over the old one.
+When a regular file is already there (after following symlinks), the temp file
+gets its permissions before anything is written to it, so a `0600` file stays
+`0600`. A new file gets the default mode. The file always holds either the old
+contents or the new ones. A run killed in the middle can leave the temp file
+behind, but never a truncated state file. With two instances running at once,
+each writes what it saw, and the last one to quit wins.
 
 **Errors.** Bad input never crashes the app or loses the file:
 
@@ -603,11 +666,13 @@ writes what it saw, and the last one to quit wins.
   (a directory, a FIFO, a device, a bigger file) is handled like a read
   error, below.
 - A malformed line (a bad escape, an unknown record kind or value, the wrong
-  number of fields, invalid UTF-8) is skipped and the rest still loads. Blank
-  lines are ignored. A record repeated in the file sets the same state again,
-  so a vote isn't toggled off. The next save drops the bad lines.
-- A file whose first line isn't exactly `workit-state 1` (empty, garbage,
-  binary, a future `workit-state 2`) loads nothing and is never overwritten.
+  number of fields, invalid UTF-8, a `hidden` record in a `workit-state 1`
+  file) is skipped and the rest still loads. Blank lines are ignored. A record
+  repeated in the file sets the same state again, so a vote isn't toggled off.
+  The next save drops the bad lines.
+- A file whose first line isn't exactly `workit-state 1` or `workit-state 2`
+  (empty, garbage, binary, a future `workit-state 3`) loads nothing and is
+  never overwritten.
 - A read error other than a missing file (permissions, not a regular file,
   over 1 MiB) loads nothing, and that run doesn't save, so a file it couldn't
   read is never replaced.
@@ -629,10 +694,10 @@ workit/
                 capture (also turned off on panic), event loop (no redraw for
                 ignored mouse events), loading the state file before the first
                 frame and saving it after the restore, messages on stderr
-    app.rs      state, feeds, sorts, voting, saving, joining, search (query parsing,
-                matching, highlight positions), comment focus and collapse,
-                key handling, mouse handling (hit-testing the click regions).
-                No rendering
+    app.rs      state, feeds, sorts, voting, saving, hiding, joining, search
+                (query parsing, matching, highlight positions), comment focus
+                and collapse, key handling, mouse handling (hit-testing the
+                click regions). No rendering
     data.rs     seed groups, posts, comments
     state.rs    the state file: content keys, format, loading, atomic saving,
                 path selection
@@ -642,20 +707,31 @@ workit/
 
 ## Testing
 
-101 unit tests, run with `cargo test`:
+120 unit tests, run with `cargo test`:
 
-- **`app.rs`** (37), on small custom data sets:
+- **`app.rs`** (44), on small custom data sets:
   - Home hides unjoined groups, and Popular hides low scores.
   - The exact order for each sort.
-  - Feed cycling wraps in both directions, with Saved between All and the
-    groups.
-  - Joining a group adds its posts to Home and leaving one removes them.
-    `J` on a group feed keeps `view` and `selected`, and a kept search. It
-    does nothing on Home, Popular, All and Saved or in the post view, and is
-    typed into the query in search mode.
+  - Feed cycling wraps in both directions, with Saved and then Hidden between
+    All and the groups.
+  - Joining a group adds its posts to Home and leaving one removes them. `J`
+    on a group feed keeps `view` and `selected`, and a kept search. It does
+    nothing on Home, Popular, All, Saved and Hidden or in the post view, and
+    is typed into the query in search mode.
   - Saved lists exactly the saved posts, combined with a search and with
     Rising. Unsaving there, from the card or from the post view, keeps the
     card until the next rebuild.
+  - Hiding in Home, All, a group feed and Saved removing exactly that card,
+    the others keeping their order and `selected` its index; a kept search and
+    the sort staying; hiding the last card selecting the new last one; hiding
+    the only card emptying the feed, after which `h` and Enter do nothing.
+  - `h` doing nothing in an empty Hidden feed and in the post view, and being
+    typed in search mode.
+  - Hidden posts, saved or not and from any group, listed in Hidden and in no
+    other feed.
+  - Unhiding in Hidden removing the card at once, and the post back in its
+    group and in Saved at the next rebuild. Sorting, votes, saves and the post
+    view working on hidden posts.
   - Vote toggling and flipping, without reordering the feed.
   - Selection clamping.
   - Search: live filtering, typing `q` doesn't quit, Esc clears.
@@ -688,7 +764,7 @@ workit/
   - Mouse events before the first frame doing nothing, toast included, and
     stale regions (a card past the end of `view`, a comment hidden under a
     collapsed one) being ignored.
-- **`ui.rs`** (46), rendering into a `TestBackend`:
+- **`ui.rs`** (53), rendering into a `TestBackend`:
   - The helpers `compact`, `age`, `wrap` and `truncate`.
   - The frontpage contents.
   - Sidebars hidden at narrow widths.
@@ -697,15 +773,27 @@ workit/
     width.
   - The selected card staying visible after `G`.
   - Both empty-feed messages, and the empty-Saved one (but not when a search
-    or Rising is what empties Saved).
+    or Rising is what empties Saved, or when every saved post is hidden).
+  - Hidden's "No hidden posts" with nothing hidden, but "Nothing here yet"
+    when Rising filters every hidden post out and "couldn't find any results"
+    for a search, live and kept.
+  - Hiding cards near the bottom of a scrolled feed, one by one down to none,
+    rendering after every key: `offset` never past `selected` or the end of
+    `view`, the selected card always drawn, and the post count dropping by one
+    each time. Hiding every card of a group feed ending on `0 posts` and
+    "Nothing here yet".
+  - A hidden post leaving Trending today, the 5th most commented post taking
+    its place.
   - Comments in the post view, and scroll clamping.
   - `☆ Saved` right below `◎ All` in the nav, and Saved's sidebar.
+  - `⊘ Hidden` right below `☆ Saved`, a click on its row switching to Hidden
+    with a kept search staying, and Hidden's sidebar.
   - The group sidebar button and nav mark flipping with `J`.
   - Every hint set (feed, kept search, search, post view unfocused and
-    focused) fitting in 80 columns on every feed, with `J join` only in the
-    feed set on group feeds, the exact search-mode and post-view sets, a
-    toast replacing the focused set, and `Esc` bringing back the unfocused
-    one.
+    focused) fitting in 80 columns on every feed, Hidden included, with the
+    exact plain and group feed sets, `h hide` in both, `J join` only in the
+    feed set on group feeds, the exact search-mode and post-view sets, a toast
+    replacing the focused set, and `Esc` bringing back the unfocused one.
   - Highlight cells: a title match black on orange and still bold, in the
     original case, with its neighbors untouched, in a kept search too.
   - A phrase wrapping across two title rows highlighted on both.
@@ -774,12 +862,14 @@ workit/
       expanded.
     - Tabs, nav and search box working in an empty feed, where the message
       isn't clickable.
+    - After hiding the first card, its `▲` and the card itself acting on the
+      card now drawn there, never the hidden one.
     - `handles_mouse` accepting exactly left presses and the vertical
       wheel, in the feed and the post view, and nothing in search mode or
       before the first frame. Every event it rejects (moves, releases,
       drags, right and middle buttons, horizontal scroll) leaves every
       field of `App` unchanged, the toast included.
-- **`state.rs`** (18), on in-memory strings and on files in a directory
+- **`state.rs`** (23), on in-memory strings and on files in a directory
   under the system temp dir that each test creates and removes itself. No
   test reads or writes a real state file or reads `HOME`, `XDG_STATE_HOME`
   or `WORKIT_STATE`:
@@ -804,9 +894,21 @@ workit/
     vote value, missing or extra fields, invalid UTF-8) skipped and counted
     while valid lines load, a repeated vote not toggling, and a last line
     with no newline.
-  - An empty, blank, garbage, binary, `workit-state 2` or
-    `workit-state 1 ` (trailing space) first line loading nothing and the
-    file left byte for byte as it was after a save.
+  - An empty, blank, garbage, binary, `workit-state 3`, `workit-state 2 ` or
+    `workit-state 1 ` (trailing space) first line loading nothing and the file
+    left byte for byte as it was after a save, and a `workit-state 3` file
+    with a `hidden` record left alone too, its message naming both versions.
+  - A round trip, by key presses, of a hidden post that is also saved and
+    upvoted, next to a downvote: the exact file with `workit-state 2` and the
+    records in seed order, the post restored hidden (missing from Home and
+    Saved, listed in Hidden), and the file written back the same.
+  - Unhiding the only hidden post bringing the file back to `workit-state 1`
+    with the other records, and the post back on Home.
+  - A `hidden` line in a `workit-state 1` file skipped and counted while the
+    rest loads, and dropped by the next save; the same line loading in a
+    `workit-state 2` file, where a `hidden` record with the wrong fields is
+    still malformed and one matching nothing is dropped.
+  - A `workit-state 1` file written back byte for byte when nothing changed.
   - A directory at the path: reported, nothing written on save; and as a
     save error, reported with no temp file left.
   - A directory, `/dev/zero`, a FIFO and a symlink to the FIFO each refused
@@ -822,7 +924,8 @@ workit/
     `HOME`.
   - A save creating missing directories and leaving no temp file behind.
   - A shared key belonging to the first item, for posts and comments.
-  - Every key in the real seed unique, and the seed with no votes or saves.
+  - Every key in the real seed unique, and the seed with no votes, saves or
+    hidden posts.
 
 Lint with `arc f`, `arc lint` and `arc rust-clippy`. The `arc lint -e extra`
 engine isn't configured for `users/`.

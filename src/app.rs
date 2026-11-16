@@ -56,6 +56,7 @@ pub(crate) enum Feed {
     Popular,
     All,
     Saved,
+    Hidden,
     Group(usize),
 }
 
@@ -440,15 +441,20 @@ impl App {
             Feed::Popular => "Popular".to_owned(),
             Feed::All => "All".to_owned(),
             Feed::Saved => "Saved".to_owned(),
+            Feed::Hidden => "Hidden".to_owned(),
             Feed::Group(g) => format!("w/{}", self.groups[g].name),
         }
     }
 
+    /// A hidden post belongs to the Hidden feed and to no other.
     fn in_feed(&self, post: &Post) -> bool {
+        if post.hidden != (self.feed == Feed::Hidden) {
+            return false;
+        }
         match self.feed {
             Feed::Home => self.groups[post.group].joined,
             Feed::Popular => post.score >= POPULAR_MIN_SCORE,
-            Feed::All => true,
+            Feed::All | Feed::Hidden => true,
             Feed::Saved => post.saved,
             Feed::Group(g) => post.group == g,
         }
@@ -485,10 +491,16 @@ impl App {
     }
 
     fn feeds(&self) -> Vec<Feed> {
-        [Feed::Home, Feed::Popular, Feed::All, Feed::Saved]
-            .into_iter()
-            .chain((0..self.groups.len()).map(Feed::Group))
-            .collect()
+        [
+            Feed::Home,
+            Feed::Popular,
+            Feed::All,
+            Feed::Saved,
+            Feed::Hidden,
+        ]
+        .into_iter()
+        .chain((0..self.groups.len()).map(Feed::Group))
+        .collect()
     }
 
     fn cycle_feed(&mut self, forward: bool) {
@@ -555,6 +567,29 @@ impl App {
         } else {
             "Post unsaved"
         });
+    }
+
+    /// Hides or unhides the selected post. Unlike a vote or an unsave, which
+    /// leave the card in place until the next rebuild, a post that stops
+    /// belonging to the feed (hidden anywhere but Hidden, unhidden in Hidden)
+    /// leaves `view` at once. Nothing is re-sorted: the next card takes its
+    /// place under the cursor, or the new last card when it was the last.
+    fn toggle_hide(&mut self) {
+        let Some(&i) = self.view.get(self.selected) else {
+            return;
+        };
+        let post = &mut self.posts[i];
+        post.hidden = !post.hidden;
+        self.status = Some(if post.hidden {
+            "Post hidden"
+        } else {
+            "Post unhidden"
+        });
+        if post.hidden != (self.feed == Feed::Hidden) {
+            self.view.remove(self.selected);
+            self.selected = self.selected.min(self.view.len().saturating_sub(1));
+            self.offset = self.offset.min(self.selected);
+        }
     }
 
     /// Joins or leaves the open group. The group feed doesn't depend on
@@ -703,6 +738,7 @@ impl App {
             KeyCode::Char('a') => self.vote(Vote::Up),
             KeyCode::Char('z') => self.vote(Vote::Down),
             KeyCode::Char('s') => self.toggle_save(),
+            KeyCode::Char('h') => self.toggle_hide(),
             KeyCode::Char('J') => self.toggle_join(),
             KeyCode::Char('c') => self.status = Some("Link copied to clipboard!"),
             KeyCode::Enter if !self.view.is_empty() => self.open_post(),
@@ -1026,7 +1062,7 @@ mod tests {
     #[test]
     fn join_on_group_feed_keeps_view_and_selection() {
         let mut app = sample();
-        press_str(&mut app, "]]]]");
+        press_str(&mut app, "]]]]]");
         assert_eq!(app.feed, Feed::Group(0));
         press(&mut app, KeyCode::Char('j'));
         let view = app.view.clone();
@@ -1046,7 +1082,13 @@ mod tests {
     #[test]
     fn join_does_nothing_outside_group_feeds_and_is_typed_in_search() {
         let mut app = sample();
-        for feed in [Feed::Home, Feed::Popular, Feed::All, Feed::Saved] {
+        for feed in [
+            Feed::Home,
+            Feed::Popular,
+            Feed::All,
+            Feed::Saved,
+            Feed::Hidden,
+        ] {
             assert_eq!(app.feed, feed);
             press(&mut app, KeyCode::Char('J'));
             assert!(app.groups[0].joined && !app.groups[1].joined, "{feed:?}");
@@ -1134,7 +1176,7 @@ mod tests {
     #[test]
     fn join_with_kept_search_keeps_query_view_and_selection() {
         let mut app = sample();
-        press_str(&mut app, "]]]]");
+        press_str(&mut app, "]]]]]");
         assert_eq!(app.feed, Feed::Group(0));
         press(&mut app, KeyCode::Char('/'));
         press(&mut app, KeyCode::Char('m'));
@@ -1155,7 +1197,7 @@ mod tests {
     #[test]
     fn join_does_nothing_in_post_view() {
         let mut app = sample();
-        press_str(&mut app, "]]]]");
+        press_str(&mut app, "]]]]]");
         assert_eq!(app.feed, Feed::Group(0));
         press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::Char('J'));
@@ -1165,10 +1207,10 @@ mod tests {
     }
 
     #[test]
-    fn feed_cycle_includes_saved_after_all() {
+    fn feed_cycle_includes_saved_and_hidden_after_all() {
         let mut app = sample();
         let mut cycle = |key| {
-            (0..6)
+            (0..7)
                 .map(|_| {
                     press(&mut app, KeyCode::Char(key));
                     app.feed
@@ -1181,6 +1223,7 @@ mod tests {
                 Feed::Popular,
                 Feed::All,
                 Feed::Saved,
+                Feed::Hidden,
                 Feed::Group(0),
                 Feed::Group(1),
                 Feed::Home
@@ -1191,6 +1234,7 @@ mod tests {
             [
                 Feed::Group(1),
                 Feed::Group(0),
+                Feed::Hidden,
                 Feed::Saved,
                 Feed::All,
                 Feed::Popular,
@@ -1381,7 +1425,7 @@ mod tests {
             assert_eq!(searched(query), all, "{query:?}");
         }
         let mut app = search_sample();
-        press_str(&mut app, "]]]]");
+        press_str(&mut app, "]]]]]");
         assert_eq!(app.feed, Feed::Group(0));
         press(&mut app, KeyCode::Char('/'));
         press_str(&mut app, "  ");
@@ -1724,5 +1768,193 @@ mod tests {
         assert_eq!(focused(&app), Some("a"));
         press_str(&mut app, "np");
         assert_eq!(focused(&app), Some("a"));
+    }
+
+    /// Presses `]` until `feed` is on screen.
+    fn go_to(app: &mut App, feed: Feed) {
+        for _ in 0..app.feeds().len() {
+            if app.feed == feed {
+                return;
+            }
+            press(app, KeyCode::Char(']'));
+        }
+        assert_eq!(app.feed, feed);
+    }
+
+    #[test]
+    fn hiding_removes_exactly_that_card_and_keeps_the_selection_index() {
+        let cases = [
+            (
+                Feed::Home,
+                vec!["mid", "old huge", "fresh small"],
+                vec!["mid", "fresh small"],
+            ),
+            (
+                Feed::All,
+                vec!["other group", "mid", "old huge", "fresh small"],
+                vec!["other group", "old huge", "fresh small"],
+            ),
+            (
+                Feed::Group(0),
+                vec!["mid", "old huge", "fresh small"],
+                vec!["mid", "fresh small"],
+            ),
+            (
+                Feed::Saved,
+                vec!["other group", "mid", "old huge", "fresh small"],
+                vec!["other group", "old huge", "fresh small"],
+            ),
+        ];
+        for (feed, before, after) in cases {
+            let mut app = sample();
+            app.posts.iter_mut().for_each(|p| p.saved = true);
+            go_to(&mut app, feed);
+            press(&mut app, KeyCode::Char('j'));
+            assert_eq!(titles(&app), before, "{feed:?}");
+            let gone = app.view[1];
+
+            press(&mut app, KeyCode::Char('h'));
+            assert!(app.posts[gone].hidden, "{feed:?}");
+            assert_eq!(app.status, Some("Post hidden"));
+            assert_eq!(titles(&app), after, "{feed:?}: the others keep their order");
+            assert_eq!(app.selected, 1, "{feed:?}: the next card takes its place");
+            assert_eq!(
+                (app.feed, app.sort, app.mode),
+                (feed, Sort::Hot, Mode::Feed)
+            );
+            assert!(app.posts[gone].saved, "hiding doesn't unsave");
+        }
+    }
+
+    #[test]
+    fn hiding_keeps_a_kept_search_and_the_sort() {
+        let mut app = sample();
+        go_to(&mut app, Feed::All);
+        press(&mut app, KeyCode::Char('3'));
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Char('u'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(titles(&app), ["old huge", "other group"]);
+
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(titles(&app), ["other group"]);
+        assert_eq!((app.selected, app.offset), (0, 0));
+        assert_eq!((app.query.as_str(), app.sort), ("u", Sort::Top));
+        assert_eq!((app.feed, app.mode), (Feed::All, Mode::Feed));
+    }
+
+    #[test]
+    fn hiding_the_last_card_selects_the_new_last_card() {
+        let mut app = sample();
+        go_to(&mut app, Feed::All);
+        press(&mut app, KeyCode::Char('G'));
+        assert_eq!(app.selected, 3);
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(titles(&app), ["other group", "mid", "old huge"]);
+        assert_eq!(app.selected, 2);
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(titles(&app), ["other group", "mid"]);
+        assert_eq!(app.selected, 1);
+        assert!(app.offset <= app.selected);
+    }
+
+    #[test]
+    fn hiding_the_only_card_empties_the_feed_and_h_then_does_nothing() {
+        let mut app = sample();
+        go_to(&mut app, Feed::Group(1));
+        assert_eq!(titles(&app), ["other group"]);
+        press(&mut app, KeyCode::Char('h'));
+        assert!(app.view.is_empty());
+        assert_eq!((app.selected, app.offset), (0, 0));
+        assert_eq!(app.status, Some("Post hidden"));
+
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(app.status, None, "nothing to hide");
+        assert!(app.posts[2].hidden, "not unhidden again");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.mode, Mode::Feed);
+    }
+
+    #[test]
+    fn h_does_nothing_in_an_empty_feed_or_the_post_view_and_is_typed_in_search() {
+        let mut app = sample();
+        go_to(&mut app, Feed::Hidden);
+        assert!(app.view.is_empty(), "nothing is hidden yet");
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(app.status, None);
+        assert!(app.posts.iter().all(|p| !p.hidden));
+
+        go_to(&mut app, Feed::All);
+        let view = app.view.clone();
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(app.mode, Mode::Post { scroll: 0 });
+        assert_eq!(app.status, None);
+        assert!(app.posts.iter().all(|p| !p.hidden), "h means nothing here");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!((app.view.clone(), app.selected), (view, 0));
+
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(app.query, "h", "typed while searching");
+        assert_eq!(app.mode, Mode::Search);
+        assert!(app.posts.iter().all(|p| !p.hidden));
+    }
+
+    #[test]
+    fn hidden_posts_leave_every_other_feed() {
+        let mut app = sample();
+        app.posts[2].saved = true;
+        app.posts[2].hidden = true; // "other group", in the unjoined group
+        app.posts[3].hidden = true; // "mid"
+        press(&mut app, KeyCode::Char('1'));
+        for feed in app.feeds() {
+            go_to(&mut app, feed);
+            let shown = titles(&app);
+            if feed == Feed::Hidden {
+                assert_eq!(shown, ["other group", "mid"], "saved or not, any group");
+            } else {
+                assert!(
+                    !shown.contains(&"mid") && !shown.contains(&"other group"),
+                    "{feed:?}: {shown:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unhiding_in_hidden_removes_the_card_and_restores_the_post_at_the_next_rebuild() {
+        let mut app = sample();
+        go_to(&mut app, Feed::All);
+        press(&mut app, KeyCode::Char('j'));
+        press_str(&mut app, "hh");
+        assert_eq!(titles(&app), ["other group", "fresh small"]);
+
+        go_to(&mut app, Feed::Hidden);
+        assert_eq!(titles(&app), ["mid", "old huge"], "in Hot order");
+        press(&mut app, KeyCode::Char('3'));
+        assert_eq!(titles(&app), ["old huge", "mid"], "under the active sort");
+
+        // Votes, saves and the post view still work on a hidden post.
+        let mid = app.view[1];
+        press_str(&mut app, "jas");
+        assert_eq!((app.posts[mid].score, app.posts[mid].saved), (601, true));
+        assert_eq!(titles(&app), ["old huge", "mid"], "no re-sort");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.selected_post().map(|p| p.title), Some("mid"));
+        press(&mut app, KeyCode::Esc);
+
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(app.status, Some("Post unhidden"));
+        assert!(!app.posts[mid].hidden);
+        assert_eq!(titles(&app), ["old huge"]);
+        assert_eq!(app.selected, 0, "the new last card");
+
+        go_to(&mut app, Feed::Group(0));
+        assert_eq!(titles(&app), ["mid", "fresh small"], "back in its group");
+        go_to(&mut app, Feed::Saved);
+        assert_eq!(titles(&app), ["mid"]);
+        go_to(&mut app, Feed::Hidden);
+        assert_eq!(titles(&app), ["old huge"]);
     }
 }

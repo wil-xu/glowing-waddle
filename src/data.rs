@@ -42,6 +42,8 @@ pub(crate) struct Post {
     pub comments: Vec<Comment>,
     pub vote: Vote,
     pub saved: bool,
+    /// Hidden posts show up only in the Hidden feed.
+    pub hidden: bool,
 }
 
 pub(crate) fn c(author: &'static str, score: i32, hours_ago: u32, body: &'static str) -> Comment {

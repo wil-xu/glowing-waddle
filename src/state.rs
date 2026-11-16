@@ -1,4 +1,4 @@
-//! Votes, saves and group membership, kept between runs in a small text file
+//! Votes, saves, hidden posts and group membership, kept between runs in a small text file
 //! (see Persistence in PLAN.md).
 
 use std::collections::HashMap;
@@ -19,7 +19,13 @@ use crate::app::CommentPath;
 use crate::data::Comment;
 use crate::data::Vote;
 
+/// The version line of a file with no `hidden` record. Builds from before
+/// hiding existed read only this one, so it is written whenever it can be.
 const VERSION: &str = "workit-state 1";
+
+/// The version line of a file with at least one `hidden` record. An older
+/// build refuses it instead of dropping the records it doesn't know.
+const VERSION_HIDDEN: &str = "workit-state 2";
 
 /// The largest state file loaded. Far above anything the seed can produce:
 /// every item in it changed is a few dozen KiB.
@@ -158,12 +164,15 @@ fn push_record<'a>(out: &mut String, fields: impl IntoIterator<Item = &'a str>) 
 }
 
 /// The state file for `app`: the version line, then one record for each
-/// group whose `joined` differs from `seed_joined`, each saved post, and
-/// each post or comment with a vote, in seed order.
+/// group whose `joined` differs from `seed_joined`, each saved post, each
+/// hidden post, and each post or comment with a vote, in seed order. The
+/// version is `VERSION_HIDDEN` when a `hidden` record is written, and
+/// `VERSION` otherwise.
 fn encode(app: &App, seed_joined: &[bool]) -> String {
     let items = items(app);
     let owners = owners(&items);
-    let mut out = format!("{VERSION}\n");
+    let mut out = String::new();
+    let mut any_hidden = false;
     for (key, item) in &items {
         if owners[key.as_slice()] != item {
             continue;
@@ -187,6 +196,10 @@ fn encode(app: &App, seed_joined: &[bool]) -> String {
                 if post.saved {
                     record("saved", None);
                 }
+                if post.hidden {
+                    record("hidden", None);
+                    any_hidden = true;
+                }
                 post.vote
             }
             Item::Comment(i, path) => {
@@ -203,20 +216,23 @@ fn encode(app: &App, seed_joined: &[bool]) -> String {
             Vote::None => {}
         }
     }
-    out
+    let version = if any_hidden { VERSION_HIDDEN } else { VERSION };
+    format!("{version}\n{out}")
 }
 
 /// One line of a state file, unescaped but not yet matched to an item.
 enum Record {
     Group(bool, String),
     Saved(Vec<String>),
+    Hidden(Vec<String>),
     Vote(Vote, Vec<String>),
 }
 
 impl Record {
     /// `None` for a malformed line: a bad escape, an unknown kind or value,
-    /// or the wrong number of fields.
-    fn parse(line: &str) -> Option<Record> {
+    /// or the wrong number of fields. `hidden` is a known kind only in a
+    /// `VERSION_HIDDEN` file, so `hidden_known` says which version this is.
+    fn parse(line: &str, hidden_known: bool) -> Option<Record> {
         let fields: Vec<String> = line.split('\t').map(unescape).collect::<Option<_>>()?;
         let (kind, rest) = fields.split_first()?;
         match (kind.as_str(), rest) {
@@ -229,6 +245,9 @@ impl Record {
                 Some(Record::Group(joined, name.clone()))
             }
             ("saved", key) if key.len() == POST_KEY_LEN => Some(Record::Saved(key.to_vec())),
+            ("hidden", key) if hidden_known && key.len() == POST_KEY_LEN => {
+                Some(Record::Hidden(key.to_vec()))
+            }
             ("vote", [value, key @ ..])
                 if key.len() >= POST_KEY_LEN && (key.len() - POST_KEY_LEN).is_multiple_of(2) =>
             {
@@ -259,6 +278,10 @@ impl Record {
                 Item::Post(i) => Some(Change::Save(*i)),
                 _ => None,
             },
+            Record::Hidden(key) => match owner(&key)? {
+                Item::Post(i) => Some(Change::Hide(*i)),
+                _ => None,
+            },
             Record::Vote(vote, key) => match owner(&key)? {
                 Item::Post(i) => Some(Change::PostVote(*i, vote)),
                 Item::Comment(i, path) => Some(Change::CommentVote(*i, path.clone(), vote)),
@@ -271,6 +294,7 @@ impl Record {
 enum Change {
     Join(usize, bool),
     Save(usize),
+    Hide(usize),
     PostVote(usize, Vote),
     CommentVote(usize, CommentPath, Vote),
 }
@@ -283,8 +307,8 @@ fn set_vote(current: &mut Vote, score: &mut i32, vote: Vote) {
     }
 }
 
-/// The file's first line isn't `VERSION`: it is empty, garbage, binary, or
-/// from a newer version.
+/// The file's first line is neither `VERSION` nor `VERSION_HIDDEN`: it is
+/// empty, garbage, binary, or from a newer version.
 #[derive(Debug, PartialEq, Eq)]
 struct Unrecognized;
 
@@ -294,9 +318,11 @@ struct Unrecognized;
 /// are dropped.
 fn apply(app: &mut App, bytes: &[u8]) -> Result<usize, Unrecognized> {
     let mut lines = bytes.split(|&b| b == b'\n');
-    if lines.next() != Some(VERSION.as_bytes()) {
-        return Err(Unrecognized);
-    }
+    let hidden_known = match lines.next() {
+        Some(line) if line == VERSION.as_bytes() => false,
+        Some(line) if line == VERSION_HIDDEN.as_bytes() => true,
+        _ => return Err(Unrecognized),
+    };
     let mut skipped = 0;
     let changes: Vec<Change> = {
         let items = items(app);
@@ -304,7 +330,9 @@ fn apply(app: &mut App, bytes: &[u8]) -> Result<usize, Unrecognized> {
         lines
             .filter(|line| !line.is_empty())
             .filter_map(|line| {
-                let record = std::str::from_utf8(line).ok().and_then(Record::parse);
+                let record = std::str::from_utf8(line)
+                    .ok()
+                    .and_then(|line| Record::parse(line, hidden_known));
                 if record.is_none() {
                     skipped += 1;
                 }
@@ -316,6 +344,7 @@ fn apply(app: &mut App, bytes: &[u8]) -> Result<usize, Unrecognized> {
         match change {
             Change::Join(g, joined) => app.groups[g].joined = joined,
             Change::Save(i) => app.posts[i].saved = true,
+            Change::Hide(i) => app.posts[i].hidden = true,
             Change::PostVote(i, vote) => {
                 let post = &mut app.posts[i];
                 set_vote(&mut post.vote, &mut post.score, vote);
@@ -435,8 +464,8 @@ impl Store {
                 Err(Unrecognized) => {
                     store.writable = false;
                     Some(format!(
-                        "{shown} doesn't start with \"{VERSION}\", so it wasn't loaded and was \
-                         left unchanged. This run's changes weren't saved."
+                        "{shown} doesn't start with \"{VERSION}\" or \"{VERSION_HIDDEN}\", so it \
+                         wasn't loaded and was left unchanged. This run's changes weren't saved."
                     ))
                 }
             },
@@ -600,9 +629,9 @@ mod tests {
         assert_eq!(titles(app), ["dead code", "pizza"]);
         press(app, "ajzs");
         press(app, "g\nnnnznaq");
-        press(app, "]]]]J]J");
+        press(app, "]]]]]J]J");
         assert_eq!(app.feed, Feed::Group(1));
-        press(app, "[[[[[");
+        press(app, "[[[[[[");
         assert_eq!(app.feed, Feed::Home);
     }
 
@@ -612,7 +641,7 @@ mod tests {
         press(app, "zs]]");
         assert_eq!(titles(app), ["dead code", "pizza", "biscuit"]);
         press(app, "a\nnnnznaq");
-        press(app, "]]J]J");
+        press(app, "]]]J]J");
         assert_eq!(app.feed, Feed::Group(1));
     }
 
@@ -739,7 +768,7 @@ mod tests {
     fn nothing_changed_and_no_file_creates_nothing() {
         let dir = TempDir::new("no-file");
         let path = dir.0.join("sub").join("state");
-        run(&path, seed(), |app| press(app, "aa]]]]JJ"));
+        run(&path, seed(), |app| press(app, "aa]]]]]JJ"));
         assert!(!dir.0.join("sub").exists(), "not even the directory");
     }
 
@@ -839,7 +868,7 @@ mod tests {
         ];
         let mut app = App::with_data(groups.clone(), posts.clone());
         let seed_joined = seed_joined(&app);
-        press(&mut app, "]]]]J");
+        press(&mut app, "]]]]]J");
         app.posts[0].saved = true;
         let first = &mut app.posts[0];
         app::cast(&mut first.vote, &mut first.score, Vote::Down);
@@ -918,7 +947,8 @@ mod tests {
         for contents in [
             &b""[..],
             b"\n",
-            b"workit-state 2\nvote\tup\tEngineering\tdana\tdead code\n",
+            b"workit-state 3\nvote\tup\tEngineering\tdana\tdead code\n",
+            b"workit-state 2 \nvote\tup\tEngineering\tdana\tdead code\n",
             b"workit-state 1 \nvote\tup\tEngineering\tdana\tdead code\n",
             b"vote\tup\tEngineering\tdana\tdead code\n",
             b"\x00\x9f\x92\x96binary\n",
@@ -1171,5 +1201,149 @@ mod tests {
             "every seed key is unique"
         );
         assert_eq!(encode(&app, &seed_joined(&app)), "workit-state 1\n");
+    }
+
+    /// Downvotes "dead code", then upvotes, saves and hides "pizza", by key
+    /// presses on Home.
+    const HIDDEN: &str = "workit-state 2\n\
+        vote\tdown\tEngineering\tdana\tdead code\n\
+        saved\tFood\tchef\tpizza\n\
+        hidden\tFood\tchef\tpizza\n\
+        vote\tup\tFood\tchef\tpizza\n";
+
+    #[test]
+    fn a_hidden_post_round_trips_with_version_2() {
+        let dir = TempDir::new("hidden");
+        let path = dir.0.join("state");
+        run(&path, seed(), |app| {
+            press(app, "jash");
+            assert_eq!(titles(app), ["dead code"], "pizza left Home at once");
+            press(app, "z");
+        });
+        assert_eq!(fs::read_to_string(&path).unwrap(), HIDDEN);
+
+        let app = run(&path, seed(), |app| {
+            let pizza = find(app, "pizza");
+            assert_eq!(
+                (pizza.score, pizza.vote, pizza.saved, pizza.hidden),
+                (71, Vote::Up, true, true)
+            );
+            assert!(!find(app, "dead code").hidden);
+            assert!(!find(app, "biscuit").hidden);
+            assert_eq!(titles(app), ["dead code"], "Home's first build");
+            press(app, "]]]");
+            assert_eq!(app.feed, Feed::Saved);
+            assert!(app.view.is_empty(), "the saved post is hidden");
+            press(app, "]");
+            assert_eq!(app.feed, Feed::Hidden);
+            assert_eq!(titles(app), ["pizza"]);
+        });
+        assert_eq!(encode(&app, &seed_joined(&seed())), HIDDEN);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            HIDDEN,
+            "written back the same"
+        );
+    }
+
+    #[test]
+    fn unhiding_everything_goes_back_to_version_1() {
+        let dir = TempDir::new("unhide");
+        let path = dir.0.join("state");
+        fs::write(&path, HIDDEN).unwrap();
+        run(&path, seed(), |app| {
+            press(app, "]]]]");
+            assert_eq!((app.feed, titles(app)), (Feed::Hidden, vec!["pizza"]));
+            press(app, "h");
+            assert!(app.view.is_empty(), "pizza left Hidden at once");
+        });
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "workit-state 1\n\
+             vote\tdown\tEngineering\tdana\tdead code\n\
+             saved\tFood\tchef\tpizza\n\
+             vote\tup\tFood\tchef\tpizza\n"
+        );
+        let app = run(&path, seed(), |app| {
+            assert!(!find(app, "pizza").hidden);
+            assert_eq!(titles(app), ["dead code", "pizza"], "back on Home");
+        });
+        assert!(!encode(&app, &seed_joined(&seed())).contains("hidden"));
+    }
+
+    #[test]
+    fn a_hidden_record_in_a_version_1_file_is_malformed() {
+        let records = "vote\tup\tEngineering\tdana\tdead code\n\
+            hidden\tFood\tchef\tpizza\n\
+            saved\tFood\tchef\tpizza\n";
+        let mut app = seed();
+        let v1 = format!("workit-state 1\n{records}");
+        assert_eq!(apply(&mut app, v1.as_bytes()), Ok(1), "skipped and counted");
+        let pizza = find(&app, "pizza");
+        assert_eq!((pizza.saved, pizza.hidden), (true, false));
+        assert_eq!(find(&app, "dead code").score, 101, "the rest loads");
+
+        let mut app = seed();
+        let v2 = format!("workit-state 2\n{records}");
+        assert_eq!(apply(&mut app, v2.as_bytes()), Ok(0));
+        assert!(find(&app, "pizza").hidden);
+
+        // In a version 2 file, a `hidden` record is still checked like the rest.
+        let mut app = seed();
+        let bad = "workit-state 2\n\
+            hidden\tFood\tchef\n\
+            hidden\tFood\tchef\tpizza\textra\n\
+            hidden\tyes\tFood\tchef\tpizza\n\
+            hidden\tFood\tchef\tpasta\n";
+        assert_eq!(
+            apply(&mut app, bad.as_bytes()),
+            Ok(3),
+            "pasta matches nothing"
+        );
+        assert!(app.posts.iter().all(|p| !p.hidden));
+
+        let dir = TempDir::new("hidden-v1");
+        let path = dir.0.join("state");
+        fs::write(&path, &v1).unwrap();
+        let mut app = seed();
+        let (store, message) = Store::load(path.clone(), &mut app);
+        assert!(message.unwrap().starts_with("ignored 1 malformed line(s)"));
+        store.save(&app).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "workit-state 1\n\
+             vote\tup\tEngineering\tdana\tdead code\n\
+             saved\tFood\tchef\tpizza\n",
+            "the next save drops it"
+        );
+    }
+
+    #[test]
+    fn a_version_1_file_is_written_back_byte_for_byte() {
+        let dir = TempDir::new("v1-unchanged");
+        let path = dir.0.join("state");
+        fs::write(&path, CHANGED).unwrap();
+        let app = run(&path, seed(), |_| {});
+        assert_eq!(fs::read_to_string(&path).unwrap(), CHANGED);
+        assert_eq!(encode(&app, &seed_joined(&seed())), CHANGED);
+    }
+
+    #[test]
+    fn a_future_version_with_hidden_records_is_left_alone() {
+        let dir = TempDir::new("version-3");
+        let path = dir.0.join("state");
+        let contents = "workit-state 3\nhidden\tFood\tchef\tpizza\nsaved\tFood\tchef\tpizza\n";
+        fs::write(&path, contents).unwrap();
+        let mut app = seed();
+        let (store, message) = Store::load(path.clone(), &mut app);
+        let message = message.unwrap();
+        assert!(message.contains("left unchanged"), "{message}");
+        assert!(message.contains("\"workit-state 1\" or \"workit-state 2\""));
+        let pizza = find(&app, "pizza");
+        assert_eq!((pizza.saved, pizza.hidden), (false, false));
+        press(&mut app, "jh");
+        store.save(&app).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), contents);
+        assert_eq!(dir.entries(), ["state"]);
     }
 }

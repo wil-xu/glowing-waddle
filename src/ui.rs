@@ -227,14 +227,16 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             ("esc", "clear search"),
             ("q", "quit"),
         ],
-        // Feed hints must fit on one line at 80 columns.
+        // Feed hints must fit on one line at 80 columns. With `J join` and
+        // `h hide` the group set would be 84, so it leaves out `enter open`:
+        // Enter is the most guessable key, and clicking a card opens it too.
         Mode::Feed if matches!(app.feed, Feed::Group(_)) => &[
             ("a/z", "vote"),
-            ("enter", "open"),
             ("1-4", "sort"),
             ("[/]", "feed"),
             ("/", "search"),
             ("s", "save"),
+            ("h", "hide"),
             ("J", "join"),
             ("q", "quit"),
         ],
@@ -245,6 +247,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             ("[/]", "feed"),
             ("/", "search"),
             ("s", "save"),
+            ("h", "hide"),
             ("q", "quit"),
         ],
         Mode::Search => &[
@@ -303,6 +306,10 @@ fn render_nav(frame: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
         ),
         (item("◎ All".to_owned(), Feed::All), Some(Feed::All)),
         (item("☆ Saved".to_owned(), Feed::Saved), Some(Feed::Saved)),
+        (
+            item("⊘ Hidden".to_owned(), Feed::Hidden),
+            Some(Feed::Hidden),
+        ),
         (Line::raw(""), None),
         (Line::styled(" GROUPS", Style::new().fg(DIM)), None),
     ]
@@ -362,7 +369,7 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
             ]);
             lines
         }
-        Feed::Home | Feed::Popular | Feed::All | Feed::Saved => wrap(
+        Feed::Home | Feed::Popular | Feed::All | Feed::Saved | Feed::Hidden => wrap(
             "Your personal workit frontpage. Come here to check in with your favorite groups.",
             width,
         )
@@ -373,7 +380,7 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     let button = match app.feed {
         Feed::Group(g) if app.groups[g].joined => " Joined ",
         Feed::Group(_) => " Join ",
-        Feed::Home | Feed::Popular | Feed::All | Feed::Saved => " Create Post ",
+        Feed::Home | Feed::Popular | Feed::All | Feed::Saved | Feed::Hidden => " Create Post ",
     };
     about.push(Line::raw(""));
     about.push(
@@ -385,10 +392,11 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     );
     let about_title = match app.feed {
         Feed::Group(g) => format!("About w/{}", app.groups[g].name),
-        Feed::Home | Feed::Popular | Feed::All | Feed::Saved => app.feed_name(),
+        Feed::Home | Feed::Popular | Feed::All | Feed::Saved | Feed::Hidden => app.feed_name(),
     };
 
-    let mut trending: Vec<&Post> = app.posts.iter().collect();
+    // Hidden posts are left out here too, so the next one takes the place.
+    let mut trending: Vec<&Post> = app.posts.iter().filter(|p| !p.hidden).collect();
     trending.sort_by_key(|p| std::cmp::Reverse(p.comment_count));
     let trending: Vec<Line> = trending
         .iter()
@@ -511,6 +519,8 @@ fn render_feed(frame: &mut Frame, app: &mut App, area: Rect, hits: &mut Hits) {
             )
         } else if app.feed == Feed::Saved && !app.posts.iter().any(|p| p.saved) {
             ("No saved posts yet", "Press s on any post to save it")
+        } else if app.feed == Feed::Hidden && !app.posts.iter().any(|p| p.hidden) {
+            ("No hidden posts", "Press h on any post to hide it")
         } else {
             (
                 "Nothing here yet",
@@ -1279,6 +1289,14 @@ mod tests {
     fn every_hint_set_fits_80_columns_on_every_feed() {
         let mut app = App::new();
         app.posts[0].saved = true;
+        // Hidden needs a post to open too, from a group with another one left.
+        let hidden = (1..app.posts.len())
+            .find(|&i| {
+                let group = app.posts[i].group;
+                (0..app.posts.len()).any(|j| j != i && app.posts[j].group == group)
+            })
+            .expect("some seed group has two posts");
+        app.posts[hidden].hidden = true;
         // So that `n` has a comment to focus on every post.
         for post in app.posts.iter_mut().filter(|p| p.comments.is_empty()) {
             post.comments.push(data::c("someone", 1, 1, "First!"));
@@ -1292,14 +1310,24 @@ mod tests {
                 .to_owned()
         };
 
-        let feeds = 4 + app.groups.len();
+        press(&mut app, KeyCode::Char('1'));
+        let feeds = 5 + app.groups.len();
+        let mut visited = Vec::new();
         for _ in 0..feeds {
             let feed = app.feed;
+            visited.push(feed);
             let on_group = matches!(feed, Feed::Group(_));
 
             let plain = footer(&mut app);
             assert!(plain.ends_with("q quit"), "{feed:?}: {plain:?}");
+            assert!(plain.contains(" h hide "), "{feed:?}: {plain:?}");
             assert_eq!(plain.contains("J join"), on_group, "{feed:?}: {plain:?}");
+            let expected = if on_group {
+                " a/z vote  1-4 sort  [/] feed  / search  s save  h hide  J join  q quit"
+            } else {
+                " a/z vote  enter open  1-4 sort  [/] feed  / search  s save  h hide  q quit"
+            };
+            assert_eq!(plain, expected, "{feed:?}");
 
             press(&mut app, KeyCode::Char('/'));
             press(&mut app, KeyCode::Char('e'));
@@ -1344,6 +1372,7 @@ mod tests {
             press(&mut app, KeyCode::Char(']'));
         }
         assert_eq!(app.feed, Feed::Home, "visited every feed");
+        assert!(visited.contains(&Feed::Hidden), "{visited:?}");
     }
 
     fn type_str(app: &mut App, text: &str) {
@@ -1531,7 +1560,7 @@ mod tests {
     #[test]
     fn filters_alone_render_exactly_like_no_query() {
         let mut app = App::new();
-        type_str(&mut app, "]]]]");
+        type_str(&mut app, "]]]]]");
         assert_eq!(app.feed, Feed::Group(0));
         let view = app.view.clone();
         let plain_feed = buffer(&mut app, 110, 24);
@@ -2622,5 +2651,244 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Presses `]` until `feed` is on screen.
+    fn go_to(app: &mut App, feed: Feed) {
+        for _ in 0..6 + app.groups.len() {
+            if app.feed == feed {
+                return;
+            }
+            press(app, KeyCode::Char(']'));
+        }
+        assert_eq!(app.feed, feed);
+    }
+
+    /// The selection and offset are in bounds, and the selected card is on
+    /// screen after a render.
+    fn assert_scroll_in_bounds(app: &mut App, why: &str) {
+        let check = |app: &App, when: &str| {
+            assert!(app.offset <= app.selected, "{why} {when}");
+            assert!(
+                app.view.is_empty() || app.selected < app.view.len(),
+                "{why} {when}"
+            );
+            assert!(app.offset <= app.view.len(), "{why} {when}");
+        };
+        check(app, "before the render");
+        let s = screen(app, 110, 24);
+        check(app, "after the render");
+        assert!(
+            s.contains(&format!(" {} posts ", app.view.len())),
+            "{why}:\n{s}"
+        );
+        if !app.view.is_empty() {
+            let title = title_of(app, app.selected);
+            assert!(s.contains(&title), "{why}: {title:?} not drawn:\n{s}");
+        }
+    }
+
+    #[test]
+    fn hiding_near_the_bottom_keeps_the_offset_in_bounds() {
+        let mut app = App::new();
+        go_to(&mut app, Feed::All);
+        let total = app.view.len();
+        press(&mut app, KeyCode::Char('G'));
+        assert_scroll_in_bounds(&mut app, "after G");
+        assert!(app.offset > 0, "scrolled");
+
+        // One above the last card, then the last card, render after each key.
+        press(&mut app, KeyCode::Char('k'));
+        assert_scroll_in_bounds(&mut app, "after k");
+        let next = app.view[app.selected + 1];
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(app.view[app.selected], next, "the next card moved up");
+        assert_scroll_in_bounds(&mut app, "after hiding the second to last");
+        assert_eq!(app.view.len(), total - 1);
+
+        let mut left = total - 1;
+        while left > 0 {
+            assert_eq!(app.selected, left - 1, "the last card is selected");
+            press(&mut app, KeyCode::Char('h'));
+            left -= 1;
+            assert_eq!(app.view.len(), left);
+            assert_scroll_in_bounds(&mut app, &format!("{left} left"));
+        }
+        let s = screen(&mut app, 110, 24);
+        assert!(
+            s.contains(" 0 posts ") && s.contains("Nothing here yet"),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn hiding_every_card_of_a_group_feed_counts_down_to_nothing_here_yet() {
+        let mut app = App::new();
+        go_to(&mut app, Feed::Group(0));
+        let mut left = app.view.len();
+        assert!(left >= 2, "{left}");
+        while left > 0 {
+            let s = screen(&mut app, 110, 24);
+            assert!(s.contains(&format!(" {left} posts ")), "{s}");
+            press(&mut app, KeyCode::Char('h'));
+            left -= 1;
+            assert_eq!(app.view.len(), left);
+        }
+        let s = screen(&mut app, 110, 24);
+        assert!(s.contains(" 0 posts "), "{s}");
+        assert!(s.contains("Nothing here yet"), "{s}");
+        assert!(s.contains("Post hidden"), "{s}");
+    }
+
+    /// The right sidebar's text, at 140 columns.
+    fn sidebar(app: &mut App) -> String {
+        rows(&buffer(app, 140, 40))
+            .iter()
+            .map(|row| row.chars().skip(140 - 32).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn hidden_posts_leave_trending_today() {
+        let mut app = App::new();
+        go_to(&mut app, Feed::All);
+        let mut by_comments: Vec<usize> = (0..app.posts.len()).collect();
+        by_comments.sort_by_key(|&i| std::cmp::Reverse(app.posts[i].comment_count));
+        let titles: Vec<String> = app.posts.iter().map(|p| truncate(p.title, 28)).collect();
+        let shown = |i: usize| titles[i].clone();
+        let [top, .., fifth] = by_comments[..5] else {
+            panic!("seed has 5 posts");
+        };
+        let (top_title, fifth_title) = (shown(top), shown(fifth));
+
+        let s = sidebar(&mut app);
+        assert!(s.contains("Trending today"), "{s}");
+        assert!(s.contains(&top_title), "{s}");
+        assert!(!s.contains(&fifth_title), "{s}");
+
+        app.selected = app.view.iter().position(|&i| i == top).expect("in All");
+        press(&mut app, KeyCode::Char('h'));
+        assert!(app.posts[top].hidden);
+        let s = sidebar(&mut app);
+        assert!(!s.contains(&top_title), "the hidden post is gone:\n{s}");
+        assert!(
+            s.contains(&fifth_title),
+            "the next one takes its place:\n{s}"
+        );
+        for &i in &by_comments[1..4] {
+            assert!(s.contains(&shown(i)), "{s}");
+        }
+    }
+
+    #[test]
+    fn saved_says_no_saved_posts_only_when_nothing_is_saved() {
+        let mut app = App::new();
+        go_to(&mut app, Feed::Saved);
+        let s = screen(&mut app, 110, 24);
+        assert!(s.contains("No saved posts yet"), "{s}");
+
+        // Save the first Home post, then hide it: Saved is empty, not unused.
+        go_to(&mut app, Feed::Home);
+        type_str(&mut app, "sh");
+        go_to(&mut app, Feed::Saved);
+        assert!(app.view.is_empty());
+        let s = screen(&mut app, 110, 24);
+        assert!(s.contains("Nothing here yet"), "{s}");
+        assert!(!s.contains("No saved posts yet"), "{s}");
+        assert!(s.contains(" 0 posts "), "{s}");
+    }
+
+    #[test]
+    fn hidden_empty_messages() {
+        let mut app = App::new();
+        go_to(&mut app, Feed::Hidden);
+        let s = screen(&mut app, 110, 24);
+        assert!(s.contains("No hidden posts"), "{s}");
+        assert!(s.contains("Press h on any post to hide it"), "{s}");
+        assert!(!s.contains("Nothing here yet"), "{s}");
+
+        // Hide a post a day old, then let Rising or a search filter it out.
+        go_to(&mut app, Feed::All);
+        app.selected = app
+            .view
+            .iter()
+            .position(|&i| app.posts[i].hours_ago >= 24)
+            .expect("seed data has posts a day old");
+        press(&mut app, KeyCode::Char('h'));
+        go_to(&mut app, Feed::Hidden);
+        assert_eq!(app.view.len(), 1);
+        press(&mut app, KeyCode::Char('4'));
+        assert!(app.view.is_empty());
+        let s = screen(&mut app, 110, 24);
+        assert!(s.contains("Nothing here yet"), "Rising:\n{s}");
+        assert!(!s.contains("No hidden posts"), "{s}");
+
+        press(&mut app, KeyCode::Char('1'));
+        press(&mut app, KeyCode::Char('/'));
+        type_str(&mut app, "zzzz");
+        let s = screen(&mut app, 110, 24);
+        assert!(s.contains("couldn't find any results"), "search:\n{s}");
+        assert!(!s.contains("No hidden posts"), "{s}");
+        press(&mut app, KeyCode::Enter);
+        let s = screen(&mut app, 110, 24);
+        assert!(s.contains("couldn't find any results"), "kept:\n{s}");
+    }
+
+    #[test]
+    fn nav_shows_hidden_after_saved_and_a_click_opens_it() {
+        let mut app = App::new();
+        press(&mut app, KeyCode::Char('/'));
+        type_str(&mut app, "w/");
+        press(&mut app, KeyCode::Enter);
+        let buf = buffer(&mut app, 110, 24);
+        let (sx, sy) = find(&buf, "☆ Saved");
+        let (hx, hy) = find(&buf, "⊘ Hidden");
+        assert_eq!((hx, hy), (sx, sy + 1), "right below Saved");
+
+        click(&mut app, (hx + 12, hy));
+        assert_eq!(app.feed, Feed::Hidden);
+        assert_eq!(app.query, "w/", "a kept search stays");
+        let buf = buffer(&mut app, 110, 24);
+        let s = rows(&buf).join("\n");
+        for needle in [
+            "╭ Hidden ",
+            "Your personal workit",
+            "Create Post",
+            "No hidden posts",
+        ] {
+            assert!(s.contains(needle), "missing {needle:?} in:\n{s}");
+        }
+        assert_eq!(buf[(hx, hy)].fg, ORANGE, "the active entry");
+
+        click(&mut app, (sx, sy));
+        assert_eq!(app.feed, Feed::Saved);
+    }
+
+    #[test]
+    fn a_click_after_hiding_hits_the_card_drawn_there() {
+        let mut app = App::new();
+        buffer(&mut app, 110, 24);
+        let gone = app.view[0];
+        let next = app.view[1];
+        let score = app.posts[next].score;
+        press(&mut app, KeyCode::Char('h'));
+        let buf = buffer(&mut app, 110, 24);
+        let (x, y) = find(&buf, &title_of(&app, 0));
+        assert_eq!(app.view[0], next);
+
+        // The ▲ of the first card drawn: two rows above the score, left of it.
+        let (_, arrow_y) = find(&buf, "▲");
+        let arrow_x = (0..110)
+            .find(|&x| buf[(x, arrow_y)].symbol() == "▲")
+            .expect("drawn");
+        click(&mut app, (arrow_x, arrow_y));
+        assert_eq!(app.posts[next].score, score + 1, "voted on the new card");
+        assert_eq!(app.posts[gone].vote, Vote::None, "not the hidden one");
+
+        buffer(&mut app, 110, 24);
+        click(&mut app, (x, y));
+        assert_eq!(app.mode, Mode::Post { scroll: 0 });
+        assert_eq!(app.view[app.selected], next, "opened the card drawn there");
     }
 }
