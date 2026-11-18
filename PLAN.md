@@ -18,6 +18,9 @@ fix whichever one is wrong. Don't let them drift apart.
   read its comment tree (voting on comments and collapsing threads), saving
   posts and listing them in a Saved feed, and hiding posts, which then show up
   only in a Hidden feed where they can be unhidden.
+- Like Reddit, the feed has a Card view (a bordered card per post, the
+  default) and a Compact view (one row per post), switched at runtime with
+  `v` or the switch on the sort-tab row.
 - Votes, saves, hidden posts and group membership survive a restart (see
   Persistence).
 - One self-contained binary. No network and no real Workplace data: all
@@ -28,8 +31,9 @@ fix whichever one is wrong. Don't let them drift apart.
 - Fetching real Workplace content (would need auth and APIs, and raises privacy
   concerns).
 - Persisting anything beyond votes, saves, hidden posts and group membership.
-  The feed, sort, search, selection, scroll, comment focus and collapse state
-  and the toast start fresh on every run, on Home, Hot, at the top.
+  The feed, sort, search, Card/Compact view, selection, scroll, comment focus
+  and collapse state and the toast start fresh on every run, on Home, Hot, in
+  the Card view, at the top.
 
 ## Build & run
 
@@ -57,7 +61,7 @@ Captured from the real binary in a 110×24 tmux pane:
 │ ◉  workit     ⌕ Search Home                                                           ● u/you  ✦ 1.3k karma│
 ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
 ╭────────────────────╮╭ Home ────────────────────────────────────────────────╮╭ Home ────────────────────────╮
-│ ⌂ Home             ││ 1 Hot   2 New   3 Top   4 Rising                     ││ Your personal workit         │
+│ ⌂ Home             ││ 1 Hot   2 New   3 Top   4 Rising              ▦ Card ││ Your personal workit         │
 │ ↗ Popular          │╰──────────────────────────────────────────── 19 posts ╯│ frontpage. Come here to      │
 │ ◎ All              │╭──────────────────────────────────────────────────────╮│ check in with your favorite  │
 │ ☆ Saved            ││   ▲   w/Engineering · u/dana_k · 3h ago   Win        ││ groups.                      │
@@ -76,13 +80,49 @@ Captured from the real binary in a 110×24 tmux pane:
 │                    │╰──────────────────────────────────────────────────────╯╰──────────────────────────────╯
 │                    │╭──────────────────────────────────────────────────────╮
 ╰────────────────────╯╰──────────────────────────────────────────────────────╯
- a/z vote  enter open  1-4 sort  [/] feed  / search  s save  h hide  q quit
+ a/z vote  1-4 sort  [/] feed  / search  s save  h hide  v view  q quit
+```
+
+The same screen in the Compact view (`v`, then `j` to select the second post
+and clear the toast). The selected row is drawn on the highlight background
+with an orange title, which a capture doesn't show:
+
+```
+╭────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ ◉  workit     ⌕ Search Home                                                           ● u/you  ✦ 1.3k karma│
+╰────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭────────────────────╮╭ Home ────────────────────────────────────────────────╮╭ Home ────────────────────────╮
+│ ⌂ Home             ││ 1 Hot   2 New   3 Top   4 Rising           ≡ Compact ││ Your personal workit         │
+│ ↗ Popular          │╰──────────────────────────────────────────── 19 posts ╯│ frontpage. Come here to      │
+│ ◎ All              │ ▲  1.2k ▼ ☆ We deleted 40k lines of d…  3h ago · ▤ 194 │ check in with your favorite  │
+│ ☆ Saved            │ ▲   856 ▼ ☆ PSA: the espresso machine…  1h ago · ▤ 100 │ groups.                      │
+│ ⊘ Hidden           │ ▲  1.9k ▼ ☆ Got paged at 3:12am becau…  9h ago · ▤ 305 │                              │
+│                    │ ▲   512 ▼ ☆ Ranking every cafe pizza …  4h ago · ▤ 154 │          Create Post         │
+│ GROUPS             │ ▲    1k ▼ ☆ The boba cart is back on T…  8h ago · ▤ 91 ╰──────────────────────────────╯
+│ ● w/Engineering    │ ▲   634 ▼ ☆ What's your best trick fo…  7h ago · ▤ 215 ╭ Trending today ──────────────╮
+│ ● w/RemoteWork     │ ▲   388 ▼ ☆ First oncall shift starts…  6h ago · ▤ 113 │ Hackathon 2026 is happening… │
+│ ● w/OfficeLife     │ ▲   201 ▼ ☆ It is 4am. Our demo is in …  3h ago · ▤ 31 │ w/Announcements · 545 comme… │
+│ ● w/Hackathon      │ ▲   156 ▼ ☆ Is it normal to feel lost …  2h ago · ▤ 73 │ Biscuit got his own visitor… │
+│ ○ w/Announcements  │ ▲    92 ▼ ☆ To everyone scheduling 8am…  1h ago · ▤ 19 │ w/DogsOfTheOffice · 406 com… │
+│ ● w/Foodies        │ ▲   921 ▼ ☆ Unpopular opinion: most …  14h ago · ▤ 393 │ Unpopular opinion: most of … │
+│ ○ w/DogsOfTheOffice│ ▲   298 ▼ ☆ LF 2 people for a hackath…  11h ago · ▤ 42 │ w/Engineering · 393 comments │
+│ ● w/OncallSurvivors│ ▲   267 ▼ ☆ The salad bar added a 'bu…  16h ago · ▤ 61 │ New building opens Monday: … │
+│                    │ ▲   433 ▼ ☆ Who keeps setting the 4t…  20h ago · ▤ 122 │ w/Announcements · 332 comme… │
+│                    │ ▲   512 ▼ ☆ This test has failed 1 i…  22h ago · ▤ 101 ╰──────────────────────────────╯
+│                    │ ▲  1.4k ▼ ☆ My cat joined a 200-perso…  1d ago · ▤ 262
+╰────────────────────╯ ▲   744 ▼ ☆ Our team built a bot that…  1d ago · ▤ 151
+ a/z vote  1-4 sort  [/] feed  / search  s save  h hide  v view  q quit
 ```
 
 **No emoji, on purpose.** Every glyph is a single-width character:
-`◉ ⌕ ✦ ⌂ ↗ ◎ ● ○ ▲ ▼ ▤ ☆ ★ ⊘ ··· ✔`. Emoji such as 🔥 or 💬 render two cells
+`◉ ⌕ ✦ ⌂ ↗ ◎ ● ○ ▲ ▼ ▤ ☆ ★ ⊘ ··· ✔ ▦ ≡`. Emoji such as 🔥 or 💬 render two cells
 wide in most terminals, and widely in tmux, which breaks the alignment of the
-bordered cards. Don't add them.
+bordered cards. Don't add them. Check new symbols too: `☰` (the trigram,
+an obvious "list" icon) was tried for the Compact switch and dropped. It is
+Wide since Unicode 16, so ratatui (`unicode-width` 0.2) gives it two cells
+while tmux 3.7 draws it in one, and the label came out with a gap. A test
+checks that `▦` and `≡` are one cell each in ratatui and appear nowhere else
+on screen.
 
 The screen is a header (3 rows), a body, and a footer (1 row).
 
@@ -97,8 +137,14 @@ The screen is a header (3 rows), a body, and a footer (1 row).
   leave. The active feed is orange on a dark background.
 - **Feed:** a box titled with the feed name holds the numbered sort tabs. The
   active tab is orange and underlined, and the box's bottom edge shows the
-  post count. Post cards follow. The selected card has an orange border and a
-  highlighted vote column.
+  post count. Right-aligned on the tab row, with one blank column before the
+  border, is the view switch: `▦ Card` or `≡ Compact` (an orange glyph and
+  the current view's name in white). It is drawn only when there is at least
+  one blank column between it and the end of `Rising`, so it never overlaps a
+  tab: the feed column needs at least 46 columns for `≡ Compact` and 43 for
+  `▦ Card`. Clicking it toggles the view like `v`. Post cards, or compact
+  rows, follow. The selected card has an orange border and a highlighted vote
+  column.
 - **Right sidebar** (`SIDEBAR_WIDTH = 32`):
   - In a group feed, the top box is "About w/<group>": description, member and
     online counts, and a Joined/Join button showing the current membership.
@@ -116,17 +162,27 @@ The screen is a header (3 rows), a body, and a footer (1 row).
 - **Footer:** key hints, which change with the mode. There are separate sets
   for the feed, the feed with a kept search, search mode, and the post view
   with and without a focused comment. The plain feed set is `a/z vote`,
-  `enter open`, `1-4 sort`, `[/] feed`, `/ search`, `s save`, `h hide`,
-  `q quit` (76 columns). On a group feed it adds `J join` and, to stay within
-  80 columns (84 otherwise), drops `enter open`: Enter is the most guessable
-  key, and a click on a card opens it too (72 columns). The search set is
+  `1-4 sort`, `[/] feed`, `/ search`, `s save`, `h hide`, `v view`, `q quit`
+  (72 columns). On a group feed it adds `J join` before `v view` (80
+  columns, exactly the limit). Neither shows `enter open`. It was first
+  dropped from the group set alone, when `J join` would have made that set 84
+  columns: Enter is the most guessable key, and a click on a card opens it
+  too. Adding `v view` would have made the plain set 84, so it now leaves
+  out `enter open` as well, for the same reason (a click on a compact row
+  opens it too), while the group set comes to exactly 80. Dropping it was
+  the cheapest fix: every other hint is
+  a key you can't guess, and shortening labels (`[] feed`, `/ find`) saved
+  only a column or two each. It also keeps the two sets the same apart from
+  `J join`. The feed set with a kept search is unchanged and still lists
+  `enter open`. The search set is
   `type filter`, `w/ u/ flair: narrow`, `enter keep`, `esc clear`. The post
   view set is `j/k scroll`, `n/p comments`, `a/z vote`, `s save`, `c share`,
   `esc back`, and with a comment focused `j/k scroll`, `n/p comments`,
   `a/z vote comment`, `enter collapse`, `esc unfocus`. Every set must fit on
   one line at 80 columns on every feed, Hidden included, so the feed set
   leaves out `j/k` and `c` (which the post view set still shows) and lists
-  only `1-4` for sorting, not `Tab`. A status toast (green, `✔ …`) replaces
+  only `1-4` for sorting, not `Tab`. The hints are the same in both views. A
+  status toast (green, `✔ …`) replaces
   the hints until the next key press, left click or wheel event (see Mouse).
 - **Responsive:** the left nav shows only when the body is at least 70 columns
   wide, and the right sidebar only at 100 or more.
@@ -163,10 +219,62 @@ preview rows, and 1 action row. Here is what goes on each row:
   `card_height` and scrolling are the same as without it, and with no
   free-text terms a card renders exactly as it would with no query.
 
-**Scrolling:** `App.offset` is the index of the first card drawn, and the
-renderer maintains it. It never exceeds `selected`, and it advances until the
-selected card fits entirely. The last card on screen may be clipped at the
-bottom edge.
+### Compact rows
+
+In the Compact view every post is exactly one row, with no border, in the
+feed area below the tab box. The rows are `compact_row` in `ui.rs`, from left
+to right:
+
+```
+ ▲  1.2k ▼ ★ We deleted 40k lines of dead code and t…  w/Engineering · 3h ago · ▤ 194
+```
+
+- a blank column, then the vote cluster `▲ <score> ▼`. The score is
+  `compact()` right-aligned in `SCORE_WIDTH` = 5 columns (enough for
+  `-1.2k` or `99.9k`, and a test checks every seed score ±1 fits), so the
+  arrows, the star and the title start in the same columns on every row.
+  Colors are the cards': an upvote draws `▲` and the score orange, a
+  downvote `▼` and the score periwinkle, and otherwise the arrows are dim
+  and the score white. All bold.
+- `★` (orange) for a saved post, `☆` (dim) otherwise, then a blank. The
+  title starts in column 13.
+- the title, bold, whitespace runs shown as one space (as on cards), cut
+  with `…` to the room left.
+- right-aligned and dim, `w/<group> · <age> · ▤ <comments>`, with `age` and
+  `compact` as on cards, at least 2 blank columns after the title and 1
+  blank column before the right edge.
+
+**Shortening.** The meta shortens so that the title keeps at least
+`MIN_TITLE` = 20 columns of room when it can. It drops, in order, the group
+(`<age> · ▤ <comments>`), then the comment count (`<age>`), then the whole
+meta. Only after that does the title's room go below 20. The room counts, not
+the title's length, so at a given width every row shortens the same way
+(apart from group names and counts of different lengths). With the 56-column
+feed of a 110- or 80-column terminal that means `<age> · ▤ <comments>`. Below
+14 columns there is no room for a title, and the row is just its first
+`width` cells: it never draws past its area, down to 1 column.
+
+**Selected row.** The whole row is on `HIGHLIGHT_BG` and its title is orange
+(bold), like the active nav entry and the focused comment header. The vote
+and star colors don't change.
+
+**Search highlighting** works as on cards: every occurrence of a free-text
+term in the visible part of the title is black on orange, in the original
+case and still bold. A match cut by the `…` highlights only its visible part,
+and the `…` keeps the title style. The meta isn't highlighted. With no
+free-text terms a row renders exactly as with no query. It uses the same
+`highlight_rows`, with one row whose leading text chars stop before the `…`.
+
+**Scrolling:** `App.offset` is the index of the first card (or compact row)
+drawn, and the renderer maintains it. It never exceeds `selected`, and it
+advances until the selected card fits entirely. The last card on screen may
+be clipped at the bottom edge. The Compact view uses the same rule with every
+post 1 row high, so 17 posts fit at 24 rows against 2½ cards. Toggling the
+view leaves `offset` alone and the first frame applies the rule: from Compact
+to Card with a post far down selected, `offset` advances until that card is
+fully on screen. From Card to Compact nothing needs to scroll (the cards from
+`offset` to `selected` fit, so their rows do), and the top post stays at the
+top.
 
 ### Empty feed
 
@@ -304,7 +412,8 @@ enum Vote { Up, None /* default */, Down }
 | `groups`, `posts` | seed data, with the state file applied by `main` before the first frame. `posts` is mutated in place by votes, saves and hides, `groups[g].joined` by `J` |
 | `view: Vec<usize>` | indices into `posts` after feed filter, search and sort. Changed only by a rebuild, except that `h` removes the card it takes out of the feed (see Selection behavior) |
 | `selected` | index into `view` |
-| `offset` | first card drawn. Maintained by the renderer (see Scrolling) |
+| `offset` | first card (or compact row) drawn. Maintained by the renderer (see Scrolling) |
+| `density: Density` | `Card` (the default) or `Compact`. Toggled by `v` and the view switch, never by a rebuild, and not saved |
 | `sort: Sort` | `Hot`, `New`, `Top`, `Rising` |
 | `feed: Feed` | `Home`, `Popular`, `All`, `Saved`, `Hidden`, `Group(usize)` |
 | `mode: Mode` | `Feed`, `Search`, `Post { scroll: u16 }`. `scroll` is clamped, and moved to reveal a newly focused comment, by the renderer |
@@ -413,6 +522,15 @@ current feed and sort, and the view updates on every keystroke.
   the empty-feed message. A kept search, the sort and the feed stay. The
   renderer then scrolls as usual, and it records the click regions afresh, so
   the next click hits the card now drawn there.
+- **Toggling the view doesn't rebuild.** `v` (or a click on the view switch)
+  changes only `density`, and shows the toast `Compact view` or `Card view`.
+  `view`, `selected`, the sort, the feed and a kept search stay as they are,
+  and `offset` is left to the renderer, which keeps the selected post fully
+  on screen (see Scrolling). It also drops the last frame's click regions,
+  which belong to the old view, so a click can only hit what the next frame
+  draws. The wheel still works in between. It works in an empty feed too,
+  where only the toast and the switch change. Votes, saves, joins and hides
+  follow the same rules in both views.
 - **Joining and leaving don't rebuild either.** A group feed's posts don't
   depend on membership, so `J` keeps `view` and `selected` as they are, and
   a kept search stays too.
@@ -433,7 +551,7 @@ feed, it saves the state file (see Persistence).
 | Key | Feed | Post view |
 |---|---|---|
 | `j`/`↓`, `k`/`↑` | select next / prev | scroll 1 line |
-| `PgDn` / `PgUp` | move 5 cards | scroll 10 lines |
+| `PgDn` / `PgUp` | move 5 posts (cards or rows) | scroll 10 lines |
 | `Space` | — | scroll 10 lines |
 | `g`/`Home`, `G`/`End` | first / last card | top / bottom |
 | `a` / `z` | upvote / downvote | same, for the focused comment, or the post with none focused |
@@ -441,6 +559,7 @@ feed, it saves the state file (see Persistence).
 | `s` | save / unsave (toast) | same, always for the post |
 | `h` | hide / unhide (toast: `Post hidden` / `Post unhidden`). Does nothing in an empty feed | — |
 | `J` | join / leave the group (toast). Only on a group feed, with or without a kept search | — |
+| `v` | switch between the Card and Compact views (toast: `Compact view` / `Card view`). Works in every feed, an empty one included, and with a kept search | — |
 | `c` | "Link copied to clipboard!" toast | same, always for the post |
 | `Enter` | open post (does nothing in an empty feed) | collapse / expand the focused comment (nothing with none focused) |
 | `1`-`4` / `Tab` | set / cycle sort | — |
@@ -453,13 +572,15 @@ feed, it saves the state file (see Persistence).
 `—` means the key does nothing. In particular, `J` does nothing in the post
 view, even on a post from a group feed. Like sorting and switching feeds, it
 acts on the feed, so you go back to the feed to join or leave. `h` does
-nothing in the post view either: like `J`, hiding acts on the feed. The `···`
+nothing in the post view either: like `J`, hiding acts on the feed. `v`
+neither, and going back to the feed returns to the view you left, with the
+same selection. The `···`
 on a card's action row stays decorative.
 
 **Search mode:**
 
-- Every printable key, including `q`, `j`, `J`, `h`, `n`, `p` and digits, is
-  typed into the query. Phrases and the `w/`, `u/` and `flair:` filters are
+- Every printable key, including `q`, `j`, `J`, `h`, `v`, `n`, `p` and
+  digits, is typed into the query. Phrases and the `w/`, `u/` and `flair:` filters are
   described under Search.
 - Backspace deletes a character.
 - Enter returns to the feed and keeps the filter.
@@ -487,11 +608,15 @@ event before the first frame is drawn. `handles_mouse` is that rule, and
 | a card: any cell of its drawn rectangle, borders and the visible part of a clipped card included | select it and open it, like `Enter` | — |
 | a card's `▲` / `▼` | select it and vote, like `a` / `z`. Doesn't open the post or re-sort | — |
 | a card's `☆ Save` / `★ Saved` | select it and save / unsave (toast), like `s` | — |
+| a compact row: any cell of it, the meta and blanks included | select it and open it, like `Enter` | — |
+| a compact row's `▲` / `▼` | select it and vote, like `a` / `z`. Doesn't open the post or re-sort | — |
+| a compact row's `☆` / `★` | select it and save / unsave (toast), like `s` | — |
 | a sort tab, its number or label | like its digit, `1`-`4` | not drawn |
+| the view switch (`▦ Card` / `≡ Compact`), where drawn | toggle the view, like `v` | not drawn |
 | a nav entry's row (`⊘ Hidden` included) | switch to that feed, as `[`/`]` would landing on it. A kept search stays. The current feed: nothing, so the view and selection stay | — |
 | the header search box | enter search mode, like `/` | — |
 | a comment's header row (`u/<author> · <age>`, `[+]` headers included), across the post box | not drawn | focus it. If it is already focused, collapse / expand it, like `Enter` |
-| the wheel, anywhere | select the next / previous card, like `j` / `k` | scroll 3 lines, clamped like `j` / `k` |
+| the wheel, anywhere | select the next / previous card or row, like `j` / `k` | scroll 3 lines, clamped like `j` / `k` |
 
 `—` means the click does nothing. So do the `GROUPS` heading, the blank nav
 row, every border outside a card, the logo, the user and karma, the sidebar
@@ -509,9 +634,11 @@ re-clamps the scroll to the shorter content.
 `App.hits` (`Hits` in `app.rs`): `regions`, a list of `(Rect, Target)` in
 drawing order, and `max_scroll`, the post view's scroll clamp (0 outside the
 post view). `Target` is `Card(i)`, `Vote(i, Vote)` or `Save(i)` with `i` an
-index into `view`, `Sort(Sort)`, `Feed(Feed)`, `Search` or
+index into `view` (a compact row records the same three), `Sort(Sort)`,
+`Density` (the view switch), `Feed(Feed)`, `Search` or
 `Comment(CommentPath)`. A click takes the last region containing the cell,
-so a card's arrows and Save label, recorded after the card, win over it.
+so a card's arrows and Save label, and a compact row's arrows and star,
+recorded after the card or row, win over it.
 
 - Regions cover only what was drawn: nav rows only when the nav is drawn and
   only the rows that fit, a clipped card's visible part, arrows and Save
@@ -520,9 +647,13 @@ so a card's arrows and Save label, recorded after the card, win over it.
   follows the responsive layout, the feed offset and the post-view scroll.
 - The arrows are drawn one cell each, where a centered one-cell line goes,
   so the cell recorded is the cell drawn. The Save label's columns come from
-  `actions_line`, which builds the row.
-- `on_mouse` decides what a target does from the mode: card, sort, nav and
-  search targets only act in the feed, `Comment` only in the post view. It
+  `actions_line`, which builds the row. A compact row's `▲`, `▼` and star
+  columns come from `compact_row`, which builds that row, and each is
+  recorded as one cell only when it is inside the row's area. The view
+  switch is recorded only when it is drawn, so only in the feed (and in
+  search mode, where clicks are ignored).
+- `on_mouse` decides what a target does from the mode: card, sort, view
+  switch, nav and search targets only act in the feed, `Comment` only in the post view. It
   ignores a target that no longer applies, such as a card index past the end
   of `view` or a comment hidden under a collapsed ancestor, so a stale
   region can't break the focus invariants.
@@ -694,22 +825,24 @@ workit/
                 capture (also turned off on panic), event loop (no redraw for
                 ignored mouse events), loading the state file before the first
                 frame and saving it after the restore, messages on stderr
-    app.rs      state, feeds, sorts, voting, saving, hiding, joining, search
+    app.rs      state, feeds, sorts, voting, saving, hiding, joining, the
+                Card/Compact toggle, search
                 (query parsing, matching, highlight positions), comment focus
                 and collapse, key handling, mouse handling (hit-testing the
                 click regions). No rendering
     data.rs     seed groups, posts, comments
     state.rs    the state file: content keys, format, loading, atomic saving,
                 path selection
-    ui.rs       all rendering, including offset upkeep, post-view scroll clamping,
-                revealing the focused comment and recording the click regions
+    ui.rs       all rendering (cards and compact rows, the view switch), including
+                offset upkeep, post-view scroll clamping, revealing the focused
+                comment and recording the click regions
 ```
 
 ## Testing
 
-120 unit tests, run with `cargo test`:
+140 unit tests, run with `cargo test`:
 
-- **`app.rs`** (44), on small custom data sets:
+- **`app.rs`** (49), on small custom data sets:
   - Home hides unjoined groups, and Popular hides low scores.
   - The exact order for each sort.
   - Feed cycling wraps in both directions, with Saved and then Hidden between
@@ -764,7 +897,16 @@ workit/
   - Mouse events before the first frame doing nothing, toast included, and
     stale regions (a card past the end of `view`, a comment hidden under a
     collapsed one) being ignored.
-- **`ui.rs`** (53), rendering into a `TestBackend`:
+  - `v` toggling Card and Compact with the `Compact view` / `Card view`
+    toasts, keeping `view`, `selected`, the sort, the feed and a kept
+    search; doing nothing in the post view, going back returning to the
+    Compact view, and being typed in search mode; working in an empty
+    Hidden feed.
+  - A toggle dropping the old view's click regions (a stale card region
+    opens nothing) while the wheel still works.
+  - Hiding in the Compact view removing exactly that post, `selected`
+    keeping its index.
+- **`ui.rs`** (68), rendering into a `TestBackend`:
   - The helpers `compact`, `age`, `wrap` and `truncate`.
   - The frontpage contents.
   - Sidebars hidden at narrow widths.
@@ -790,10 +932,12 @@ workit/
     with a kept search staying, and Hidden's sidebar.
   - The group sidebar button and nav mark flipping with `J`.
   - Every hint set (feed, kept search, search, post view unfocused and
-    focused) fitting in 80 columns on every feed, Hidden included, with the
-    exact plain and group feed sets, `h hide` in both, `J join` only in the
-    feed set on group feeds, the exact search-mode and post-view sets, a toast
-    replacing the focused set, and `Esc` bringing back the unfocused one.
+    focused) fitting in 80 columns on every feed, Hidden included, in both
+    the Card and Compact views, with the exact plain and group feed sets,
+    `h hide` and `v view` in both, `J join` only in the feed set on group
+    feeds, the exact search-mode and post-view sets, the toggle's toast, a
+    toast replacing the focused set, and `Esc` bringing back the unfocused
+    one.
   - Highlight cells: a title match black on orange and still bold, in the
     original case, with its neighbors untouched, in a kept search too.
   - A phrase wrapping across two title rows highlighted on both.
@@ -864,6 +1008,48 @@ workit/
       isn't clickable.
     - After hiding the first card, its `▲` and the card itself acting on the
       card now drawn there, never the hidden one.
+    - A compact row click after scrolling opening `view[offset]`, its meta
+      and blank cells counting, Esc returning to the Compact view with the
+      same selection; `▲` and `▼` selecting the row and voting and flipping
+      without opening or re-sorting; `☆` saving with the toast and `★`
+      unsaving.
+    - After a toggle, a click on a cell where the old view drew a card's `▲`
+      (or a row's `☆`) acting on what the new view draws there.
+    - The wheel moving the selection in the Compact view, clamped, with the
+      selected row on screen.
+    - The view switch: `▦ Card` and `≡ Compact` at their exact columns at
+      110 wide, a click on each toggling with the toast; at 46 columns
+      `≡ Compact` drawn one blank after `Rising` and at 45 neither drawn nor
+      clickable (`▦ Card`: 43 and 42), and never more than one switch
+      region at any width; nothing drawn or clickable in the post view.
+  - Compact rows:
+    - The exact text of the first two Home rows at 140 columns, one upvoted
+      and saved (`★`, orange `▲`, score and star) and one downvoted
+      (periwinkle `▼` and score), dim arrows and a white score otherwise, a
+      dim meta, and the selected row on `HIGHLIGHT_BG` across its width
+      with an orange bold title.
+    - The meta dropping the group at 65 columns, the comment count at 49
+      and everything at 41, never coming back as the width shrinks, the
+      title keeping 20 columns down to 34 and cut below that, no `…` with
+      no room, and no row of any seed post wider than its area at any width
+      from 1 to 120. Rendering every width from 1 to 120, every arrow and
+      star region one cell inside its row, on the glyph drawn.
+    - The arrows, star and title in the same columns for scores 1.2k, 845,
+      7 and -12.
+    - Title highlighting: a match cut by the `…` highlighted only in its
+      visible part, the `…` keeping the selected title style, the meta
+      plain, the text unchanged; every occurrence in the original case,
+      overlapping terms as one run, in a kept search too. Filters alone
+      rendering exactly like no query.
+    - 24 rows showing 17 posts against 2 cards' arrows, and the selected row
+      on screen in the selected style after `G` (offset 2), `k`, `g`, each
+      `PgDn` and `PgUp` (5 posts) and `k` all the way up.
+    - Switching from Compact to Card with the last post selected scrolling
+      on the first frame until that card is whole, bottom border included.
+    - Hiding the second row removing exactly it, the next row moving up into
+      its place, and the post count dropping by one.
+    - `▦` and `≡` one cell wide in ratatui and found nowhere else on the
+      Card, Compact and post view screens.
     - `handles_mouse` accepting exactly left presses and the vertical
       wheel, in the feed and the post view, and nothing in search mode or
       before the first frame. Every event it rejects (moves, releases,

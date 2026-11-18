@@ -60,6 +60,14 @@ pub(crate) enum Feed {
     Group(usize),
 }
 
+/// How the feed draws its posts: a bordered card each, or one row each.
+/// Not saved: every run starts in `Card`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Density {
+    Card,
+    Compact,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Mode {
     Feed,
@@ -166,14 +174,17 @@ impl Thread {
 /// the mode (see `App::on_mouse`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Target {
-    /// A card, by index into `view`: any cell of its drawn rectangle.
+    /// A card or a compact row, by index into `view`: any cell of its drawn
+    /// rectangle.
     Card(usize),
-    /// A card's `▲` (`Vote::Up`) or `▼` (`Vote::Down`).
+    /// A card's or compact row's `▲` (`Vote::Up`) or `▼` (`Vote::Down`).
     Vote(usize, Vote),
-    /// A card's `☆ Save` or `★ Saved` label.
+    /// A card's `☆ Save` or `★ Saved` label, or a compact row's `☆` / `★`.
     Save(usize),
     /// A sort tab: its number and label.
     Sort(Sort),
+    /// The view switch on the sort-tab row (`▦ Card` / `≡ Compact`).
+    Density,
     /// A nav entry.
     Feed(Feed),
     /// The header search box.
@@ -239,6 +250,8 @@ pub(crate) struct App {
     pub selected: usize,
     /// Index into `view` of the first card drawn; maintained by the renderer.
     pub offset: usize,
+    /// Card or Compact. Toggling it doesn't rebuild `view`.
+    pub density: Density,
     pub sort: Sort,
     pub feed: Feed,
     pub mode: Mode,
@@ -416,6 +429,7 @@ impl App {
             view: Vec::new(),
             selected: 0,
             offset: 0,
+            density: Density::Card,
             sort: Sort::Hot,
             feed: Feed::Home,
             mode: Mode::Feed,
@@ -592,6 +606,25 @@ impl App {
         }
     }
 
+    /// Switches between the Card and Compact views. Not a rebuild: `view`,
+    /// `selected`, the sort, the feed and a kept search stay, and the renderer
+    /// keeps the selected post on screen from `offset` as usual. The last
+    /// frame's click regions belong to the old view, so they are dropped
+    /// until the next frame records the new ones.
+    fn toggle_density(&mut self) {
+        self.density = match self.density {
+            Density::Card => Density::Compact,
+            Density::Compact => Density::Card,
+        };
+        self.status = Some(match self.density {
+            Density::Card => "Card view",
+            Density::Compact => "Compact view",
+        });
+        if let Some(hits) = &mut self.hits {
+            hits.regions.clear();
+        }
+    }
+
     /// Joins or leaves the open group. The group feed doesn't depend on
     /// membership, so it isn't rebuilt; Home picks up the change on its next
     /// rebuild.
@@ -693,6 +726,7 @@ impl App {
                 self.toggle_save();
             }
             Target::Sort(sort) => self.set_sort(sort),
+            Target::Density => self.toggle_density(),
             Target::Feed(feed) if feed != self.feed => {
                 self.feed = feed;
                 self.refresh();
@@ -740,6 +774,7 @@ impl App {
             KeyCode::Char('s') => self.toggle_save(),
             KeyCode::Char('h') => self.toggle_hide(),
             KeyCode::Char('J') => self.toggle_join(),
+            KeyCode::Char('v') => self.toggle_density(),
             KeyCode::Char('c') => self.status = Some("Link copied to clipboard!"),
             KeyCode::Enter if !self.view.is_empty() => self.open_post(),
             KeyCode::Char(ch @ '1'..='4') => self.set_sort(Sort::ALL[usize::from(ch as u8 - b'1')]),
@@ -1956,5 +1991,99 @@ mod tests {
         assert_eq!(titles(&app), ["mid"]);
         go_to(&mut app, Feed::Hidden);
         assert_eq!(titles(&app), ["old huge"]);
+    }
+
+    #[test]
+    fn v_toggles_the_density_with_a_toast_and_keeps_everything_else() {
+        let mut app = sample();
+        go_to(&mut app, Feed::All);
+        press(&mut app, KeyCode::Char('3'));
+        press_str(&mut app, "/o");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(
+            titles(&app),
+            ["old huge", "other group", "mid", "fresh small"]
+        );
+        let before = (app.view.clone(), app.selected, app.sort, app.feed);
+        assert_eq!(app.density, Density::Card, "every run starts in Card");
+
+        press(&mut app, KeyCode::Char('v'));
+        assert_eq!(app.density, Density::Compact);
+        assert_eq!(app.status, Some("Compact view"));
+        assert_eq!((app.view.clone(), app.selected, app.sort, app.feed), before);
+        assert_eq!((app.query.as_str(), app.mode), ("o", Mode::Feed));
+
+        press(&mut app, KeyCode::Char('v'));
+        assert_eq!(app.density, Density::Card);
+        assert_eq!(app.status, Some("Card view"));
+        assert_eq!((app.view.clone(), app.selected, app.sort, app.feed), before);
+        assert_eq!(app.query, "o", "the kept search stays");
+    }
+
+    #[test]
+    fn v_does_nothing_in_the_post_view_and_is_typed_in_search() {
+        let mut app = sample();
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('v'));
+        assert_eq!(app.mode, Mode::Post { scroll: 0 });
+        assert_eq!((app.density, app.status), (Density::Card, None));
+
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('v'));
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(
+            (app.mode, app.density),
+            (Mode::Feed, Density::Compact),
+            "going back returns to the Compact view"
+        );
+
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Char('v'));
+        assert_eq!(app.query, "v", "typed while searching");
+        assert_eq!((app.mode, app.density), (Mode::Search, Density::Compact));
+    }
+
+    #[test]
+    fn v_works_in_an_empty_feed() {
+        let mut app = sample();
+        go_to(&mut app, Feed::Hidden);
+        assert!(app.view.is_empty());
+        press(&mut app, KeyCode::Char('v'));
+        assert_eq!(app.density, Density::Compact);
+        assert_eq!(app.status, Some("Compact view"));
+        press(&mut app, KeyCode::Char('v'));
+        assert_eq!(
+            (app.density, app.status),
+            (Density::Card, Some("Card view"))
+        );
+        assert_eq!(app.feed, Feed::Hidden);
+    }
+
+    #[test]
+    fn toggling_drops_the_old_views_click_regions() {
+        let mut app = sample();
+        app.hits = Some(Hits {
+            regions: vec![(Rect::new(0, 0, 100, 100), Target::Card(1))],
+            max_scroll: 0,
+        });
+        press(&mut app, KeyCode::Char('v'));
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 1, 1);
+        assert_eq!((app.mode, app.selected), (Mode::Feed, 0), "no stale card");
+        mouse(&mut app, MouseEventKind::ScrollDown, 1, 1);
+        assert_eq!(app.selected, 1, "the wheel still works");
+    }
+
+    #[test]
+    fn hiding_in_compact_view_removes_exactly_that_row() {
+        let mut app = sample();
+        go_to(&mut app, Feed::All);
+        press_str(&mut app, "vj");
+        let gone = app.view[1];
+        press(&mut app, KeyCode::Char('h'));
+        assert!(app.posts[gone].hidden);
+        assert_eq!(titles(&app), ["other group", "old huge", "fresh small"]);
+        assert_eq!((app.selected, app.density), (1, Density::Compact));
     }
 }

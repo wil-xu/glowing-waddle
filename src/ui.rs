@@ -18,6 +18,7 @@ use ratatui::widgets::Wrap;
 
 use crate::app::App;
 use crate::app::CommentPath;
+use crate::app::Density;
 use crate::app::Feed;
 use crate::app::Hits;
 use crate::app::Mode;
@@ -38,6 +39,11 @@ const NAV_WIDTH: u16 = 22;
 const SIDEBAR_WIDTH: u16 = 32;
 const VOTE_WIDTH: u16 = 6;
 const PREVIEW_LINES: usize = 2;
+/// A compact row's score column: wide enough for every seed score, so the
+/// arrows line up from row to row.
+const SCORE_WIDTH: usize = 5;
+/// The room a compact row keeps for its title by shortening its meta.
+const MIN_TITLE: usize = 20;
 
 fn compact(n: i64) -> String {
     if n.abs() < 1_000 {
@@ -227,9 +233,11 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             ("esc", "clear search"),
             ("q", "quit"),
         ],
-        // Feed hints must fit on one line at 80 columns. With `J join` and
-        // `h hide` the group set would be 84, so it leaves out `enter open`:
-        // Enter is the most guessable key, and clicking a card opens it too.
+        // Feed hints must fit on one line at 80 columns. With `J join` the
+        // group set would be 84 with `enter open`, and with `v view` the plain
+        // set would be too, so both leave it out: Enter is the most guessable
+        // key, and clicking a card or a compact row opens it too. That leaves
+        // 72 and 80, and the group set is the plain set plus `J join`.
         Mode::Feed if matches!(app.feed, Feed::Group(_)) => &[
             ("a/z", "vote"),
             ("1-4", "sort"),
@@ -238,16 +246,17 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             ("s", "save"),
             ("h", "hide"),
             ("J", "join"),
+            ("v", "view"),
             ("q", "quit"),
         ],
         Mode::Feed => &[
             ("a/z", "vote"),
-            ("enter", "open"),
             ("1-4", "sort"),
             ("[/]", "feed"),
             ("/", "search"),
             ("s", "save"),
             ("h", "hide"),
+            ("v", "view"),
             ("q", "quit"),
         ],
         Mode::Search => &[
@@ -498,15 +507,29 @@ fn render_feed(frame: &mut Frame, app: &mut App, area: Rect, hits: &mut Hits) {
     // Each tab is 3 spans: " N ", the label and a gap. The number and the
     // label are clickable, as far as they are drawn.
     let mut x = tab_row.x;
+    let mut tabs_end = x;
     for (&sort, spans) in Sort::ALL.iter().zip(tab_spans.chunks(3)) {
         let [number, label, gap] = [0, 1, 2].map(|i| spans[i].width() as u16);
         let rect = Rect::new(x + 1, tab_row.y, number - 1 + label, 1).intersection(tab_row);
         if !rect.is_empty() {
             hits.regions.push((rect, Target::Sort(sort)));
         }
+        tabs_end = x + number + label;
         x += number + label + gap;
     }
     frame.render_widget(Paragraph::new(Line::from(tab_spans)).block(tab_block), tabs);
+
+    // The view switch, right-aligned with a blank column before the border.
+    // Drawn, and clickable, only with at least one blank column between it
+    // and the last tab.
+    let switch = density_label(app.density);
+    let width = switch.width() as u16;
+    let at = tab_row.right().saturating_sub(width + 1);
+    if tab_row.width > width && at > tabs_end {
+        let rect = Rect::new(at, tab_row.y, width, 1);
+        frame.render_widget(switch, rect);
+        hits.regions.push((rect, Target::Density));
+    }
 
     if app.view.is_empty() {
         // A query that filters nothing (`w/`, `" "`) didn't empty the feed.
@@ -540,14 +563,18 @@ fn render_feed(frame: &mut Frame, app: &mut App, area: Rect, hits: &mut Hits) {
         return;
     }
 
-    let content_width = usize::from(cards.width.saturating_sub(VOTE_WIDTH + 4));
-    let heights: Vec<u16> = app
-        .view
-        .iter()
-        .map(|&i| card_height(&app.posts[i], content_width))
-        .collect();
+    let heights: Vec<u16> = match app.density {
+        Density::Card => {
+            let content_width = usize::from(cards.width.saturating_sub(VOTE_WIDTH + 4));
+            app.view
+                .iter()
+                .map(|&i| card_height(&app.posts[i], content_width))
+                .collect()
+        }
+        Density::Compact => vec![1; app.view.len()],
+    };
 
-    // Scroll just far enough that the selected card is fully visible.
+    // Scroll just far enough that the selected card (or row) is fully visible.
     app.offset = app.offset.min(app.selected);
     while app.offset < app.selected
         && heights[app.offset..=app.selected].iter().sum::<u16>() > cards.height
@@ -563,7 +590,10 @@ fn render_feed(frame: &mut Frame, app: &mut App, area: Rect, hits: &mut Hits) {
         }
         let rect = Rect::new(cards.x, y, cards.width, heights[vi].min(bottom - y));
         hits.regions.push((rect, Target::Card(vi)));
-        render_card(frame, app, vi, &app.posts[pi], rect, hits);
+        match app.density {
+            Density::Card => render_card(frame, app, vi, &app.posts[pi], rect, hits),
+            Density::Compact => render_compact_row(frame, app, vi, &app.posts[pi], rect, hits),
+        }
         y += heights[vi];
     }
 }
@@ -804,6 +834,159 @@ fn render_card(
     }
     let lines: Vec<Line> = lines.into_iter().chain([actions]).collect();
     frame.render_widget(Paragraph::new(lines), text);
+}
+
+/// The tab box's view switch: a glyph and the current view's name.
+fn density_label(density: Density) -> Line<'static> {
+    let (glyph, name) = match density {
+        Density::Card => ("▦", "Card"),
+        Density::Compact => ("≡", "Compact"),
+    };
+    Line::from(vec![
+        Span::styled(format!("{glyph} "), Style::new().fg(ORANGE)),
+        Span::styled(name, Style::new().fg(Color::White).bold()),
+    ])
+}
+
+/// The first `width` cells of `spans`. Every glyph here is one cell wide.
+fn clip(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
+    let mut left = width;
+    let mut out = Vec::new();
+    for mut span in spans {
+        if left == 0 {
+            break;
+        }
+        let len = span.content.chars().count();
+        if len > left {
+            span.content = span.content.chars().take(left).collect::<String>().into();
+        }
+        left -= len.min(left);
+        out.push(span);
+    }
+    out
+}
+
+/// The cells of a compact row a click acts on, as columns within the row.
+struct RowCells {
+    up: u16,
+    down: u16,
+    star: u16,
+}
+
+/// A compact row, at most `width` cells: ` ▲ <score> ▼ ☆ <title>`, then the
+/// dim `w/<group> · <age> · ▤ <comments>` right-aligned with a blank column
+/// after it. The meta shortens so the title keeps `MIN_TITLE` columns of
+/// room when it can: first the group goes, then the comment count, then the
+/// whole meta. Only then is the title's room below `MIN_TITLE`. Also returns
+/// the columns of the arrows and the star, which may be past `width`.
+fn compact_row(app: &App, post: &Post, selected: bool, width: usize) -> (Line<'static>, RowCells) {
+    let arrow = |glyph: &'static str, vote: Vote, color: Color| {
+        let color = if post.vote == vote { color } else { DIM };
+        Span::styled(glyph, Style::new().fg(color).bold())
+    };
+    let star = if post.saved {
+        Span::styled("★", Style::new().fg(ORANGE).bold())
+    } else {
+        Span::styled("☆", Style::new().fg(DIM).bold())
+    };
+    let mut spans = vec![
+        Span::raw(" "),
+        arrow("▲", Vote::Up, ORANGE),
+        Span::styled(
+            format!(" {:>SCORE_WIDTH$} ", compact(i64::from(post.score))),
+            Style::new().fg(vote_color(post.vote)).bold(),
+        ),
+        arrow("▼", Vote::Down, PERIWINKLE),
+        Span::raw(" "),
+    ];
+    let column = |spans: &[Span]| spans.iter().map(Span::width).sum::<usize>() as u16;
+    let up = 1;
+    let down = column(&spans) - 2;
+    let star_at = column(&spans);
+    spans.extend([star, Span::raw(" ")]);
+    let title_at = usize::from(column(&spans));
+
+    let group = format!("w/{}", app.groups[post.group].name);
+    let age = age(post.hours_ago);
+    let comments = format!("▤ {}", compact(i64::from(post.comment_count)));
+    // The title's room with each meta: 2 blank columns before the meta and 1
+    // after it, or just the 1 when there is none.
+    let room = |meta: &str| {
+        let meta = meta.chars().count();
+        width.saturating_sub(title_at + 1 + if meta > 0 { meta + 2 } else { 0 })
+    };
+    let meta = [
+        format!("{group} · {age} · {comments}"),
+        format!("{age} · {comments}"),
+        age.clone(),
+    ]
+    .into_iter()
+    .find(|meta| room(meta) >= MIN_TITLE)
+    .unwrap_or_default();
+    let room = room(&meta);
+
+    // Whitespace runs become one space, as on cards, which is what lets
+    // `highlight_rows` walk the title alongside the row.
+    let title = post.title.split_whitespace().collect::<Vec<_>>().join(" ");
+    let len = title.chars().count();
+    let (shown, from_text) = if len <= room {
+        (title, len)
+    } else if room == 0 {
+        (String::new(), 0)
+    } else {
+        (truncate(&title, room), room.saturating_sub(1))
+    };
+    let shown_len = shown.chars().count();
+    let title_style = Style::new()
+        .fg(if selected { ORANGE } else { Color::White })
+        .bold();
+    let line = highlight_rows(
+        post.title,
+        &app.search.highlights(post.title),
+        vec![(shown, from_text)],
+        title_style,
+    )
+    .remove(0);
+    spans.extend(line.spans.into_iter().map(|mut span| {
+        span.style = line.style.patch(span.style);
+        span
+    }));
+    if !meta.is_empty() {
+        spans.push(Span::raw(" ".repeat(room - shown_len + 2)));
+        spans.push(Span::styled(meta, Style::new().fg(DIM)));
+    }
+
+    let cells = RowCells {
+        up,
+        down,
+        star: star_at,
+    };
+    (Line::from(clip(spans, width)), cells)
+}
+
+/// Draws the compact row for `view[index]`, recording its arrows and star.
+fn render_compact_row(
+    frame: &mut Frame,
+    app: &App,
+    index: usize,
+    post: &Post,
+    area: Rect,
+    hits: &mut Hits,
+) {
+    let selected = index == app.selected;
+    let (line, cells) = compact_row(app, post, selected, usize::from(area.width));
+    let bg = if selected { HIGHLIGHT_BG } else { Color::Reset };
+    frame.render_widget(Paragraph::new(line).bg(bg), area);
+    for (column, target) in [
+        (cells.up, Target::Vote(index, Vote::Up)),
+        (cells.down, Target::Vote(index, Vote::Down)),
+        (cells.star, Target::Save(index)),
+    ] {
+        if column < area.width {
+            hits.regions
+                .push((Rect::new(area.x + column, area.y, 1, 1), target));
+        }
+    }
 }
 
 /// One comment, without its replies. A collapsed one is only its header,
@@ -1314,60 +1497,77 @@ mod tests {
         let feeds = 5 + app.groups.len();
         let mut visited = Vec::new();
         for _ in 0..feeds {
-            let feed = app.feed;
-            visited.push(feed);
-            let on_group = matches!(feed, Feed::Group(_));
+            for density in [Density::Card, Density::Compact] {
+                if app.density != density {
+                    press(&mut app, KeyCode::Char('v'));
+                    let toast = match density {
+                        Density::Card => " ✔ Card view",
+                        Density::Compact => " ✔ Compact view",
+                    };
+                    assert_eq!(footer(&mut app), toast, "{:?}", app.feed);
+                    // Esc with no kept search does nothing but clear the toast.
+                    press(&mut app, KeyCode::Esc);
+                }
+                let feed = app.feed;
+                visited.push(feed);
+                let on_group = matches!(feed, Feed::Group(_));
+                let feed = (feed, density);
 
-            let plain = footer(&mut app);
-            assert!(plain.ends_with("q quit"), "{feed:?}: {plain:?}");
-            assert!(plain.contains(" h hide "), "{feed:?}: {plain:?}");
-            assert_eq!(plain.contains("J join"), on_group, "{feed:?}: {plain:?}");
-            let expected = if on_group {
-                " a/z vote  1-4 sort  [/] feed  / search  s save  h hide  J join  q quit"
-            } else {
-                " a/z vote  enter open  1-4 sort  [/] feed  / search  s save  h hide  q quit"
-            };
-            assert_eq!(plain, expected, "{feed:?}");
+                let plain = footer(&mut app);
+                assert!(plain.ends_with("q quit"), "{feed:?}: {plain:?}");
+                assert!(plain.contains(" h hide "), "{feed:?}: {plain:?}");
+                assert!(plain.contains(" v view "), "{feed:?}: {plain:?}");
+                assert!(plain.chars().count() <= 80, "{feed:?}: {plain:?}");
+                assert_eq!(plain.contains("J join"), on_group, "{feed:?}: {plain:?}");
+                let expected = if on_group {
+                    " a/z vote  1-4 sort  [/] feed  / search  s save  h hide  J join  v view  q quit"
+                } else {
+                    " a/z vote  1-4 sort  [/] feed  / search  s save  h hide  v view  q quit"
+                };
+                assert_eq!(plain, expected, "{feed:?}");
 
-            press(&mut app, KeyCode::Char('/'));
-            press(&mut app, KeyCode::Char('e'));
-            let search = footer(&mut app);
-            assert!(search.ends_with("esc clear"), "{feed:?}: {search:?}");
-            assert_eq!(
-                search, " type filter  w/ u/ flair: narrow  enter keep  esc clear",
-                "{feed:?}"
-            );
+                press(&mut app, KeyCode::Char('/'));
+                press(&mut app, KeyCode::Char('e'));
+                let search = footer(&mut app);
+                assert!(search.ends_with("esc clear"), "{feed:?}: {search:?}");
+                assert_eq!(
+                    search, " type filter  w/ u/ flair: narrow  enter keep  esc clear",
+                    "{feed:?}"
+                );
 
-            press(&mut app, KeyCode::Enter);
-            let kept = footer(&mut app);
-            assert!(
-                kept.contains("esc clear search") && kept.ends_with("q quit"),
-                "{feed:?}: {kept:?}"
-            );
-            press(&mut app, KeyCode::Esc);
+                press(&mut app, KeyCode::Enter);
+                let kept = footer(&mut app);
+                assert!(
+                    kept.contains("esc clear search") && kept.ends_with("q quit"),
+                    "{feed:?}: {kept:?}"
+                );
+                press(&mut app, KeyCode::Esc);
 
-            assert!(!app.view.is_empty(), "{feed:?} needs a post to open");
-            press(&mut app, KeyCode::Enter);
-            let post = footer(&mut app);
-            assert!(post.ends_with("esc back"), "{feed:?}: {post:?}");
-            assert_eq!(
-                post, " j/k scroll  n/p comments  a/z vote  s save  c share  esc back",
-                "{feed:?}"
-            );
+                assert!(!app.view.is_empty(), "{feed:?} needs a post to open");
+                press(&mut app, KeyCode::Enter);
+                let post = footer(&mut app);
+                assert!(post.ends_with("esc back"), "{feed:?}: {post:?}");
+                assert_eq!(
+                    post, " j/k scroll  n/p comments  a/z vote  s save  c share  esc back",
+                    "{feed:?}"
+                );
 
-            press(&mut app, KeyCode::Char('n'));
-            assert!(app.thread.focus.is_some(), "{feed:?}");
-            let focused = footer(&mut app);
-            assert_eq!(
-                focused, " j/k scroll  n/p comments  a/z vote comment  enter collapse  esc unfocus",
-                "{feed:?}"
-            );
-            press(&mut app, KeyCode::Char('c'));
-            assert_eq!(footer(&mut app), " ✔ Link copied to clipboard!", "{feed:?}");
-            press(&mut app, KeyCode::Esc);
-            assert_eq!(footer(&mut app), post, "{feed:?}: unfocused again");
-            press(&mut app, KeyCode::Esc);
-            assert_eq!(app.mode, Mode::Feed, "{feed:?}");
+                press(&mut app, KeyCode::Char('n'));
+                assert!(app.thread.focus.is_some(), "{feed:?}");
+                let focused = footer(&mut app);
+                assert_eq!(
+                    focused,
+                    " j/k scroll  n/p comments  a/z vote comment  enter collapse  esc unfocus",
+                    "{feed:?}"
+                );
+                press(&mut app, KeyCode::Char('c'));
+                assert_eq!(footer(&mut app), " ✔ Link copied to clipboard!", "{feed:?}");
+                press(&mut app, KeyCode::Esc);
+                assert_eq!(footer(&mut app), post, "{feed:?}: unfocused again");
+                press(&mut app, KeyCode::Esc);
+                assert_eq!(app.mode, Mode::Feed, "{feed:?}");
+                assert_eq!(app.density, density, "{feed:?}: back in the same view");
+            }
 
             press(&mut app, KeyCode::Char(']'));
         }
@@ -2890,5 +3090,633 @@ mod tests {
         click(&mut app, (x, y));
         assert_eq!(app.mode, Mode::Post { scroll: 0 });
         assert_eq!(app.view[app.selected], next, "opened the card drawn there");
+    }
+
+    /// The seed app in the Compact view, toast cleared.
+    fn compact_app() -> App {
+        let mut app = App::new();
+        press(&mut app, KeyCode::Char('v'));
+        assert_eq!(app.density, Density::Compact);
+        app.status = None;
+        app
+    }
+
+    /// The text of a compact row's line for `post` at `width`.
+    fn row_text(app: &App, post: &Post, width: usize) -> String {
+        compact_row(app, post, false, width)
+            .0
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect()
+    }
+
+    /// The x of the first `glyph` at or right of `from` on row `y`.
+    fn glyph_x(buf: &Buffer, glyph: &str, from: u16, y: u16) -> u16 {
+        (from..buf.area.width)
+            .find(|&x| buf[(x, y)].symbol() == glyph)
+            .unwrap_or_else(|| panic!("no {glyph} on row {y}:\n{}", rows(buf).join("\n")))
+    }
+
+    #[test]
+    fn compact_row_exact_text_with_save_and_vote_colors() {
+        let mut app = compact_app();
+        // The first Home post upvoted and saved, the second downvoted.
+        type_str(&mut app, "sajzk");
+        app.status = None;
+        let buf = buffer(&mut app, 140, 30);
+        let main: Vec<String> = rows(&buf)
+            .iter()
+            .map(|r| r.chars().skip(22).take(86).collect())
+            .collect();
+        assert_eq!(
+            main[6],
+            " ▲  1.2k ▼ ★ We deleted 40k lines of dead code and t…  w/Engineering · 3h ago · ▤ 194 "
+        );
+        assert_eq!(
+            main[7],
+            " ▲   855 ▼ ☆ PSA: the espresso machine on floor 3 is …  w/OfficeLife · 1h ago · ▤ 100 "
+        );
+
+        // Upvoted and saved: ▲, score and ★ orange. Downvoted: ▼ and score
+        // periwinkle. The other arrow dim, the meta dim.
+        let (up, score, down, star) = (23, 26, 31, 33);
+        assert_eq!(buf[(up, 6)].fg, ORANGE);
+        assert_eq!(buf[(score, 6)].fg, ORANGE);
+        assert_eq!(buf[(down, 6)].fg, DIM);
+        assert_eq!((buf[(star, 6)].symbol(), buf[(star, 6)].fg), ("★", ORANGE));
+        assert_eq!(buf[(up, 7)].fg, DIM);
+        assert_eq!(buf[(score, 7)].fg, PERIWINKLE);
+        assert_eq!(buf[(down, 7)].fg, PERIWINKLE);
+        assert_eq!((buf[(star, 7)].symbol(), buf[(star, 7)].fg), ("☆", DIM));
+        assert_eq!(buf[(23, 8)].fg, DIM, "no vote: dim arrows");
+        assert_eq!(
+            buf[(26, 8)].fg,
+            Color::White,
+            "and a white score, as on cards"
+        );
+        let meta = find(&buf, "w/OfficeLife · 1h ago");
+        assert_eq!(
+            (buf[meta].fg, buf[meta].modifier.contains(Modifier::BOLD)),
+            (DIM, false)
+        );
+
+        // The selected row: orange bold title on HIGHLIGHT_BG, the whole row
+        // wide. The others: white bold title, no background.
+        assert_eq!(app.selected, 0);
+        for x in 22..108 {
+            assert_eq!(buf[(x, 6)].bg, HIGHLIGHT_BG, "selected row, x {x}");
+            assert_eq!(buf[(x, 7)].bg, Color::Reset, "unselected row, x {x}");
+        }
+        let title = (35, 6);
+        assert_eq!(buf[title].fg, ORANGE);
+        assert!(buf[title].modifier.contains(Modifier::BOLD));
+        assert_eq!(buf[(35, 7)].fg, Color::White);
+        assert!(buf[(35, 7)].modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn compact_meta_shortens_in_order_and_rows_never_overflow() {
+        let app = App::new();
+        let post = &app.posts[app.view[0]];
+        assert_eq!(post.title.chars().count(), 62);
+        let stage = |w: usize| {
+            let text = row_text(&app, post, w);
+            if text.contains("w/Engineering · 3h ago · ▤ 194") {
+                0
+            } else if text.contains("3h ago · ▤ 194") {
+                1
+            } else if text.contains("3h ago") {
+                2
+            } else {
+                3
+            }
+        };
+        // 13 columns before the title, 2 between it and the meta, 1 after.
+        // The full meta is 30 wide, without the group 14, the age alone 6.
+        assert_eq!((stage(66), stage(65)), (0, 1), "the group goes first");
+        assert_eq!((stage(50), stage(49)), (1, 2), "then the comment count");
+        assert_eq!((stage(42), stage(41)), (2, 3), "then the whole meta");
+        let mut last = 0;
+        for w in (1..=120).rev() {
+            assert!(stage(w) >= last, "the meta came back at {w}");
+            last = stage(w);
+        }
+        assert_eq!(
+            row_text(&app, post, 65),
+            " ▲  1.2k ▼ ☆ We deleted 40k lines of dead code …  3h ago · ▤ 194"
+        );
+        // The title keeps 20 columns as long as it can, then is cut.
+        let title_room = |w: usize| row_text(&app, post, w).chars().count() - 13;
+        assert_eq!(title_room(41), 27, "all but the blank column at the end");
+        assert_eq!(title_room(34), 20);
+        assert_eq!(row_text(&app, post, 33), " ▲  1.2k ▼ ☆ We deleted 40k lin…");
+        assert_eq!(row_text(&app, post, 15), " ▲  1.2k ▼ ☆ …");
+        assert_eq!(row_text(&app, post, 14), " ▲  1.2k ▼ ☆ ", "no room, no …");
+        assert_eq!(row_text(&app, post, 5), " ▲  1");
+        assert_eq!(row_text(&app, post, 1), " ");
+
+        for w in 1..=120 {
+            for (i, post) in app.posts.iter().enumerate() {
+                for selected in [false, true] {
+                    let width = compact_row(&app, post, selected, w).0.width();
+                    assert!(width <= w, "post {i} is {width} wide at {w}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compact_rows_draw_inside_their_area_at_every_width() {
+        let mut app = compact_app();
+        type_str(&mut app, "sa");
+        for width in 1..=120u16 {
+            let buf = buffer(&mut app, width, 24);
+            let hits = app.hits.clone().expect("rendered");
+            let rows = hits
+                .regions
+                .iter()
+                .filter(|(_, t)| matches!(t, Target::Card(_)))
+                .collect::<Vec<_>>();
+            for (rect, target) in &hits.regions {
+                if let Target::Vote(i, _) | Target::Save(i) = target {
+                    let (row, _) = rows
+                        .iter()
+                        .find(|(_, t)| *t == Target::Card(*i))
+                        .expect("a row for every arrow and star");
+                    assert_eq!(rect.intersection(*row), *rect, "{width}: {target:?}");
+                    assert_eq!((rect.width, rect.height), (1, 1));
+                    let glyph = buf[(rect.x, rect.y)].symbol();
+                    assert!(["▲", "▼", "☆", "★"].contains(&glyph), "{width}: {glyph:?}");
+                }
+            }
+            // Past the right edge of the main column is the sidebar or nothing.
+            for (row, _) in rows {
+                assert!(row.right() <= width, "{width}: {row:?}");
+                assert_eq!(row.height, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn compact_arrows_line_up_for_any_score_width() {
+        let mut app = compact_app();
+        let post = |score, title| Post {
+            group: 0,
+            author: "dana_k",
+            title,
+            score,
+            hours_ago: 1,
+            ..Default::default()
+        };
+        app.posts = vec![
+            post(7, "seven"),
+            post(845, "eight four five"),
+            post(1_243, "one point two k"),
+            post(-12, "negative"),
+        ];
+        press(&mut app, KeyCode::Char('3'));
+        app.status = None;
+        let buf = buffer(&mut app, 110, 24);
+        let ys: Vec<u16> = ["seven", "eight four five", "one point two k", "negative"]
+            .iter()
+            .map(|t| find(&buf, t).1)
+            .collect();
+        let columns = |glyph| {
+            ys.iter()
+                .map(|&y| glyph_x(&buf, glyph, 22, y))
+                .collect::<Vec<_>>()
+        };
+        let up = columns("▲");
+        let down = columns("▼");
+        let star = columns("☆");
+        assert!(up.iter().all(|&x| x == up[0]), "{up:?}");
+        assert!(down.iter().all(|&x| x == down[0]), "{down:?}");
+        assert!(star.iter().all(|&x| x == star[0]), "{star:?}");
+        let titles: Vec<u16> = ["seven", "eight four five", "one point two k", "negative"]
+            .iter()
+            .map(|t| find(&buf, t).0)
+            .collect();
+        assert!(titles.iter().all(|&x| x == titles[0]), "{titles:?}");
+        let clusters = ["▲     7 ▼ ☆", "▲   845 ▼ ☆", "▲  1.2k ▼ ☆", "▲   -12 ▼ ☆"];
+        for (&y, cluster) in ys.iter().zip(clusters) {
+            let row: String = rows(&buf)[usize::from(y)]
+                .chars()
+                .skip(23)
+                .take(11)
+                .collect();
+            assert_eq!(row, cluster);
+        }
+
+        // Every seed score, voted up or down, fits the column.
+        for p in data::posts() {
+            for score in [p.score - 1, p.score, p.score + 1] {
+                assert!(compact(i64::from(score)).chars().count() <= SCORE_WIDTH);
+            }
+        }
+    }
+
+    #[test]
+    fn compact_title_highlights_including_a_match_cut_by_the_ellipsis() {
+        // 60 columns, no nav: "1h ago · ▤ 0" leaves the title 32 columns,
+        // "aaaa bbbb cccc dddd eeee ffff g…", so gggg is cut after its g.
+        let mut app = one_post("aaaa bbbb cccc dddd eeee ffff gggg hhhh", "");
+        press(&mut app, KeyCode::Char('v'));
+        let plain = buffer(&mut app, 60, 20);
+        press(&mut app, KeyCode::Char('/'));
+        type_str(&mut app, "BBBB gggg");
+        assert_eq!(app.view, [0]);
+        let buf = buffer(&mut app, 60, 20);
+        let (x, y) = find(&buf, "aaaa bbbb cccc dddd eeee ffff g…");
+        assert_eq!(x, 13);
+        let expected = format!("{}^^^^{}^.", ".".repeat(5), ".".repeat(21));
+        assert_eq!(hits(&buf, x, y, 32), expected, "the … is never marked");
+        assert_eq!(
+            (buf[(x + 31, y)].fg, buf[(x + 31, y)].bg),
+            (ORANGE, HIGHLIGHT_BG),
+            "the … keeps the selected title style"
+        );
+        for dx in 0..32 {
+            assert!(buf[(x + dx, y)].modifier.contains(Modifier::BOLD), "{dx}");
+        }
+        let (mx, my) = find(&buf, "1h ago · ▤ 0");
+        assert_eq!(hits(&buf, mx, my, 12), "............", "the meta isn't");
+        assert_eq!(rows(&buf)[usize::from(y)], rows(&plain)[usize::from(y)]);
+
+        // Every occurrence, in the original case, overlapping terms merged
+        // into one run, in a kept search too.
+        let mut app = one_post("Old HUGE post about huge things", "");
+        type_str(&mut app, "v/huge \"ge p\"");
+        let buf = buffer(&mut app, 60, 20);
+        let (x, y) = find(&buf, "Old HUGE post about huge things");
+        assert_eq!(hits(&buf, x, y, 31), "....^^^^^^..........^^^^.......");
+        press(&mut app, KeyCode::Enter);
+        let kept = buffer(&mut app, 60, 20);
+        assert_eq!(hits(&kept, x, y, 31), "....^^^^^^..........^^^^.......");
+    }
+
+    #[test]
+    fn compact_rows_with_filters_alone_render_like_no_query() {
+        let mut app = compact_app();
+        type_str(&mut app, "]]]]]");
+        assert_eq!(app.feed, Feed::Group(0));
+        app.status = None;
+        let plain = buffer(&mut app, 110, 24);
+        press(&mut app, KeyCode::Char('/'));
+        type_str(&mut app, "W/eng u/ \" \"");
+        press(&mut app, KeyCode::Enter);
+        let filtered = buffer(&mut app, 110, 24);
+        for y in 3..23 {
+            for x in 0..110 {
+                assert_eq!(plain[(x, y)], filtered[(x, y)], "cell ({x}, {y})");
+            }
+        }
+    }
+
+    /// The posts drawn in the main column: one `▲` each, in cards or rows.
+    fn posts_drawn(buf: &Buffer) -> usize {
+        find_all(buf, "▲").len()
+    }
+
+    /// The selected post's row in the Compact view is on screen and drawn in
+    /// the selected style.
+    fn assert_selected_row_on_screen(app: &mut App, why: &str) {
+        let buf = buffer(app, 110, 24);
+        assert!(app.offset <= app.selected, "{why}");
+        assert!(app.selected - app.offset < 17, "{why}: 17 rows fit");
+        let (x, y) = find(&buf, &title_of(app, app.selected));
+        assert_eq!(y, 6 + (app.selected - app.offset) as u16, "{why}");
+        assert_eq!(
+            (buf[(x, y)].fg, buf[(x, y)].bg),
+            (ORANGE, HIGHLIGHT_BG),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn compact_view_shows_many_more_posts_and_keeps_the_selection_on_screen() {
+        let mut app = App::new();
+        let cards = posts_drawn(&buffer(&mut app, 110, 24));
+        press(&mut app, KeyCode::Char('v'));
+        let buf = buffer(&mut app, 110, 24);
+        let compact = posts_drawn(&buf);
+        assert_eq!((cards, compact), (2, 17), "{}", rows(&buf).join("\n"));
+        assert_eq!(app.view.len(), 19);
+
+        press(&mut app, KeyCode::Char('G'));
+        assert_selected_row_on_screen(&mut app, "after G");
+        assert_eq!(app.offset, 2, "advanced just far enough");
+        press(&mut app, KeyCode::Char('k'));
+        assert_selected_row_on_screen(&mut app, "after k");
+        assert_eq!(app.offset, 2, "no scroll needed");
+        press(&mut app, KeyCode::Char('g'));
+        assert_selected_row_on_screen(&mut app, "after g");
+        assert_eq!(app.offset, 0);
+        for (n, selected) in [5, 10, 15, 18].into_iter().enumerate() {
+            press(&mut app, KeyCode::PageDown);
+            assert_eq!(app.selected, selected, "PgDn moves 5 posts");
+            assert_selected_row_on_screen(&mut app, &format!("PgDn {n}"));
+        }
+        press(&mut app, KeyCode::PageUp);
+        assert_eq!(app.selected, 13);
+        assert_selected_row_on_screen(&mut app, "PgUp");
+        for _ in 0..13 {
+            press(&mut app, KeyCode::Char('k'));
+            assert_selected_row_on_screen(&mut app, "walking up with k");
+        }
+        assert_eq!(app.offset, 0);
+    }
+
+    #[test]
+    fn switching_to_cards_with_the_last_post_selected_shows_that_card_whole() {
+        let mut app = compact_app();
+        press(&mut app, KeyCode::Char('G'));
+        buffer(&mut app, 110, 24);
+        let compact_offset = app.offset;
+        let last = app.selected;
+        press(&mut app, KeyCode::Char('v'));
+        assert_eq!(app.status, Some("Card view"));
+        assert_eq!(
+            (app.selected, app.offset),
+            (last, compact_offset),
+            "left to the renderer"
+        );
+
+        // The first frame in the Card view scrolls the card fully on screen.
+        let buf = buffer(&mut app, 110, 24);
+        let s = rows(&buf).join("\n");
+        // 56 columns for the feed, 17 rows below the tab box.
+        let heights: u16 = app.view[app.offset..=last]
+            .iter()
+            .map(|&i| card_height(&app.posts[i], 56 - usize::from(VOTE_WIDTH) - 4))
+            .sum();
+        assert!(heights <= 17, "{heights}:\n{s}");
+        assert!(app.offset > compact_offset, "scrolled further:\n{s}");
+        let post = &app.posts[app.view[last]];
+        assert!(s.contains(&title_of(&app, last)), "{s}");
+        let comments = format!("▤ {} Comments", compact(i64::from(post.comment_count)));
+        let (_, y) = find(&buf, &comments);
+        assert_eq!(buf[(23, y + 1)].symbol(), "─", "its bottom border:\n{s}");
+        assert!(y < 22, "inside the feed, which ends at row 22:\n{s}");
+    }
+
+    #[test]
+    fn clicking_compact_rows_opens_votes_and_saves() {
+        let mut app = compact_app();
+        type_str(&mut app, "]]");
+        assert_eq!(app.feed, Feed::All);
+        press(&mut app, KeyCode::Char('G'));
+        buffer(&mut app, 110, 24);
+        let offset = app.offset;
+        assert!(offset > 0, "scrolled: {offset}");
+        press(&mut app, KeyCode::Char('k'));
+        let buf = buffer(&mut app, 110, 24);
+        assert_eq!(app.offset, offset);
+
+        // The first row drawn is view[offset], not view[0].
+        let (x, y) = find(&buf, &title_of(&app, offset));
+        click(&mut app, (x + 3, y));
+        assert_eq!(app.mode, Mode::Post { scroll: 0 });
+        assert_eq!(app.selected, offset);
+        assert_eq!(app.thread, Default::default());
+        press(&mut app, KeyCode::Esc);
+        assert_eq!((app.density, app.selected), (Density::Compact, offset));
+
+        // The meta and the blank cells count as the row.
+        let buf = buffer(&mut app, 110, 24);
+        let (_, y) = find(&buf, &title_of(&app, offset + 2));
+        click(&mut app, (75, y));
+        assert_eq!(
+            (app.mode, app.selected),
+            (Mode::Post { scroll: 0 }, offset + 2)
+        );
+        press(&mut app, KeyCode::Esc);
+
+        // ▲ and ▼ select the row and vote, without opening or re-sorting.
+        let view = app.view.clone();
+        let buf = buffer(&mut app, 110, 24);
+        let (_, y) = find(&buf, &title_of(&app, offset + 1));
+        let i = app.view[offset + 1];
+        let base = app.posts[i].score;
+        let up = (glyph_x(&buf, "▲", 22, y), y);
+        click(&mut app, up);
+        assert_eq!(app.selected, offset + 1);
+        assert_eq!(
+            (app.posts[i].vote, app.posts[i].score),
+            (Vote::Up, base + 1)
+        );
+        assert_eq!(app.mode, Mode::Feed, "not opened");
+        let buf = buffer(&mut app, 110, 24);
+        assert_eq!(buf[up].fg, ORANGE);
+        let down = (glyph_x(&buf, "▼", 22, y), y);
+        assert_eq!(down.0, up.0 + 8);
+        click(&mut app, down);
+        assert_eq!(
+            (app.posts[i].vote, app.posts[i].score),
+            (Vote::Down, base - 1)
+        );
+        assert_eq!(app.view, view, "voting never re-sorts");
+
+        // ☆ selects the row and saves it, ★ unsaves.
+        let buf = buffer(&mut app, 110, 24);
+        let (_, y) = find(&buf, &title_of(&app, offset));
+        let j = app.view[offset];
+        let star = (glyph_x(&buf, "☆", 22, y), y);
+        click(&mut app, star);
+        assert!(app.posts[j].saved);
+        assert_eq!((app.selected, app.mode), (offset, Mode::Feed));
+        assert_eq!(app.status, Some("Post saved"));
+        let buf = buffer(&mut app, 110, 24);
+        assert_eq!(buf[star].symbol(), "★");
+        click(&mut app, star);
+        assert!(!app.posts[j].saved);
+        assert_eq!(app.status, Some("Post unsaved"));
+
+        // The blank cell between ▲ and the score opens the row.
+        buffer(&mut app, 110, 24);
+        click(&mut app, (up.0 + 1, up.1));
+        assert_eq!(
+            (app.mode, app.selected),
+            (Mode::Post { scroll: 0 }, offset + 1)
+        );
+    }
+
+    #[test]
+    fn after_a_toggle_a_click_hits_what_the_new_view_draws() {
+        let mut app = App::new();
+        let cards = buffer(&mut app, 110, 24);
+        // The second card's ▲ is on a row that a compact row covers.
+        let up = find_all(&cards, "▲")[1];
+        press(&mut app, KeyCode::Char('v'));
+        let buf = buffer(&mut app, 110, 24);
+        assert_ne!(buf[up].symbol(), "▲");
+        let row = (usize::from(up.1) - 6) + app.offset;
+        click(&mut app, up);
+        assert_eq!((app.mode, app.selected), (Mode::Post { scroll: 0 }, row));
+        assert!(
+            app.posts.iter().all(|p| p.vote == Vote::None),
+            "no card vote"
+        );
+
+        // And back: a compact row's ☆ cell is inside a card again.
+        press(&mut app, KeyCode::Esc);
+        let buf = buffer(&mut app, 110, 24);
+        let star = (glyph_x(&buf, "☆", 22, 9), 9);
+        press(&mut app, KeyCode::Char('v'));
+        buffer(&mut app, 110, 24);
+        click(&mut app, star);
+        assert!(app.posts.iter().all(|p| !p.saved), "no compact save");
+        assert_eq!(app.mode, Mode::Post { scroll: 0 }, "opened the card there");
+    }
+
+    #[test]
+    fn wheel_moves_the_selection_in_compact_view() {
+        let mut app = compact_app();
+        buffer(&mut app, 110, 24);
+        mouse(&mut app, MouseEventKind::ScrollDown, (40, 10));
+        mouse(&mut app, MouseEventKind::ScrollDown, (40, 10));
+        mouse(&mut app, MouseEventKind::ScrollUp, (5, 10));
+        assert_eq!((app.selected, app.mode), (1, Mode::Feed));
+        for _ in 0..30 {
+            mouse(&mut app, MouseEventKind::ScrollDown, (40, 10));
+        }
+        assert_eq!(app.selected, app.view.len() - 1);
+        assert_selected_row_on_screen(&mut app, "after the wheel");
+    }
+
+    fn density_regions(app: &App) -> usize {
+        let hits = app.hits.as_ref().expect("rendered");
+        hits.regions
+            .iter()
+            .filter(|(_, t)| *t == Target::Density)
+            .count()
+    }
+
+    #[test]
+    fn view_switch_label_is_drawn_and_clickable_where_it_fits() {
+        let mut app = App::new();
+        let buf = buffer(&mut app, 110, 24);
+        let (x, y) = find(&buf, "▦ Card");
+        assert_eq!((x, y), (70, 4), "right-aligned, a blank before the border");
+        assert_eq!(buf[(76, 4)].symbol(), " ");
+        assert_eq!(buf[(77, 4)].symbol(), "│");
+        assert_eq!(density_regions(&app), 1);
+        click(&mut app, (x + 3, y));
+        assert_eq!(
+            (app.density, app.status),
+            (Density::Compact, Some("Compact view"))
+        );
+        let buf = buffer(&mut app, 110, 24);
+        let (x, y) = find(&buf, "≡ Compact");
+        assert_eq!((x, y), (67, 4));
+        assert!(find_all(&buf, "▦").is_empty());
+        click(&mut app, (x, y));
+        assert_eq!(
+            (app.density, app.status),
+            (Density::Card, Some("Card view"))
+        );
+        assert_eq!(app.mode, Mode::Feed);
+
+        // At 46 columns (no nav) "≡ Compact" just fits, one blank after
+        // "Rising"; at 45 it would touch it, so it isn't drawn or clickable.
+        press(&mut app, KeyCode::Char('v'));
+        let buf = buffer(&mut app, 46, 24);
+        assert_eq!(
+            rows(&buf)[4],
+            "│ 1 Hot   2 New   3 Top   4 Rising ≡ Compact │"
+        );
+        assert_eq!(density_regions(&app), 1);
+        let buf = buffer(&mut app, 45, 24);
+        assert_eq!(
+            rows(&buf)[4],
+            "│ 1 Hot   2 New   3 Top   4 Rising          │"
+        );
+        assert_eq!(density_regions(&app), 0);
+        click(&mut app, (36, 4));
+        click(&mut app, (43, 4));
+        assert_eq!((app.density, app.mode), (Density::Compact, Mode::Feed));
+        // "▦ Card" is shorter: it still fits at 43 but not at 42.
+        press(&mut app, KeyCode::Char('v'));
+        let buf = buffer(&mut app, 43, 24);
+        assert_eq!(rows(&buf)[4], "│ 1 Hot   2 New   3 Top   4 Rising ▦ Card │");
+        let buf = buffer(&mut app, 42, 24);
+        assert!(find_all(&buf, "▦").is_empty(), "{}", rows(&buf)[4]);
+        assert_eq!(density_regions(&app), 0);
+        click(&mut app, (36, 4));
+        assert_eq!(app.density, Density::Card);
+        for width in 1..=120 {
+            buffer(&mut app, width, 24);
+            assert!(density_regions(&app) <= 1);
+        }
+    }
+
+    #[test]
+    fn view_switch_does_nothing_in_the_post_view() {
+        let mut app = App::new();
+        let buf = buffer(&mut app, 110, 24);
+        let (x, y) = find(&buf, "▦ Card");
+        press(&mut app, KeyCode::Enter);
+        let post = buffer(&mut app, 110, 24);
+        assert!(find_all(&post, "▦").is_empty());
+        assert_eq!(density_regions(&app), 0);
+        click(&mut app, (x, y));
+        click(&mut app, (x + 4, y));
+        assert_eq!((app.density, app.status), (Density::Card, None));
+        assert_eq!(app.mode, Mode::Post { scroll: 0 });
+    }
+
+    #[test]
+    fn view_switch_glyphs_are_one_cell_and_used_nowhere_else() {
+        for density in [Density::Card, Density::Compact] {
+            let label = density_label(density);
+            assert_eq!(
+                label.width(),
+                label.to_string().chars().count(),
+                "{density:?}"
+            );
+            let glyph = label.to_string().chars().next().expect("a glyph");
+            assert_eq!(Span::raw(glyph.to_string()).width(), 1, "{glyph}");
+        }
+        // Every screen: Card and Compact feeds, the post view, a sidebar.
+        let mut app = App::new();
+        app.posts[0].saved = true;
+        let card = rows(&buffer(&mut app, 140, 40)).join("\n");
+        assert_eq!(
+            (card.matches('▦').count(), card.matches('≡').count()),
+            (1, 0)
+        );
+        press(&mut app, KeyCode::Char('v'));
+        let compact = rows(&buffer(&mut app, 140, 40)).join("\n");
+        assert_eq!(
+            (compact.matches('▦').count(), compact.matches('≡').count()),
+            (0, 1)
+        );
+        press(&mut app, KeyCode::Enter);
+        let post = rows(&buffer(&mut app, 140, 60)).join("\n");
+        assert!(!post.contains('▦') && !post.contains('≡'));
+    }
+
+    #[test]
+    fn hiding_in_compact_view_removes_exactly_that_row() {
+        let mut app = compact_app();
+        go_to(&mut app, Feed::All);
+        press(&mut app, KeyCode::Char('j'));
+        let before: Vec<String> = (0..app.view.len()).map(|i| title_of(&app, i)).collect();
+        let buf = buffer(&mut app, 110, 24);
+        let (_, y) = find(&buf, &before[1]);
+        assert_eq!(y, 7);
+        press(&mut app, KeyCode::Char('h'));
+        let buf = buffer(&mut app, 110, 24);
+        let s = rows(&buf).join("\n");
+        assert!(!s.contains(&before[1]), "{s}");
+        assert!(s.contains(&format!(" {} posts ", before.len() - 1)), "{s}");
+        assert_eq!(app.selected, 1, "the next row takes its place");
+        assert_eq!(find(&buf, &before[2]).1, 7, "and its row");
+        assert_eq!(find(&buf, &before[0]).1, 6);
+        let after: Vec<String> = (0..app.view.len()).map(|i| title_of(&app, i)).collect();
+        let mut expected = before.clone();
+        expected.remove(1);
+        assert_eq!(after, expected, "the others keep their order");
+        assert_eq!(app.density, Density::Compact);
     }
 }
