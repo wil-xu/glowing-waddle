@@ -75,6 +75,16 @@ pub(crate) enum Mode {
     Post { scroll: u16 },
 }
 
+/// The `?` help overlay, while it is open. It sits on top of whatever mode
+/// it was opened from and leaves that mode alone, so closing it returns to
+/// exactly that screen. Session state only: never saved.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Help {
+    /// The first line shown. The renderer clamps it to the content height
+    /// and writes it back, as it does for `Mode::Post { scroll }`.
+    pub scroll: u16,
+}
+
 /// A comment's position in a post's tree: its index among the top-level
 /// comments, then among that comment's replies, and so on. The tree never
 /// changes, so a path always names the same comment.
@@ -191,16 +201,20 @@ pub(crate) enum Target {
     Search,
     /// A comment's header row in the post view.
     Comment(CommentPath),
+    /// The help overlay's box. While it is open, it is the only region.
+    Help,
 }
 
 /// What the most recent frame drew where, written by the renderer on every
-/// frame so that a click acts on what is on screen.
+/// frame so that a click acts on what is on screen. While the help is open,
+/// it describes only the help: its box and its scroll clamp.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Hits {
     /// Clickable regions in drawing order. Where they overlap (a card's `▲`
     /// inside the card), the later one wins.
     pub regions: Vec<(Rect, Target)>,
-    /// The post view's scroll clamp. 0 outside the post view.
+    /// The scroll clamp of what the wheel scrolls: the help while it is open,
+    /// else the post view. 0 in the feed.
     pub max_scroll: u16,
 }
 
@@ -260,11 +274,23 @@ pub(crate) struct App {
     pub search: Query,
     /// Comment focus and collapse state of the open post.
     pub thread: Thread,
+    /// The `?` overlay, when open. Keys and clicks go to it, not to `mode`.
+    pub help: Option<Help>,
     /// Clickable regions of the most recent frame; `None` until the first.
     pub hits: Option<Hits>,
     pub status: Option<&'static str>,
     pub karma: u32,
     pub should_quit: bool,
+}
+
+/// One wheel notch: 3 lines down or up from `scroll`, clamped to `max` as
+/// the last frame drew it. Never moves a scroll already past `max` further.
+fn wheel_scroll(scroll: u16, delta: isize, max: u16) -> u16 {
+    if delta > 0 {
+        scroll.saturating_add(3).min(max.max(scroll))
+    } else {
+        scroll.saturating_sub(3)
+    }
 }
 
 /// Reddit's "hot" ranking, with its 45000 second decay expressed in hours.
@@ -436,6 +462,7 @@ impl App {
             query: String::new(),
             search: Query::default(),
             thread: Thread::default(),
+            help: None,
             hits: None,
             status: None,
             karma: 1_337,
@@ -647,6 +674,10 @@ impl App {
             return;
         }
         self.status = None;
+        if let Some(help) = self.help {
+            self.on_help_key(key.code, help.scroll);
+            return;
+        }
         match self.mode {
             Mode::Feed => self.on_feed_key(key.code),
             Mode::Search => self.on_search_key(key.code),
@@ -670,7 +701,8 @@ impl App {
 
     /// Left presses act on whatever the last frame drew under the pointer, and
     /// the wheel moves like `j`/`k`. Events `handles_mouse` rejects do nothing
-    /// at all, not even clear the toast.
+    /// at all, not even clear the toast. While the help is open, the wheel
+    /// scrolls it and a click outside its box closes it, and nothing else.
     pub(crate) fn on_mouse(&mut self, event: MouseEvent) {
         if !self.handles_mouse(&event) {
             return;
@@ -686,6 +718,19 @@ impl App {
         let target = hits.at(event.column, event.row).cloned();
         let max_scroll = hits.max_scroll;
         self.status = None;
+        if let Some(Help { scroll }) = self.help {
+            self.help = match wheel {
+                Some(delta) => Some(Help {
+                    scroll: wheel_scroll(scroll, delta, max_scroll),
+                }),
+                // Only the box is recorded while the help is open. Any other
+                // cell, even one where the last frame drew a card or a tab
+                // before the help opened, is outside it.
+                None if target == Some(Target::Help) => self.help,
+                None => None,
+            };
+            return;
+        }
         match (self.mode, wheel) {
             (Mode::Feed, Some(delta)) => self.move_selection(delta),
             (Mode::Feed, None) => {
@@ -694,13 +739,9 @@ impl App {
                 }
             }
             (Mode::Post { scroll }, Some(delta)) => {
-                // 3 lines per notch, clamped as the last frame drew it.
-                let scroll = if delta > 0 {
-                    scroll.saturating_add(3).min(max_scroll.max(scroll))
-                } else {
-                    scroll.saturating_sub(3)
+                self.mode = Mode::Post {
+                    scroll: wheel_scroll(scroll, delta, max_scroll),
                 };
-                self.mode = Mode::Post { scroll };
             }
             (Mode::Post { .. }, None) => {
                 if let Some(Target::Comment(path)) = target {
@@ -782,8 +823,30 @@ impl App {
             KeyCode::Char(']') => self.cycle_feed(true),
             KeyCode::Char('[') => self.cycle_feed(false),
             KeyCode::Char('/') => self.mode = Mode::Search,
+            KeyCode::Char('?') => self.help = Some(Help::default()),
             _ => {}
         }
+    }
+
+    /// While the help is open every key ends here. `?`, `Esc` and `q` close
+    /// it, the scrolling keys scroll it (clamped by the renderer, as in the
+    /// post view), and every other key does nothing, so nothing reaches the
+    /// screen underneath. Ctrl-C is handled before this, and still quits.
+    fn on_help_key(&mut self, code: KeyCode, scroll: u16) {
+        let scroll = match code {
+            KeyCode::Char('?' | 'q') | KeyCode::Esc => {
+                self.help = None;
+                return;
+            }
+            KeyCode::Char('j') | KeyCode::Down => scroll.saturating_add(1),
+            KeyCode::Char('k') | KeyCode::Up => scroll.saturating_sub(1),
+            KeyCode::PageDown | KeyCode::Char(' ') => scroll.saturating_add(10),
+            KeyCode::PageUp => scroll.saturating_sub(10),
+            KeyCode::Char('g') | KeyCode::Home => 0,
+            KeyCode::Char('G') | KeyCode::End => u16::MAX,
+            _ => scroll,
+        };
+        self.help = Some(Help { scroll });
     }
 
     fn on_search_key(&mut self, code: KeyCode) {
@@ -852,6 +915,10 @@ impl App {
             }
             KeyCode::Char('c') => {
                 self.status = Some("Link copied to clipboard!");
+                scroll
+            }
+            KeyCode::Char('?') => {
+                self.help = Some(Help::default());
                 scroll
             }
             _ => scroll,
@@ -2085,5 +2152,127 @@ mod tests {
         assert!(app.posts[gone].hidden);
         assert_eq!(titles(&app), ["other group", "old huge", "fresh small"]);
         assert_eq!((app.selected, app.density), (1, Density::Compact));
+    }
+
+    fn ctrl_c(app: &mut App) {
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    }
+
+    /// Presses `?` and checks that only `help` changed.
+    fn opens_help(app: &mut App, why: &str) {
+        let before = (
+            app.mode,
+            app.feed,
+            app.sort,
+            app.density,
+            app.query.clone(),
+            app.view.clone(),
+            (app.selected, app.offset),
+            app.thread.clone(),
+        );
+        press(app, KeyCode::Char('?'));
+        assert_eq!(app.help, Some(Help { scroll: 0 }), "{why}");
+        let after = (
+            app.mode,
+            app.feed,
+            app.sort,
+            app.density,
+            app.query.clone(),
+            app.view.clone(),
+            (app.selected, app.offset),
+            app.thread.clone(),
+        );
+        assert_eq!(after, before, "{why}");
+    }
+
+    #[test]
+    fn question_mark_opens_the_help_from_the_feed_and_the_post_view() {
+        assert_eq!(sample().help, None, "closed at startup");
+
+        let mut app = sample();
+        press(&mut app, KeyCode::Char('j'));
+        opens_help(&mut app, "Card view");
+
+        let mut app = sample();
+        press_str(&mut app, "vj");
+        assert_eq!(app.density, Density::Compact);
+        opens_help(&mut app, "Compact view");
+
+        let mut app = sample();
+        go_to(&mut app, Feed::Group(1));
+        opens_help(&mut app, "group feed");
+
+        let mut app = sample();
+        go_to(&mut app, Feed::Hidden);
+        assert!(app.view.is_empty());
+        opens_help(&mut app, "empty feed");
+
+        let mut app = sample();
+        press_str(&mut app, "/mid");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!((app.mode, app.query.as_str()), (Mode::Feed, "mid"));
+        opens_help(&mut app, "kept search");
+
+        let mut app = thread_sample();
+        press(&mut app, KeyCode::Enter);
+        press_str(&mut app, "n");
+        press(&mut app, KeyCode::Enter);
+        press_str(&mut app, "n");
+        assert_eq!(focused(&app), Some("f"));
+        assert!(app.thread.collapsed.contains(&vec![0]));
+        opens_help(&mut app, "post view, focused, with a collapsed comment");
+
+        let mut app = thread_sample();
+        press(&mut app, KeyCode::Enter);
+        opens_help(&mut app, "post view, no focus");
+    }
+
+    #[test]
+    fn question_mark_is_typed_in_search_mode() {
+        let mut app = sample();
+        press_str(&mut app, "/a?b");
+        assert_eq!((app.mode, app.query.as_str()), (Mode::Search, "a?b"));
+        assert_eq!(app.help, None);
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Backspace);
+        press_str(&mut app, "?");
+        assert_eq!((app.query.as_str(), app.help), ("?", None));
+        assert!(app.view.is_empty(), "no title holds a ?");
+    }
+
+    #[test]
+    fn q_closes_the_help_and_never_quits_while_ctrl_c_still_quits() {
+        let mut app = sample();
+        press_str(&mut app, "?q");
+        assert_eq!((app.help, app.should_quit), (None, false));
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.should_quit, "closed, so q quits again");
+
+        for keys in ["?", "\n?", "\nn?"] {
+            let mut app = thread_sample();
+            for ch in keys.chars() {
+                let code = if ch == '\n' {
+                    KeyCode::Enter
+                } else {
+                    KeyCode::Char(ch)
+                };
+                press(&mut app, code);
+            }
+            assert!(app.help.is_some(), "{keys:?}");
+            ctrl_c(&mut app);
+            assert!(app.should_quit, "{keys:?}");
+        }
+    }
+
+    #[test]
+    fn any_key_clears_a_toast_while_the_help_is_open() {
+        let mut app = sample();
+        press_str(&mut app, "?");
+        app.status = Some("Post saved");
+        press_str(&mut app, "a");
+        assert_eq!(app.status, None);
+        assert!(app.help.is_some());
+        assert_eq!(app.posts[app.view[0]].vote, Vote::None, "a didn't vote");
     }
 }

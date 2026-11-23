@@ -12,6 +12,7 @@ use ratatui::text::Line;
 use ratatui::text::Span;
 use ratatui::widgets::Block;
 use ratatui::widgets::BorderType;
+use ratatui::widgets::Clear;
 use ratatui::widgets::Padding;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Wrap;
@@ -20,6 +21,7 @@ use crate::app::App;
 use crate::app::CommentPath;
 use crate::app::Density;
 use crate::app::Feed;
+use crate::app::Help;
 use crate::app::Hits;
 use crate::app::Mode;
 use crate::app::Query;
@@ -143,6 +145,8 @@ pub(crate) fn render(frame: &mut Frame, app: &mut App) {
         Mode::Post { scroll } => render_post(frame, app, main, scroll, &mut hits),
         Mode::Feed | Mode::Search => render_feed(frame, app, main, &mut hits),
     }
+    // Last, so it covers the body as drawn. Header and footer stay.
+    render_help(frame, app, body, &mut hits);
     app.hits = Some(hits);
 }
 
@@ -213,6 +217,93 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
     );
 }
 
+/// A footer hint: a key, then what it does.
+type Hint = (&'static str, &'static str);
+
+// Every hint set must fit on one line at 80 columns, counting the blank after
+// the last hint, on every feed, in both views.
+//
+// The feed sets leave out `j/k`, `c` (which the post view set shows) and
+// `Tab` (only `1-4`). With `J join` the group set would be 84 with
+// `enter open`, and with `v view` the plain set would be too, so both leave
+// it out: Enter is the most guessable key, and clicking a card or a compact
+// row opens it too. Adding `? help` made the group set 88, so both sets now
+// give up `v view` for it: the view switch (`▦ Card` / `≡ Compact`) on the tab
+// row already names the view and toggles it on a click, and `?` lists `v`
+// along with every other key the footer can't fit. That leaves 72 and 80, and
+// the group set is still the plain set plus `J join`.
+const FEED_HINTS: &[Hint] = &[
+    ("a/z", "vote"),
+    ("1-4", "sort"),
+    ("[/]", "feed"),
+    ("/", "search"),
+    ("s", "save"),
+    ("h", "hide"),
+    ("?", "help"),
+    ("q", "quit"),
+];
+const GROUP_HINTS: &[Hint] = &[
+    ("a/z", "vote"),
+    ("1-4", "sort"),
+    ("[/]", "feed"),
+    ("/", "search"),
+    ("s", "save"),
+    ("h", "hide"),
+    ("J", "join"),
+    ("?", "help"),
+    ("q", "quit"),
+];
+const KEPT_SEARCH_HINTS: &[Hint] = &[
+    ("j/k", "move"),
+    ("enter", "open"),
+    ("/", "edit search"),
+    ("esc", "clear search"),
+    ("q", "quit"),
+];
+const SEARCH_HINTS: &[Hint] = &[
+    ("type", "filter"),
+    ("w/ u/ flair:", "narrow"),
+    ("enter", "keep"),
+    ("esc", "clear"),
+];
+const POST_HINTS: &[Hint] = &[
+    ("j/k", "scroll"),
+    ("n/p", "comments"),
+    ("a/z", "vote"),
+    ("s", "save"),
+    ("c", "share"),
+    ("?", "help"),
+    ("esc", "back"),
+];
+// With `? help` this set would be 81, so it leaves out `j/k scroll`: the set
+// above always shows it first, since a comment is only focused from the
+// unfocused post view, and the wheel scrolls too.
+const FOCUSED_HINTS: &[Hint] = &[
+    ("n/p", "comments"),
+    ("a/z", "vote comment"),
+    ("enter", "collapse"),
+    ("?", "help"),
+    ("esc", "unfocus"),
+];
+// Short enough (42 columns) that `close` still shows at 50 columns. The
+// help itself lists `PgDn`/`PgUp`/`Space`, on screen while this is.
+const HELP_HINTS: &[Hint] = &[("j/k", "scroll"), ("g/G", "top/bottom"), ("?/esc", "close")];
+
+/// The footer's hint set for the current mode.
+fn hints(app: &App) -> &'static [Hint] {
+    if app.help.is_some() {
+        return HELP_HINTS;
+    }
+    match app.mode {
+        Mode::Feed if !app.query.is_empty() => KEPT_SEARCH_HINTS,
+        Mode::Feed if matches!(app.feed, Feed::Group(_)) => GROUP_HINTS,
+        Mode::Feed => FEED_HINTS,
+        Mode::Search => SEARCH_HINTS,
+        Mode::Post { .. } if app.thread.focus.is_some() => FOCUSED_HINTS,
+        Mode::Post { .. } => POST_HINTS,
+    }
+}
+
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     if let Some(status) = app.status {
         frame.render_widget(
@@ -225,63 +316,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let hints: &[(&str, &str)] = match app.mode {
-        Mode::Feed if !app.query.is_empty() => &[
-            ("j/k", "move"),
-            ("enter", "open"),
-            ("/", "edit search"),
-            ("esc", "clear search"),
-            ("q", "quit"),
-        ],
-        // Feed hints must fit on one line at 80 columns. With `J join` the
-        // group set would be 84 with `enter open`, and with `v view` the plain
-        // set would be too, so both leave it out: Enter is the most guessable
-        // key, and clicking a card or a compact row opens it too. That leaves
-        // 72 and 80, and the group set is the plain set plus `J join`.
-        Mode::Feed if matches!(app.feed, Feed::Group(_)) => &[
-            ("a/z", "vote"),
-            ("1-4", "sort"),
-            ("[/]", "feed"),
-            ("/", "search"),
-            ("s", "save"),
-            ("h", "hide"),
-            ("J", "join"),
-            ("v", "view"),
-            ("q", "quit"),
-        ],
-        Mode::Feed => &[
-            ("a/z", "vote"),
-            ("1-4", "sort"),
-            ("[/]", "feed"),
-            ("/", "search"),
-            ("s", "save"),
-            ("h", "hide"),
-            ("v", "view"),
-            ("q", "quit"),
-        ],
-        Mode::Search => &[
-            ("type", "filter"),
-            ("w/ u/ flair:", "narrow"),
-            ("enter", "keep"),
-            ("esc", "clear"),
-        ],
-        Mode::Post { .. } if app.thread.focus.is_some() => &[
-            ("j/k", "scroll"),
-            ("n/p", "comments"),
-            ("a/z", "vote comment"),
-            ("enter", "collapse"),
-            ("esc", "unfocus"),
-        ],
-        Mode::Post { .. } => &[
-            ("j/k", "scroll"),
-            ("n/p", "comments"),
-            ("a/z", "vote"),
-            ("s", "save"),
-            ("c", "share"),
-            ("esc", "back"),
-        ],
-    };
-    let spans: Vec<Span> = hints
+    let spans: Vec<Span> = hints(app)
         .iter()
         .flat_map(|(key, what)| {
             [
@@ -291,6 +326,229 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
     frame.render_widget(Line::from(spans), area);
+}
+
+/// A part of the help overlay, one per mode plus the mouse and the keys that
+/// work anywhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Section {
+    Feed,
+    Post,
+    Search,
+    Mouse,
+    Help,
+    Anywhere,
+}
+
+/// One line of the help: the keys (shown joined by `, `), then what they do.
+type HelpRow = (&'static [&'static str], &'static str);
+
+/// Every key binding, the only place the help's text comes from. The footer
+/// shows a few of these; a test checks that each footer key is listed here,
+/// in the section for its mode. Keep it in step with PLAN.md's "Key
+/// bindings" and "Mouse".
+const HELP: [(Section, &str, &[HelpRow]); 6] = [
+    (
+        Section::Feed,
+        "Feed",
+        &[
+            (&["j/k", "↓/↑"], "select the next / previous post"),
+            (&["PgDn/PgUp"], "move 5 posts down / up"),
+            (&["g/G", "Home/End"], "first / last post"),
+            (&["a/z"], "upvote / downvote, again to undo"),
+            (&["s"], "save / unsave"),
+            (&["h"], "hide / unhide (hidden posts are in Hidden)"),
+            (&["J"], "join / leave the group, on a group feed"),
+            (&["v"], "switch between the Card and Compact views"),
+            (&["c"], "copy the post's link"),
+            (&["enter"], "open the post"),
+            (&["1-4"], "sort by Hot, New, Top, Rising"),
+            (&["Tab"], "next sort"),
+            (&["[/]"], "previous / next feed"),
+            (&["/"], "search, editing a kept search"),
+            (&["esc"], "clear a kept search"),
+            (&["?"], "this help"),
+            (&["q"], "quit"),
+        ],
+    ),
+    (
+        Section::Post,
+        "Post view",
+        &[
+            (&["j/k", "↓/↑"], "scroll 1 line"),
+            (&["PgDn/PgUp"], "scroll 10 lines down / up"),
+            (&["Space"], "scroll 10 lines down"),
+            (&["g/G", "Home/End"], "top / bottom"),
+            (&["n/p"], "focus the next / previous comment"),
+            (&["a/z"], "vote on the focused comment, or the post"),
+            (&["enter"], "collapse / expand the focused comment"),
+            (&["s"], "save / unsave the post"),
+            (&["c"], "copy the post's link"),
+            (&["esc"], "unfocus the comment, or back to the feed"),
+            (&["q", "Backspace"], "back to the feed"),
+            (&["?"], "this help"),
+        ],
+    ),
+    (
+        Section::Search,
+        "Search mode",
+        &[
+            (&["type"], "filter as you type: q, j, ? and digits too"),
+            (&["w/ u/ flair:"], "narrow to a group, author or flair"),
+            (&["Backspace"], "delete a character"),
+            (&["enter"], "keep the search, back to the feed"),
+            (&["esc"], "clear the search, back to the feed"),
+        ],
+    ),
+    (
+        Section::Mouse,
+        "Mouse",
+        &[
+            (&["click post"], "open it, like enter"),
+            (&["click ▲/▼"], "vote on it, like a/z"),
+            (&["click Save/☆"], "save / unsave it, like s"),
+            (&["click tab"], "sort, like 1-4"),
+            (&["click switch"], "switch the view, like v"),
+            (&["click nav"], "go to that feed"),
+            (&["click search"], "search, like /"),
+            (&["click comment"], "focus it, again to collapse / expand"),
+            (&["wheel"], "next / previous post, or scroll a post 3 lines"),
+        ],
+    ),
+    (
+        Section::Help,
+        "This help",
+        &[
+            (&["j/k", "↓/↑"], "scroll 1 line"),
+            (&["PgDn/PgUp"], "scroll 10 lines down / up"),
+            (&["Space"], "scroll 10 lines down"),
+            (&["g/G", "Home/End"], "top / bottom"),
+            (&["?/esc", "q"], "close"),
+            (&["wheel"], "scroll 3 lines"),
+            (&["click outside"], "close"),
+        ],
+    ),
+    (
+        Section::Anywhere,
+        "Anywhere",
+        &[(&["Ctrl-C"], "quit, saving votes, saves, hides and groups")],
+    ),
+];
+
+/// Rows are indented this much under their section's heading.
+const HELP_INDENT: usize = 2;
+/// Blank columns between the key column and the description.
+const HELP_GAP: usize = 2;
+
+/// The width of a section's key column: its longest keys.
+fn help_key_width(rows: &[HelpRow]) -> usize {
+    rows.iter()
+        .map(|(keys, _)| keys.join(", ").chars().count())
+        .max()
+        .unwrap_or(0)
+}
+
+/// The width of the widest help line, unwrapped. Every glyph in `HELP` is one
+/// cell wide (a test checks it), so chars are columns.
+fn help_width() -> usize {
+    HELP.iter()
+        .flat_map(|(_, title, rows)| {
+            let keys = help_key_width(rows);
+            let descriptions = rows
+                .iter()
+                .map(move |(_, what)| HELP_INDENT + keys + HELP_GAP + what.chars().count());
+            std::iter::once(title.chars().count()).chain(descriptions)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// The help's lines at `width` columns: the section for the current mode
+/// first, then the others in table order, a blank line between sections.
+/// Descriptions too long for the line wrap under themselves.
+fn help_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+    let first = match app.mode {
+        Mode::Feed => Section::Feed,
+        Mode::Search => Section::Search,
+        Mode::Post { .. } => Section::Post,
+    };
+    let sections = HELP
+        .iter()
+        .filter(|(section, ..)| *section == first)
+        .chain(HELP.iter().filter(|(section, ..)| *section != first));
+    let mut lines = Vec::new();
+    for (n, (_, title, rows)) in sections.enumerate() {
+        if n > 0 {
+            lines.push(Line::raw(""));
+        }
+        lines.push(Line::styled(*title, Style::new().fg(Color::White).bold()));
+        let column = HELP_INDENT + help_key_width(rows) + HELP_GAP;
+        for (keys, what) in rows.iter() {
+            let keys = format!("{}{}", " ".repeat(HELP_INDENT), keys.join(", "));
+            for (i, row) in wrap(what, width.saturating_sub(column))
+                .into_iter()
+                .enumerate()
+            {
+                let key = if i == 0 { keys.as_str() } else { "" };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{key:column$}"), Style::new().fg(ORANGE).bold()),
+                    Span::raw(row),
+                ]));
+            }
+        }
+    }
+    lines
+}
+
+/// Draws the `?` overlay, when open, centered over `body`: a bordered box
+/// titled `Keys`, as wide as its widest line where there is room, and as tall
+/// as its content or the body. The cells under the box are cleared first, so
+/// nothing shows through. The click regions underneath are dropped and the
+/// box is the only one left, so a click can't reach what the help covers,
+/// and `hits.max_scroll` becomes the help's. The scroll is clamped to the
+/// content and written back.
+fn render_help(frame: &mut Frame, app: &mut App, body: Rect, hits: &mut Hits) {
+    let Some(help) = app.help else {
+        return;
+    };
+    hits.regions.clear();
+    let width = body
+        .width
+        .min(u16::try_from(help_width() + 4).unwrap_or(u16::MAX));
+    let lines = help_lines(app, usize::from(width.saturating_sub(4)));
+    let total = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    let height = body.height.min(total.saturating_add(2));
+    let area = Rect {
+        x: body.x + (body.width - width) / 2,
+        y: body.y + (body.height - height) / 2,
+        width,
+        height,
+    };
+    let mut block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(ORANGE)
+        .title(Span::styled(" Keys ", Style::new().fg(Color::White).bold()))
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    let max_scroll = total.saturating_sub(inner.height);
+    let scroll = help.scroll.min(max_scroll);
+    app.help = Some(Help { scroll });
+    hits.max_scroll = max_scroll;
+    if max_scroll > 0 && inner.height > 0 {
+        let last = scroll + inner.height;
+        block = block.title_bottom(
+            Line::styled(
+                format!(" {}-{last} of {total} ", scroll + 1),
+                Style::new().fg(DIM),
+            )
+            .right_aligned(),
+        );
+    }
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)).block(block), area);
+    if !area.is_empty() {
+        hits.regions.push((area, Target::Help));
+    }
 }
 
 fn render_nav(frame: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
@@ -1184,6 +1442,8 @@ mod tests {
     use ratatui::crossterm::event::MouseEvent;
     use ratatui::crossterm::event::MouseEventKind;
 
+    use ratatui::layout::Position;
+
     use super::*;
     use crate::data;
 
@@ -1468,6 +1728,9 @@ mod tests {
         assert!(!s.contains("No saved posts yet"));
     }
 
+    /// The footer while the help is open, trimmed.
+    const HELP_FOOTER: &str = " j/k scroll  g/G top/bottom  ?/esc close";
+
     #[test]
     fn every_hint_set_fits_80_columns_on_every_feed() {
         let mut app = App::new();
@@ -1516,15 +1779,22 @@ mod tests {
                 let plain = footer(&mut app);
                 assert!(plain.ends_with("q quit"), "{feed:?}: {plain:?}");
                 assert!(plain.contains(" h hide "), "{feed:?}: {plain:?}");
-                assert!(plain.contains(" v view "), "{feed:?}: {plain:?}");
-                assert!(plain.chars().count() <= 80, "{feed:?}: {plain:?}");
+                assert!(plain.contains(" ? help "), "{feed:?}: {plain:?}");
+                // Counting the blank after the last hint, as PLAN.md does.
+                assert!(plain.chars().count() < 80, "{feed:?}: {plain:?}");
                 assert_eq!(plain.contains("J join"), on_group, "{feed:?}: {plain:?}");
                 let expected = if on_group {
-                    " a/z vote  1-4 sort  [/] feed  / search  s save  h hide  J join  v view  q quit"
+                    " a/z vote  1-4 sort  [/] feed  / search  s save  h hide  J join  ? help  q quit"
                 } else {
-                    " a/z vote  1-4 sort  [/] feed  / search  s save  h hide  v view  q quit"
+                    " a/z vote  1-4 sort  [/] feed  / search  s save  h hide  ? help  q quit"
                 };
                 assert_eq!(plain, expected, "{feed:?}");
+
+                press(&mut app, KeyCode::Char('?'));
+                let help = footer(&mut app);
+                assert_eq!(help, HELP_FOOTER, "{feed:?}");
+                press(&mut app, KeyCode::Char('?'));
+                assert_eq!(footer(&mut app), plain, "{feed:?}: help closed");
 
                 press(&mut app, KeyCode::Char('/'));
                 press(&mut app, KeyCode::Char('e'));
@@ -1548,18 +1818,26 @@ mod tests {
                 let post = footer(&mut app);
                 assert!(post.ends_with("esc back"), "{feed:?}: {post:?}");
                 assert_eq!(
-                    post, " j/k scroll  n/p comments  a/z vote  s save  c share  esc back",
+                    post, " j/k scroll  n/p comments  a/z vote  s save  c share  ? help  esc back",
                     "{feed:?}"
                 );
+                press(&mut app, KeyCode::Char('?'));
+                assert_eq!(footer(&mut app), HELP_FOOTER, "{feed:?}: post view");
+                press(&mut app, KeyCode::Esc);
+                assert_eq!(footer(&mut app), post, "{feed:?}: help closed");
 
                 press(&mut app, KeyCode::Char('n'));
                 assert!(app.thread.focus.is_some(), "{feed:?}");
                 let focused = footer(&mut app);
                 assert_eq!(
-                    focused,
-                    " j/k scroll  n/p comments  a/z vote comment  enter collapse  esc unfocus",
+                    focused, " n/p comments  a/z vote comment  enter collapse  ? help  esc unfocus",
                     "{feed:?}"
                 );
+                assert!(focused.chars().count() < 80, "{feed:?}: {focused:?}");
+                press(&mut app, KeyCode::Char('?'));
+                assert_eq!(footer(&mut app), HELP_FOOTER, "{feed:?}: focused");
+                press(&mut app, KeyCode::Char('q'));
+                assert_eq!(footer(&mut app), focused, "{feed:?}: help closed");
                 press(&mut app, KeyCode::Char('c'));
                 assert_eq!(footer(&mut app), " ✔ Link copied to clipboard!", "{feed:?}");
                 press(&mut app, KeyCode::Esc);
@@ -2778,7 +3056,8 @@ mod tests {
             "{:?}",
             (
                 (&app.groups, &app.posts, &app.view, app.selected, app.offset),
-                (app.sort, app.feed, app.mode, &app.query, &app.search),
+                (app.density, app.sort, app.feed, app.mode, &app.query),
+                (&app.search, app.help),
                 (
                     &app.thread,
                     &app.hits,
@@ -3718,5 +3997,830 @@ mod tests {
         expected.remove(1);
         assert_eq!(after, expected, "the others keep their order");
         assert_eq!(app.density, Density::Compact);
+    }
+
+    /// The help's box, as recorded by the last frame.
+    fn help_box(app: &App) -> Option<Rect> {
+        let hits = app.hits.as_ref()?;
+        hits.regions
+            .iter()
+            .find(|(_, target)| *target == Target::Help)
+            .map(|(rect, _)| *rect)
+    }
+
+    fn help_scroll(app: &App) -> u16 {
+        app.help.expect("the help is open").scroll
+    }
+
+    fn help_text(app: &App, width: usize) -> Vec<String> {
+        help_lines(app, width)
+            .iter()
+            .map(|line| line.to_string())
+            .collect()
+    }
+
+    /// The text inside the box's borders and padding, one string per row.
+    fn help_rows(buf: &Buffer, area: Rect) -> Vec<String> {
+        (area.y + 1..area.bottom().saturating_sub(1))
+            .map(|y| {
+                (area.x + 2..area.right().saturating_sub(2))
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The section headings of the help, in the order shown.
+    fn headings(app: &App) -> Vec<String> {
+        let titles: Vec<&str> = HELP.iter().map(|(_, title, _)| *title).collect();
+        help_text(app, usize::MAX)
+            .into_iter()
+            .filter(|line| titles.contains(&line.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn help_box_is_centered_over_the_body_and_hides_what_is_under_it() {
+        let mut app = App::new();
+        let closed = buffer(&mut app, 80, 24);
+        press(&mut app, KeyCode::Char('?'));
+        let buf = buffer(&mut app, 80, 24);
+        let area = help_box(&app).expect("the box is drawn");
+        let width = help_width() as u16 + 4;
+        assert!(width <= 80, "{width}");
+        assert_eq!(area, Rect::new((80 - width) / 2, 3, width, 20));
+        assert_eq!(find(&buf, " Keys "), (area.x + 1, 3), "the title");
+        assert_eq!(buf[(area.x, 3)].symbol(), "╭");
+        assert_eq!(buf[(area.right() - 1, 22)].symbol(), "╯");
+
+        let (before, after) = (rows(&closed), rows(&buf));
+        assert_eq!(after[..3], before[..3], "the header stays");
+        assert_eq!(after[23].trim_end(), HELP_FOOTER, "the footer stays");
+        for y in 3..23 {
+            for x in 0..80 {
+                if !area.contains(Position::new(x, y)) {
+                    assert_eq!(buf[(x, y)], closed[(x, y)], "underneath at {x},{y}");
+                }
+            }
+        }
+        // Inside, exactly the help's lines, padded with blanks: nothing from
+        // the cards shows through, and no line is cut off.
+        let inner = usize::from(width - 4);
+        let text = help_text(&app, inner);
+        assert_eq!(text, help_text(&app, usize::MAX), "nothing wraps at 80");
+        let shown = help_rows(&buf, area);
+        assert_eq!(shown.len(), 18);
+        for (row, line) in shown.iter().zip(&text) {
+            assert_eq!(*row, format!("{line:inner$}"));
+        }
+        for y in 4..22 {
+            assert_eq!(buf[(area.x + 1, y)].symbol(), " ", "left padding");
+            assert_eq!(buf[(area.right() - 2, y)].symbol(), " ", "right padding");
+        }
+        assert_eq!(text[0], "Feed", "the feed's section first");
+        assert!(
+            after[22].contains(&format!(" 1-18 of {} ", text.len())),
+            "{}",
+            after[22]
+        );
+    }
+
+    #[test]
+    fn the_section_for_the_current_mode_comes_first() {
+        let others = ["Search mode", "Mouse", "This help", "Anywhere"];
+        let mut app = thread_post();
+        press(&mut app, KeyCode::Char('?'));
+        assert_eq!(headings(&app)[..2], ["Feed", "Post view"]);
+        assert_eq!(headings(&app)[2..], others);
+        press(&mut app, KeyCode::Esc);
+
+        type_str(&mut app, "/thread");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('?'));
+        assert_eq!(headings(&app)[0], "Feed", "with a kept search");
+        press(&mut app, KeyCode::Esc);
+
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Char('?'));
+        assert_eq!(headings(&app)[..2], ["Post view", "Feed"]);
+        assert_eq!(headings(&app)[2..], others);
+        let buf = buffer(&mut app, 80, 24);
+        let area = help_box(&app).expect("drawn");
+        assert_eq!(help_rows(&buf, area)[0].trim_end(), "Post view");
+        assert!(
+            help_rows(&buf, area)[1].starts_with("  j/k, ↓/↑       scroll 1 line"),
+            "{:?}",
+            help_rows(&buf, area)[1]
+        );
+    }
+
+    #[test]
+    fn no_help_line_is_cut_off_at_80_columns_or_wider() {
+        let descriptions: Vec<&str> = HELP
+            .iter()
+            .flat_map(|(_, _, rows)| rows.iter().map(|(_, what)| *what))
+            .collect();
+        for (width, height) in [(80, 24), (100, 30), (110, 24), (200, 70)] {
+            for post in [false, true] {
+                let mut app = App::new();
+                if post {
+                    press(&mut app, KeyCode::Enter);
+                }
+                press(&mut app, KeyCode::Char('?'));
+                let mut seen: Vec<String> = Vec::new();
+                loop {
+                    let buf = buffer(&mut app, width, height);
+                    let area = help_box(&app).expect("drawn");
+                    assert_eq!(area.width, help_width() as u16 + 4, "{width}x{height}");
+                    seen.extend(
+                        help_rows(&buf, area)
+                            .into_iter()
+                            .map(|row| row.trim_end().into()),
+                    );
+                    if help_scroll(&app) == app.hits.as_ref().unwrap().max_scroll {
+                        break;
+                    }
+                    press(&mut app, KeyCode::PageDown);
+                }
+                for line in help_text(&app, usize::MAX) {
+                    assert!(seen.contains(&line), "{width}x{height} {post}: {line:?}");
+                }
+                for what in &descriptions {
+                    assert!(
+                        seen.iter().any(|row| row.ends_with(what)),
+                        "{width}x{height}: {what:?}"
+                    );
+                }
+            }
+        }
+        // Tall enough for all of it: no scrolling and no position.
+        let mut app = App::new();
+        press(&mut app, KeyCode::Char('?'));
+        let buf = buffer(&mut app, 200, 70);
+        assert_eq!(app.hits.as_ref().unwrap().max_scroll, 0);
+        let area = help_box(&app).unwrap();
+        assert_eq!(area.height, help_text(&app, usize::MAX).len() as u16 + 2);
+        let bottom = &rows(&buf)[usize::from(area.bottom() - 1)];
+        assert!(!bottom.contains(" of "), "{bottom}");
+    }
+
+    #[test]
+    fn help_keys_scroll_it_clamped_to_the_content() {
+        let mut app = App::new();
+        press(&mut app, KeyCode::Char('?'));
+        let draw = |app: &mut App| {
+            buffer(app, 80, 24);
+            help_scroll(app)
+        };
+        assert_eq!(draw(&mut app), 0);
+        let total = help_text(&app, usize::MAX).len() as u16;
+        let max = app.hits.as_ref().unwrap().max_scroll;
+        assert_eq!(max, total - 18, "18 rows inside the box");
+
+        let mut step = |code: KeyCode| {
+            press(&mut app, code);
+            draw(&mut app)
+        };
+        assert_eq!(step(KeyCode::Char('k')), 0, "clamped at the top");
+        assert_eq!(step(KeyCode::Up), 0);
+        assert_eq!(step(KeyCode::PageUp), 0);
+        assert_eq!(step(KeyCode::Char('j')), 1);
+        assert_eq!(step(KeyCode::Down), 2);
+        assert_eq!(step(KeyCode::Up), 1);
+        assert_eq!(step(KeyCode::PageDown), 11);
+        assert_eq!(step(KeyCode::Char(' ')), 21);
+        assert_eq!(step(KeyCode::PageUp), 11);
+        assert_eq!(step(KeyCode::Char('g')), 0);
+        assert_eq!(step(KeyCode::End), max);
+        assert_eq!(step(KeyCode::Home), 0);
+        assert_eq!(step(KeyCode::Char('G')), max);
+        assert_eq!(step(KeyCode::Char('j')), max, "clamped at the bottom");
+        assert_eq!(step(KeyCode::PageDown), max);
+        assert_eq!(step(KeyCode::Char('k')), max - 1, "G then k moves at once");
+
+        press(&mut app, KeyCode::Char('G'));
+        assert_eq!(help_scroll(&app), u16::MAX, "before the renderer clamps it");
+        let buf = buffer(&mut app, 80, 24);
+        assert_eq!(help_scroll(&app), max);
+        let area = help_box(&app).unwrap();
+        let shown = help_rows(&buf, area);
+        assert!(shown[17].starts_with("  Ctrl-C  quit"), "{shown:?}");
+        assert!(rows(&buf)[22].contains(&format!(" {}-{total} of {total} ", max + 1)));
+        assert_eq!(app.mode, Mode::Feed);
+        assert_eq!((app.selected, app.offset), (0, 0), "the feed never moved");
+    }
+
+    #[test]
+    fn wheel_scrolls_the_help_three_lines_and_is_clamped() {
+        let mut app = App::new();
+        press(&mut app, KeyCode::Char('?'));
+        buffer(&mut app, 80, 24);
+        let max = app.hits.as_ref().unwrap().max_scroll;
+        let area = help_box(&app).unwrap();
+        let inside = (area.x + area.width / 2, area.y + area.height / 2);
+        let mut wheel = |kind: MouseEventKind, at: (u16, u16)| {
+            mouse(&mut app, kind, at);
+            buffer(&mut app, 80, 24);
+            help_scroll(&app)
+        };
+        assert_eq!(wheel(MouseEventKind::ScrollDown, inside), 3);
+        assert_eq!(wheel(MouseEventKind::ScrollDown, (0, 0)), 6, "anywhere");
+        assert_eq!(wheel(MouseEventKind::ScrollUp, (5, 10)), 3);
+        assert_eq!(wheel(MouseEventKind::ScrollUp, inside), 0);
+        assert_eq!(
+            wheel(MouseEventKind::ScrollUp, inside),
+            0,
+            "clamped at the top"
+        );
+        for _ in 0..max {
+            wheel(MouseEventKind::ScrollDown, inside);
+        }
+        assert_eq!(help_scroll(&app), max, "clamped at the bottom");
+        assert_eq!(app.hits.as_ref().unwrap().max_scroll, max);
+        mouse(&mut app, MouseEventKind::ScrollDown, inside);
+        assert_eq!(help_scroll(&app), max, "clamped straight away");
+        assert_eq!(
+            (app.selected, app.mode),
+            (0, Mode::Feed),
+            "the feed never moved"
+        );
+
+        // In the post view too, and the post doesn't scroll.
+        let mut app = App::new();
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('?'));
+        buffer(&mut app, 80, 24);
+        mouse(&mut app, MouseEventKind::ScrollDown, (40, 12));
+        assert_eq!(help_scroll(&app), 3);
+        assert_eq!(app.mode, Mode::Post { scroll: 0 });
+    }
+
+    #[test]
+    fn a_click_outside_the_help_closes_it_and_does_nothing_else() {
+        let feed = || {
+            let mut app = App::new();
+            app.posts[0].saved = true;
+            app
+        };
+        let post = || {
+            let mut app = thread_post();
+            press(&mut app, KeyCode::Enter);
+            app
+        };
+        // Where the help-free frame drew a card, its arrow and Save, a tab,
+        // the view switch, a nav entry, the search box and a comment header.
+        let cases: [(&dyn Fn() -> App, &str); 9] = [
+            (&feed, "We deleted 40k"),
+            (&feed, "▲"),
+            (&feed, "▼"),
+            (&feed, "★ Saved"),
+            (&feed, "New"),
+            (&feed, "▦ Card"),
+            (&feed, "◎ All"),
+            (&feed, "Search Home"),
+            (&post, "u/dan"),
+        ];
+        for (setup, needle) in cases {
+            let mut app = setup();
+            let closed = buffer(&mut app, 200, 40);
+            let at = find(&closed, needle);
+            let before = state(&app);
+            press(&mut app, KeyCode::Char('?'));
+            buffer(&mut app, 200, 40);
+            let area = help_box(&app).unwrap();
+            assert!(!area.contains(Position::new(at.0, at.1)), "{needle}");
+            click(&mut app, at);
+            assert_eq!(app.help, None, "{needle}");
+            assert_eq!(app.status, None, "{needle}");
+            buffer(&mut app, 200, 40);
+            assert_eq!(state(&app), before, "{needle}: nothing else changed");
+        }
+
+        // Even when no frame has been drawn since `?`, so the last one still
+        // has the card's regions.
+        let mut app = feed();
+        let closed = buffer(&mut app, 200, 40);
+        let before = state(&app);
+        press(&mut app, KeyCode::Char('?'));
+        click(&mut app, find(&closed, "We deleted 40k"));
+        assert_eq!(app.help, None);
+        buffer(&mut app, 200, 40);
+        assert_eq!(state(&app), before);
+    }
+
+    /// The target the last frame recorded at `at`, as `on_mouse` sees it.
+    fn region_at(app: &App, at: (u16, u16)) -> Option<Target> {
+        let regions = &app.hits.as_ref()?.regions;
+        regions
+            .iter()
+            .rev()
+            .find(|(rect, _)| rect.contains(Position::new(at.0, at.1)))
+            .map(|(_, target)| target.clone())
+    }
+
+    #[test]
+    fn before_the_next_frame_a_click_on_a_stale_region_only_closes_the_help() {
+        // `?` changes no region: until the next frame, `hits` still holds the
+        // feed's or the post view's, and no `Help` box. Every click is then
+        // outside the help, so it closes it and does nothing more, even on a
+        // cell the stale regions say is an arrow, a tab, a nav entry or a
+        // comment header (and where the box will be drawn).
+        let feed = || App::new();
+        let thread = || {
+            let mut app = thread_post();
+            press(&mut app, KeyCode::Enter);
+            app
+        };
+        let focused = || {
+            let mut app = thread();
+            press(&mut app, KeyCode::Char('n'));
+            app
+        };
+        let cases: [(&dyn Fn() -> App, &str, Target); 7] = [
+            (&feed, "▲", Target::Vote(0, Vote::Up)),
+            (&feed, "▼", Target::Vote(0, Vote::Down)),
+            (&feed, "New", Target::Sort(Sort::New)),
+            (&feed, "◎ All", Target::Feed(Feed::All)),
+            (&feed, "We deleted 40k", Target::Card(0)),
+            (&thread, "u/bob", Target::Comment(vec![0, 0])),
+            // The focused header: a click would collapse it.
+            (&focused, "u/ann", Target::Comment(vec![0])),
+        ];
+        for (setup, needle, expected) in cases {
+            let mut app = setup();
+            let buf = buffer(&mut app, 80, 24);
+            let at = find(&buf, needle);
+            let target = region_at(&app, at)
+                .unwrap_or_else(|| panic!("{needle} at {at:?}:\n{}", rows(&buf).join("\n")));
+            assert_eq!(target, expected, "{needle}");
+            let before = state(&app);
+            press(&mut app, KeyCode::Char('?'));
+            assert_eq!(region_at(&app, at), Some(target), "{needle}: still there");
+            click(&mut app, at);
+            assert_eq!(app.help, None, "{needle}: closed");
+            assert_eq!(state(&app), before, "{needle}: nothing else");
+            buffer(&mut app, 80, 24);
+            assert_eq!(state(&app), before, "{needle}: after a frame");
+        }
+        // The wheel doesn't fall through to the feed or the post either.
+        for setup in [&feed as &dyn Fn() -> App, &thread] {
+            let mut app = setup();
+            buffer(&mut app, 80, 24);
+            press(&mut app, KeyCode::Char('?'));
+            let (selected, mode) = (app.selected, app.mode);
+            mouse(&mut app, MouseEventKind::ScrollDown, (40, 12));
+            assert_eq!((app.selected, app.mode), (selected, mode));
+            assert!(app.help.is_some());
+        }
+    }
+
+    #[test]
+    fn resizing_with_the_help_open_reclamps_its_scroll() {
+        let mut app = App::new();
+        press(&mut app, KeyCode::Char('?'));
+        buffer(&mut app, 80, 24);
+        press(&mut app, KeyCode::Char('G'));
+        for (width, height) in [(80, 24), (80, 50), (30, 8), (80, 70), (80, 24)] {
+            press(&mut app, KeyCode::Char('G'));
+            let buf = buffer(&mut app, width, height);
+            let area = help_box(&app).expect("drawn");
+            let inner = usize::from(area.height - 2);
+            let text = help_text(&app, usize::from(area.width - 4));
+            let max = text.len().saturating_sub(inner);
+            let why = format!("{width}x{height}");
+            assert_eq!(usize::from(help_scroll(&app)), max, "{why}");
+            assert_eq!(
+                usize::from(app.hits.as_ref().unwrap().max_scroll),
+                max,
+                "{why}"
+            );
+            let shown = help_rows(&buf, area);
+            assert_eq!(shown.len(), inner, "{why}");
+            // The last line is on the box's last row: no blank after it.
+            assert_eq!(
+                shown.last().unwrap().trim_end(),
+                text.last().unwrap().trim_end(),
+                "{why}"
+            );
+            if text.len() + 2 <= usize::from(height - 4) {
+                assert_eq!((max, inner), (0, text.len()), "{why}: fits whole");
+            }
+            // `k` moves on the very next frame.
+            press(&mut app, KeyCode::Char('k'));
+            buffer(&mut app, width, height);
+            assert_eq!(
+                usize::from(help_scroll(&app)),
+                max.saturating_sub(1),
+                "{why}"
+            );
+        }
+
+        // Growing without pressing anything clamps a scroll left at the
+        // old bottom, and shrinking keeps it.
+        let mut app = App::new();
+        press(&mut app, KeyCode::Char('?'));
+        press(&mut app, KeyCode::Char('G'));
+        buffer(&mut app, 80, 24);
+        let small = help_scroll(&app);
+        buffer(&mut app, 80, 50);
+        let big = help_scroll(&app);
+        assert!(big < small, "{big} < {small}");
+        let inner = usize::from(help_box(&app).unwrap().width - 4);
+        assert_eq!(usize::from(big), help_text(&app, inner).len() - 44);
+        buffer(&mut app, 80, 70);
+        assert_eq!(help_scroll(&app), 0);
+        buffer(&mut app, 30, 8);
+        assert_eq!(
+            help_scroll(&app),
+            0,
+            "a smaller box doesn't scroll by itself"
+        );
+        for (width, height) in [(1, 1), (2, 5), (30, 4), (80, 24)] {
+            press(&mut app, KeyCode::Char('G'));
+            buffer(&mut app, width, height);
+            assert!(help_scroll(&app) <= app.hits.as_ref().unwrap().max_scroll);
+        }
+    }
+
+    #[test]
+    fn a_click_inside_the_help_does_nothing() {
+        for post in [false, true] {
+            let mut app = thread_post();
+            if post {
+                press(&mut app, KeyCode::Enter);
+            }
+            press(&mut app, KeyCode::Char('?'));
+            buffer(&mut app, 80, 24);
+            let area = help_box(&app).unwrap();
+            let before = state(&app);
+            // Corners, the title, the padding, text, and over the card or
+            // comment headers drawn underneath.
+            let (right, bottom) = (area.right() - 1, area.bottom() - 1);
+            for at in [
+                (area.x, area.y),
+                (right, bottom),
+                (area.x + 2, area.y),
+                (area.x + 1, area.y + 1),
+                (area.x + 4, area.y + 2),
+                (area.x + area.width / 2, area.y + area.height / 2),
+                (right, area.y + 5),
+            ] {
+                click(&mut app, at);
+                assert_eq!(state(&app), before, "{post} {at:?}");
+                buffer(&mut app, 80, 24);
+                assert_eq!(state(&app), before, "{post} {at:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn help_opens_anywhere_but_search_and_closing_restores_everything() {
+        let render = |app: &mut App| {
+            buffer(app, 80, 24);
+        };
+        let scrolled_cards = || {
+            let mut app = App::new();
+            press(&mut app, KeyCode::Char('3'));
+            press(&mut app, KeyCode::Char('G'));
+            press(&mut app, KeyCode::Char('k'));
+            app
+        };
+        let scrolled_rows = || {
+            let mut app = compact_app();
+            for _ in 0..20 {
+                press(&mut app, KeyCode::Char('j'));
+            }
+            app
+        };
+        let group_with_search = || {
+            let mut app = App::new();
+            go_to(&mut app, Feed::Group(0));
+            type_str(&mut app, "/e");
+            press(&mut app, KeyCode::Enter);
+            press(&mut app, KeyCode::Char('j'));
+            app
+        };
+        let empty = || {
+            let mut app = App::new();
+            go_to(&mut app, Feed::Hidden);
+            app
+        };
+        let thread = || {
+            let mut app = App::new();
+            press(&mut app, KeyCode::Enter);
+            press(&mut app, KeyCode::Char('n'));
+            press(&mut app, KeyCode::Enter);
+            press(&mut app, KeyCode::Char('n'));
+            press(&mut app, KeyCode::Char('j'));
+            press(&mut app, KeyCode::Char('j'));
+            app
+        };
+        let cases: [(&dyn Fn() -> App, &str); 5] = [
+            (&scrolled_cards, "cards"),
+            (&scrolled_rows, "compact rows"),
+            (&group_with_search, "group feed, kept search"),
+            (&empty, "empty feed"),
+            (&thread, "post view"),
+        ];
+        for (setup, name) in cases {
+            for close in [KeyCode::Char('?'), KeyCode::Esc, KeyCode::Char('q')] {
+                let mut app = setup();
+                app.status = None;
+                render(&mut app);
+                match name {
+                    "cards" | "compact rows" => assert!(app.offset > 0, "{name}"),
+                    "group feed, kept search" => {
+                        assert!(!app.query.is_empty() && app.selected == 1, "{name}")
+                    }
+                    "empty feed" => assert!(app.view.is_empty(), "{name}"),
+                    _ => {
+                        assert!(matches!(app.mode, Mode::Post { scroll } if scroll > 0));
+                        assert!(app.thread.focus.is_some() && !app.thread.collapsed.is_empty());
+                    }
+                }
+                let before = state(&app);
+                press(&mut app, KeyCode::Char('?'));
+                assert_eq!(app.help, Some(Help { scroll: 0 }), "{name}");
+                render(&mut app);
+                assert!(help_box(&app).is_some(), "{name}");
+                press(&mut app, KeyCode::Char('j'));
+                render(&mut app);
+                assert_eq!(help_scroll(&app), 1, "{name}");
+                press(&mut app, close);
+                assert_eq!(app.help, None, "{name} {close:?}");
+                assert!(!app.should_quit, "{name} {close:?}");
+                render(&mut app);
+                assert_eq!(state(&app), before, "{name} {close:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_help_swallows_every_other_key() {
+        let keys = [
+            "a", "z", "s", "h", "J", "v", "c", "n", "p", "1", "2", "3", "4", "[", "]", "/", "x",
+            "Q", "K",
+        ]
+        .map(|key| KeyCode::Char(key.chars().next().unwrap()))
+        .into_iter()
+        .chain([
+            KeyCode::Enter,
+            KeyCode::Tab,
+            KeyCode::BackTab,
+            KeyCode::Backspace,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Delete,
+            KeyCode::Insert,
+            KeyCode::F(1),
+        ]);
+        let group = || {
+            let mut app = App::new();
+            go_to(&mut app, Feed::Group(1));
+            app
+        };
+        let compact_search = || {
+            let mut app = compact_app();
+            type_str(&mut app, "/the");
+            press(&mut app, KeyCode::Enter);
+            app
+        };
+        let post = || {
+            let mut app = thread_post();
+            press(&mut app, KeyCode::Enter);
+            press(&mut app, KeyCode::Char('n'));
+            app
+        };
+        let cases: [&dyn Fn() -> App; 3] = [&group, &compact_search, &post];
+        for setup in cases {
+            let mut app = setup();
+            assert!(!app.view.is_empty());
+            press(&mut app, KeyCode::Char('?'));
+            buffer(&mut app, 80, 24);
+            let before = state(&app);
+            for key in keys.clone() {
+                press(&mut app, key);
+                buffer(&mut app, 80, 24);
+                assert_eq!(state(&app), before, "{key:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn mouse_events_the_app_ignores_change_nothing_with_the_help_open() {
+        let rejected = [
+            MouseEventKind::Moved,
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Down(MouseButton::Right),
+            MouseEventKind::Up(MouseButton::Right),
+            MouseEventKind::Down(MouseButton::Middle),
+            MouseEventKind::ScrollLeft,
+            MouseEventKind::ScrollRight,
+        ];
+        for post in [false, true] {
+            let mut app = thread_post();
+            if post {
+                press(&mut app, KeyCode::Enter);
+            }
+            press(&mut app, KeyCode::Char('c'));
+            press(&mut app, KeyCode::Char('?'));
+            app.status = Some("Link copied to clipboard!");
+            buffer(&mut app, 110, 24);
+            let area = help_box(&app).unwrap();
+            let center = (area.x + area.width / 2, area.y + area.height / 2);
+            for at in [center, (5, 5), (60, 1), (0, 23), (area.x, area.y)] {
+                for kind in rejected {
+                    let event = MouseEvent {
+                        kind,
+                        column: at.0,
+                        row: at.1,
+                        modifiers: KeyModifiers::NONE,
+                    };
+                    assert!(!app.handles_mouse(&event), "{kind:?}");
+                    let before = state(&app);
+                    app.on_mouse(event);
+                    assert_eq!(state(&app), before, "{post}: {kind:?} at {at:?}");
+                }
+                for kind in [
+                    MouseEventKind::Down(MouseButton::Left),
+                    MouseEventKind::ScrollDown,
+                    MouseEventKind::ScrollUp,
+                ] {
+                    let event = MouseEvent {
+                        kind,
+                        column: at.0,
+                        row: at.1,
+                        modifiers: KeyModifiers::NONE,
+                    };
+                    assert!(app.handles_mouse(&event), "{kind:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn help_fits_the_body_at_every_size_and_never_panics() {
+        let footer = |width: u16| -> String {
+            let line = format!("{HELP_FOOTER} ");
+            let cut: String = line.chars().take(usize::from(width)).collect();
+            format!("{cut:w$}", w = usize::from(width))
+        };
+        let sizes = (1..=32).flat_map(|w| (1..=12).map(move |h| (w, h))).chain([
+            (80, 4),
+            (80, 5),
+            (200, 4),
+            (30, 24),
+            (79, 24),
+            (63, 22),
+        ]);
+        for post in [false, true] {
+            let mut app = App::new();
+            if post {
+                press(&mut app, KeyCode::Enter);
+            }
+            for (width, height) in sizes.clone() {
+                let why = format!("{width}x{height} post={post}");
+                let [_, body, footer_area] = Layout::vertical([
+                    Constraint::Length(3),
+                    Constraint::Min(0),
+                    Constraint::Length(1),
+                ])
+                .areas(Rect::new(0, 0, width, height));
+                let closed = buffer(&mut app, width, height);
+                press(&mut app, KeyCode::Char('?'));
+                let buf = buffer(&mut app, width, height);
+                match help_box(&app) {
+                    Some(area) => {
+                        assert_eq!(area.intersection(body), area, "{why}: {area:?}")
+                    }
+                    None => assert!(body.is_empty(), "{why}: no box"),
+                }
+                for y in 0..height {
+                    let row: String = (0..width).map(|x| buf[(x, y)].symbol()).collect();
+                    // With under 2 body rows the feed's view switch lands on
+                    // the footer row, help or not, so only the help's absence
+                    // from it is checked there (it isn't drawn at all).
+                    if footer_area.height > 0 && y == footer_area.y {
+                        if body.height < 2 {
+                            continue;
+                        }
+                        assert_eq!(row, footer(width), "{why}: the footer");
+                    } else if !(body.y..body.bottom()).contains(&y) {
+                        let was: String = (0..width).map(|x| closed[(x, y)].symbol()).collect();
+                        assert_eq!(row, was, "{why}: row {y} isn't the body's");
+                    }
+                }
+                press(&mut app, KeyCode::Char('G'));
+                buffer(&mut app, width, height);
+                assert!(help_scroll(&app) <= app.hits.as_ref().unwrap().max_scroll);
+                press(&mut app, KeyCode::Char('?'));
+                assert_eq!(app.help, None);
+            }
+        }
+    }
+
+    #[test]
+    fn every_footer_key_is_in_the_help_table() {
+        // A key matches exactly, or ignoring case when it is a name rather
+        // than a letter (`enter` and `Enter`, but `J` isn't `j`).
+        let listed = |section: Section, key: &str| {
+            HELP.iter()
+                .filter(|(s, ..)| *s == section)
+                .flat_map(|(_, _, rows)| rows.iter())
+                .flat_map(|(keys, _)| keys.iter())
+                .any(|k| *k == key || (key.chars().count() > 1 && k.eq_ignore_ascii_case(key)))
+        };
+        let sets: [(&[Hint], Section); 7] = [
+            (FEED_HINTS, Section::Feed),
+            (GROUP_HINTS, Section::Feed),
+            (KEPT_SEARCH_HINTS, Section::Feed),
+            (POST_HINTS, Section::Post),
+            (FOCUSED_HINTS, Section::Post),
+            (SEARCH_HINTS, Section::Search),
+            (HELP_HINTS, Section::Help),
+        ];
+        for (set, section) in sets {
+            for (key, _) in set {
+                assert!(listed(section, key), "{section:?} is missing {key:?}");
+            }
+        }
+        // What the feed's footer leaves out is in the help.
+        for key in ["enter", "j/k", "g/G", "PgDn/PgUp", "Tab", "c", "v", "esc"] {
+            assert!(listed(Section::Feed, key), "{key}");
+        }
+        assert!(listed(Section::Anywhere, "Ctrl-C"));
+        assert!(listed(Section::Search, "Backspace"));
+        assert!(listed(Section::Post, "Backspace") && listed(Section::Post, "Space"));
+        // Each section once.
+        for section in [
+            Section::Feed,
+            Section::Post,
+            Section::Search,
+            Section::Mouse,
+            Section::Help,
+            Section::Anywhere,
+        ] {
+            assert_eq!(HELP.iter().filter(|(s, ..)| *s == section).count(), 1);
+        }
+        // And the footer only ever shows one of those sets.
+        let mut app = App::new();
+        let check = |app: &App| {
+            let shown = hints(app);
+            assert!(sets.iter().any(|(set, _)| *set == shown), "{shown:?}");
+        };
+        for keys in [
+            "", "?", "?q/e", "\n", "\n", "\nn", "\nn?", "q", "\n\x1b", "[[[[[[[",
+        ] {
+            for ch in keys.chars() {
+                press(
+                    &mut app,
+                    match ch {
+                        '\n' => KeyCode::Enter,
+                        '\x1b' => KeyCode::Esc,
+                        ch => KeyCode::Char(ch),
+                    },
+                );
+                check(&app);
+            }
+        }
+    }
+
+    #[test]
+    fn help_glyphs_are_one_cell_wide() {
+        let mut texts: Vec<&str> = vec![" Keys "];
+        for (_, title, rows) in HELP {
+            texts.push(title);
+            for (keys, what) in rows {
+                texts.extend(keys.iter());
+                texts.push(what);
+            }
+        }
+        for set in [
+            FEED_HINTS,
+            GROUP_HINTS,
+            KEPT_SEARCH_HINTS,
+            POST_HINTS,
+            FOCUSED_HINTS,
+            SEARCH_HINTS,
+            HELP_HINTS,
+        ] {
+            for (key, what) in set {
+                texts.extend([*key, *what]);
+            }
+        }
+        let all = texts.concat();
+        for glyph in ['↓', '↑', '▲', '▼', '☆'] {
+            assert!(all.contains(glyph), "{glyph}");
+        }
+        for text in texts {
+            assert_eq!(Line::raw(text).width(), text.chars().count(), "{text:?}");
+            for ch in text.chars() {
+                assert_eq!(Span::raw(ch.to_string()).width(), 1, "{ch:?} in {text:?}");
+            }
+        }
+        // The view switch's glyphs stay the switch's alone.
+        assert!(!all.contains('▦') && !all.contains('≡'));
     }
 }

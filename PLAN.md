@@ -21,6 +21,9 @@ fix whichever one is wrong. Don't let them drift apart.
 - Like Reddit, the feed has a Card view (a bordered card per post, the
   default) and a Compact view (one row per post), switched at runtime with
   `v` or the switch on the sort-tab row.
+- Like Reddit and most keyboard-driven apps, `?` opens a sheet of every key
+  binding and what the mouse does, over the screen it was opened from (see
+  Help overlay). The footer only has room for some of them.
 - Votes, saves, hidden posts and group membership survive a restart (see
   Persistence).
 - One self-contained binary. No network and no real Workplace data: all
@@ -32,8 +35,8 @@ fix whichever one is wrong. Don't let them drift apart.
   concerns).
 - Persisting anything beyond votes, saves, hidden posts and group membership.
   The feed, sort, search, Card/Compact view, selection, scroll, comment focus
-  and collapse state and the toast start fresh on every run, on Home, Hot, in
-  the Card view, at the top.
+  and collapse state, the help overlay and the toast start fresh on every run,
+  on Home, Hot, in the Card view, at the top, with the help closed.
 
 ## Build & run
 
@@ -80,7 +83,7 @@ Captured from the real binary in a 110×24 tmux pane:
 │                    │╰──────────────────────────────────────────────────────╯╰──────────────────────────────╯
 │                    │╭──────────────────────────────────────────────────────╮
 ╰────────────────────╯╰──────────────────────────────────────────────────────╯
- a/z vote  1-4 sort  [/] feed  / search  s save  h hide  v view  q quit
+ a/z vote  1-4 sort  [/] feed  / search  s save  h hide  ? help  q quit
 ```
 
 The same screen in the Compact view (`v`, then `j` to select the second post
@@ -111,18 +114,21 @@ with an orange title, which a capture doesn't show:
 │                    │ ▲   512 ▼ ☆ This test has failed 1 i…  22h ago · ▤ 101 ╰──────────────────────────────╯
 │                    │ ▲  1.4k ▼ ☆ My cat joined a 200-perso…  1d ago · ▤ 262
 ╰────────────────────╯ ▲   744 ▼ ☆ Our team built a bot that…  1d ago · ▤ 151
- a/z vote  1-4 sort  [/] feed  / search  s save  h hide  v view  q quit
+ a/z vote  1-4 sort  [/] feed  / search  s save  h hide  ? help  q quit
 ```
 
 **No emoji, on purpose.** Every glyph is a single-width character:
-`◉ ⌕ ✦ ⌂ ↗ ◎ ● ○ ▲ ▼ ▤ ☆ ★ ⊘ ··· ✔ ▦ ≡`. Emoji such as 🔥 or 💬 render two cells
+`◉ ⌕ ✦ ⌂ ↗ ◎ ● ○ ▲ ▼ ▤ ☆ ★ ⊘ ··· ✔ ▦ ≡ ↓ ↑` (`↓ ↑` only in the help).
+Emoji such as 🔥 or 💬 render two cells
 wide in most terminals, and widely in tmux, which breaks the alignment of the
 bordered cards. Don't add them. Check new symbols too: `☰` (the trigram,
 an obvious "list" icon) was tried for the Compact switch and dropped. It is
 Wide since Unicode 16, so ratatui (`unicode-width` 0.2) gives it two cells
 while tmux 3.7 draws it in one, and the label came out with a gap. A test
 checks that `▦` and `≡` are one cell each in ratatui and appear nowhere else
-on screen.
+on screen. Another checks every char of the help table and the footer hint
+sets the same way, `↓` and `↑` included (tmux 3.7 draws them in one cell
+too).
 
 The screen is a header (3 rows), a body, and a footer (1 row).
 
@@ -160,30 +166,45 @@ The screen is a header (3 rows), a body, and a footer (1 row).
     About is drawn when there isn't room for it, and it is clipped at the
     bottom.
 - **Footer:** key hints, which change with the mode. There are separate sets
-  for the feed, the feed with a kept search, search mode, and the post view
-  with and without a focused comment. The plain feed set is `a/z vote`,
-  `1-4 sort`, `[/] feed`, `/ search`, `s save`, `h hide`, `v view`, `q quit`
-  (72 columns). On a group feed it adds `J join` before `v view` (80
-  columns, exactly the limit). Neither shows `enter open`. It was first
-  dropped from the group set alone, when `J join` would have made that set 84
-  columns: Enter is the most guessable key, and a click on a card opens it
-  too. Adding `v view` would have made the plain set 84, so it now leaves
-  out `enter open` as well, for the same reason (a click on a compact row
-  opens it too), while the group set comes to exactly 80. Dropping it was
-  the cheapest fix: every other hint is
-  a key you can't guess, and shortening labels (`[] feed`, `/ find`) saved
-  only a column or two each. It also keeps the two sets the same apart from
-  `J join`. The feed set with a kept search is unchanged and still lists
-  `enter open`. The search set is
-  `type filter`, `w/ u/ flair: narrow`, `enter keep`, `esc clear`. The post
-  view set is `j/k scroll`, `n/p comments`, `a/z vote`, `s save`, `c share`,
-  `esc back`, and with a comment focused `j/k scroll`, `n/p comments`,
-  `a/z vote comment`, `enter collapse`, `esc unfocus`. Every set must fit on
-  one line at 80 columns on every feed, Hidden included, so the feed set
-  leaves out `j/k` and `c` (which the post view set still shows) and lists
-  only `1-4` for sorting, not `Tab`. The hints are the same in both views. A
-  status toast (green, `✔ …`) replaces
-  the hints until the next key press, left click or wheel event (see Mouse).
+  for the feed, the feed with a kept search, search mode, the post view with
+  and without a focused comment, and the help overlay. They are constants
+  next to `render_footer` (`FEED_HINTS`, `GROUP_HINTS`, ...), picked by
+  `hints`. The plain feed set is `a/z vote`, `1-4 sort`, `[/] feed`,
+  `/ search`, `s save`, `h hide`, `? help`, `q quit` (72 columns, counting
+  the blank after the last hint). On a group feed it adds `J join` before
+  `? help` (80 columns, exactly the limit). Every set must fit on one line at
+  80 columns on every feed, Hidden and every group included, in both views,
+  so the feed sets leave things out, and `?` lists all of them:
+  - `enter open`. It was first dropped from the group set alone, when
+    `J join` would have made that set 84 columns: Enter is the most
+    guessable key, and a click on a card or a compact row opens it too.
+    Adding `v view` would have made the plain set 84, so it left out
+    `enter open` as well.
+  - `v view`. Adding `? help` made the group set 88, so both sets gave up
+    `v view` for it. Of the hints left, it is the only one whose action is
+    already on screen: the view switch (`▦ Card` / `≡ Compact`) on the tab
+    row names the current view and toggles it on a click, and it is drawn at
+    80 columns. Every other hint is a key you can't guess, shortening labels
+    (`[] feed`, `/ find`) saves only a column or two each, and dropping the
+    same hint from both sets keeps them the same apart from `J join`. The
+    trade-off: `v` is now found only through the switch or `?`.
+  - `j/k` and `c` (which the post view set shows), and `Tab` (only `1-4` for
+    sorting).
+
+  The feed set with a kept search is unchanged and still lists `enter open`:
+  `j/k move`, `enter open`, `/ edit search`, `esc clear search`, `q quit`.
+  The search set is `type filter`, `w/ u/ flair: narrow`, `enter keep`,
+  `esc clear`. The post view set is `j/k scroll`, `n/p comments`, `a/z vote`,
+  `s save`, `c share`, `? help`, `esc back` (71 columns). With a comment
+  focused it is `n/p comments`, `a/z vote comment`, `enter collapse`,
+  `? help`, `esc unfocus` (69): with `j/k scroll` it would be 81, and that is
+  the hint to drop, since a comment is only ever focused from the unfocused
+  post view, whose set shows it, and the wheel scrolls too. While the help is
+  open the footer shows `j/k scroll`, `g/G top/bottom`, `?/esc close` (42
+  columns, so `close` still shows at 50; the help itself lists `PgDn`, `PgUp`
+  and `Space`). The hints are the same in both views. A status toast
+  (green, `✔ …`) replaces the hints until the next key press, left click or
+  wheel event (see Mouse).
 - **Responsive:** the left nav shows only when the body is at least 70 columns
   wide, and the right sidebar only at 100 or more.
 
@@ -321,7 +342,8 @@ stop at the ends, and do nothing on a post without seeded comments. The
 focused comment's header row (`u/<author> · <age>`, and the `[+]` and reply
 count when collapsed) is drawn like the active nav entry: orange on the
 highlight background, bold. `Esc` clears the focus and stays in the post; the
-next `Esc` goes back to the feed. `q` and `Backspace` always go back.
+next `Esc` goes back to the feed. `q` and `Backspace` always go back (unless
+the help is open: then `q` closes it, see Help overlay).
 
 **Comment votes.** With a comment focused, `a`/`z` vote on it instead of the
 post, with the same arithmetic (see Selection behavior). An upvote draws its
@@ -360,6 +382,85 @@ doesn't change the content height or the scroll clamping.
 The renderer clamps the scroll position to the content height (after any
 collapse) and writes it back into `Mode::Post { scroll }`. So `G` followed by
 `k` moves right away, instead of first counting down from `u16::MAX`.
+
+### Help overlay (`?`)
+
+`?` in the feed (either view, any feed, an empty one and one with a kept
+search included) or in the post view (focused or not) opens a box titled
+`Keys` over the body. In search mode `?` is typed into the query like any
+other printable key. Captured from the real binary in a 110×24 tmux pane,
+right after `?` on the frontpage:
+
+```
+╭────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ ◉  workit     ⌕ Search Home                                                           ● u/you  ✦ 1.3k karma│
+╰────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭────────────────────╭ Keys ───────────────────────────────────────────────────────────╮─────────────────────╮
+│ ⌂ Home             │ Feed                                                            │sonal workit         │
+│ ↗ Popular          │   j/k, ↓/↑       select the next / previous post                │e. Come here to      │
+│ ◎ All              │   PgDn/PgUp      move 5 posts down / up                         │ with your favorite  │
+│ ☆ Saved            │   g/G, Home/End  first / last post                              │                     │
+│ ⊘ Hidden           │   a/z            upvote / downvote, again to undo               │                     │
+│                    │   s              save / unsave                                  │ Create Post         │
+│ GROUPS             │   h              hide / unhide (hidden posts are in Hidden)     │─────────────────────╯
+│ ● w/Engineering    │   J              join / leave the group, on a group feed        │ today ──────────────╮
+│ ● w/RemoteWork     │   v              switch between the Card and Compact views      │n 2026 is happening… │
+│ ● w/OfficeLife     │   c              copy the post's link                           │cements · 545 comme… │
+│ ● w/Hackathon      │   enter          open the post                                  │got his own visitor… │
+│ ○ w/Announcements  │   1-4            sort by Hot, New, Top, Rising                  │TheOffice · 406 com… │
+│ ● w/Foodies        │   Tab            next sort                                      │r opinion: most of … │
+│ ○ w/DogsOfTheOffice│   [/]            previous / next feed                           │ering · 393 comments │
+│ ● w/OncallSurvivors│   /              search, editing a kept search                  │ding opens Monday: … │
+│                    │   esc            clear a kept search                            │cements · 332 comme… │
+│                    │   ?              this help                                      │─────────────────────╯
+│                    │   q              quit                                           │
+╰────────────────────╰───────────────────────────────────────────────────── 1-18 of 62 ╯
+ j/k scroll  g/G top/bottom  ?/esc close
+```
+
+- **One table.** Everything in the box comes from `HELP` in `ui.rs`: six
+  sections (Feed, Post view, Search mode, Mouse, This help, Anywhere for
+  Ctrl-C), each a list of rows, each row its keys (shown joined by `, `) and
+  what they do. It mirrors "Key bindings" and "Mouse" below, so change them
+  together. A test fails if a key of any footer hint set is missing from its
+  mode's section, so the footer can't name a key the help doesn't explain.
+- **Order.** The section for the mode it was opened from comes first (Feed
+  or Post view), then the others in table order. A blank line separates
+  sections. Headings are white and bold, keys orange and bold, as in the
+  footer. Each section's key column is as wide as its longest keys.
+- **Layout.** The box is centered over the body, whatever the mode drew
+  there, and the header and footer stay. It is as wide as the widest line
+  plus borders and a blank column each side (67 columns), or the body if
+  narrower, and as tall as the content plus borders, or the body if shorter.
+  So it always fits inside the body and never draws over the header or
+  footer, and with no body rows it isn't drawn at all. Its cells are cleared
+  first, so nothing shows through. Outside it the screen is drawn exactly as
+  without the help. At 80 columns and wider no line is cut off. In a
+  narrower box descriptions wrap under themselves, and a key wider than the
+  box is clipped. It never panics, down to 1×1.
+- **Scrolling.** `Help.scroll` is the first line shown. The renderer clamps
+  it to the content height and writes it back on every frame, as in the post
+  view, so `G` then `k` moves at once, and after a resize the scroll fits the
+  new box: never past the last line, and none at all when everything fits. When there is more than fits, the bottom border
+  shows the lines in view, `1-18 of 62` at 80×24.
+- **Modal.** The help sits on top of the mode and leaves it alone. Closing
+  it returns to exactly the screen it was opened from: mode, feed, sort,
+  kept search, selection, `offset`, view, post scroll, focus and collapse.
+  While it is open:
+  - `?`, `Esc` and `q` close it. `q` never quits here.
+  - `j`/`↓`, `k`/`↑` scroll 1 line, `PgDn`/`Space` and `PgUp` 10, `g`/`Home`
+    and `G`/`End` go to the top and bottom.
+  - Every other key does nothing. Voting, saving, hiding, joining, the view
+    toggle, sorts, feeds, search, opening, comment focus and collapse never
+    reach the screen underneath.
+  - Any key press clears a toast, as always, and Ctrl-C still quits and
+    saves.
+  - The wheel scrolls it 3 lines per notch, anywhere on screen, clamped. A
+    left click inside the box does nothing. A left click anywhere else
+    closes it and does nothing more, even where the screen underneath drew a
+    card, tab, switch, nav entry, search box or comment header (see Mouse).
+- **Not saved.** Whether it is open and its scroll are session state only.
+  Every run starts with it closed, and the state file doesn't change.
 
 ## Data model (`src/data.rs`)
 
@@ -419,6 +520,7 @@ enum Vote { Up, None /* default */, Down }
 | `mode: Mode` | `Feed`, `Search`, `Post { scroll: u16 }`. `scroll` is clamped, and moved to reveal a newly focused comment, by the renderer |
 | `query: String` | search text, raw as typed. Kept after leaving search mode with Enter |
 | `search: Query` | `query` parsed into free-text terms and filters. Re-parsed on every rebuild of `view`, and used both to filter and to highlight |
+| `help: Option<Help>` | the `?` overlay: `None` when closed (at startup), else `Help { scroll: u16 }`. While it is open, keys and clicks go to it and `mode` is left as it was. `scroll` is clamped by the renderer. Not saved |
 | `hits: Option<Hits>` | where the most recent frame drew each clickable thing, written by the renderer on every frame. `None` until the first frame (see Mouse) |
 | `thread: Thread` | the open post's comment state: `focus: Option<CommentPath>`, `collapsed: HashSet<CommentPath>` (see Data model) and `reveal: bool` (set when `focus` moves, cleared by the renderer once it has scrolled). Reset to the default whenever a post is opened. Only read in the post view |
 | `status: Option<&'static str>` | toast text. Every toast is a fixed string. Cleared on the next key press, left click or wheel event |
@@ -545,8 +647,8 @@ current feed and sort, and the view updates on every keystroke.
 
 ## Key bindings
 
-**Global:** Ctrl-C quits from any mode, including search. Like `q` in the
-feed, it saves the state file (see Persistence).
+**Global:** Ctrl-C quits from any mode, including search and with the help
+open. Like `q` in the feed, it saves the state file (see Persistence).
 
 | Key | Feed | Post view |
 |---|---|---|
@@ -566,6 +668,7 @@ feed, it saves the state file (see Persistence).
 | `[` / `]` | prev / next feed | — |
 | `/` | enter search mode, editing any kept query | — |
 | `Esc` | clear a kept search. Otherwise nothing, so it never quits | unfocus the comment, or back to feed with none focused |
+| `?` | open the help (see Help overlay) | same |
 | `q` | quit | back to feed |
 | `Backspace` | — | back to feed |
 
@@ -579,12 +682,22 @@ on a card's action row stays decorative.
 
 **Search mode:**
 
-- Every printable key, including `q`, `j`, `J`, `h`, `v`, `n`, `p` and
+- Every printable key, including `q`, `j`, `J`, `h`, `v`, `n`, `p`, `?` and
   digits, is typed into the query. Phrases and the `w/`, `u/` and `flair:` filters are
   described under Search.
 - Backspace deletes a character.
 - Enter returns to the feed and keeps the filter.
 - Esc returns to the feed and clears it.
+
+**Help overlay** (open over the feed or the post view):
+
+| Key | Help |
+|---|---|
+| `j`/`↓`, `k`/`↑` | scroll 1 line |
+| `PgDn`/`Space`, `PgUp` | scroll 10 lines |
+| `g`/`Home`, `G`/`End` | top / bottom |
+| `?`, `Esc`, `q` | close, back to exactly where it was opened |
+| anything else | nothing (it never reaches the screen underneath) |
 
 ## Mouse
 
@@ -618,6 +731,15 @@ event before the first frame is drawn. `handles_mouse` is that rule, and
 | a comment's header row (`u/<author> · <age>`, `[+]` headers included), across the post box | not drawn | focus it. If it is already focused, collapse / expand it, like `Enter` |
 | the wheel, anywhere | select the next / previous card or row, like `j` / `k` | scroll 3 lines, clamped like `j` / `k` |
 
+**While the help is open** (feed or post view underneath), the table above
+doesn't apply. The wheel scrolls the help 3 lines per notch, clamped like
+its `j`/`k`. A left click inside its box, borders included, does nothing.
+A left click anywhere else closes it and does nothing more: it never votes,
+opens, saves, sorts, toggles the view, switches feeds, enters search or
+focuses a comment, whatever the screen underneath drew there. The events
+ignored everywhere (releases, moves, drags, right and middle clicks,
+horizontal scroll) are ignored here too, and cause no redraw.
+
 `—` means the click does nothing. So do the `GROUPS` heading, the blank nav
 row, every border outside a card, the logo, the user and karma, the sidebar
 (its Join button included) and the footer. In the post view only comment
@@ -632,11 +754,12 @@ re-clamps the scroll to the shorter content.
 
 **Click regions.** On every frame the renderer records what it drew where in
 `App.hits` (`Hits` in `app.rs`): `regions`, a list of `(Rect, Target)` in
-drawing order, and `max_scroll`, the post view's scroll clamp (0 outside the
-post view). `Target` is `Card(i)`, `Vote(i, Vote)` or `Save(i)` with `i` an
-index into `view` (a compact row records the same three), `Sort(Sort)`,
-`Density` (the view switch), `Feed(Feed)`, `Search` or
-`Comment(CommentPath)`. A click takes the last region containing the cell,
+drawing order, and `max_scroll`, the scroll clamp of what the wheel scrolls
+(the help while it is open, else the post view, 0 in the feed). `Target` is
+`Card(i)`, `Vote(i, Vote)` or `Save(i)` with `i` an index into `view` (a
+compact row records the same three), `Sort(Sort)`, `Density` (the view
+switch), `Feed(Feed)`, `Search`, `Comment(CommentPath)` or `Help` (the help's
+box). A click takes the last region containing the cell,
 so a card's arrows and Save label, and a compact row's arrows and star,
 recorded after the card or row, win over it.
 
@@ -658,7 +781,15 @@ recorded after the card or row, win over it.
   of `view` or a comment hidden under a collapsed ancestor, so a stale
   region can't break the focus invariants.
 - The wheel in the post view clamps to `max_scroll` straight away, and the
-  renderer clamps again as it does for `j`.
+  renderer clamps again as it does for `j`. So does the wheel in the help
+  (before the first frame after `?`, against the stale `max_scroll`, which
+  the next frame corrects).
+- While the help is open, the renderer draws the screen underneath as
+  usual, then drops every region it recorded and records only the help's
+  box as `Help`, with the help's `max_scroll`. `on_mouse` handles the help
+  before looking at the mode: a click is inside only when it hits `Help`,
+  so even a click before the first frame after `?`, while the old regions
+  are still there, can only close the help.
 - `app.rs` only hit-tests rectangles. It has no rendering code.
 
 **No redraw for ignored events.** Mouse capture turns on any-motion
@@ -677,7 +808,7 @@ debug build at that size.
 Your vote on each post and on each comment, each post's `saved` and `hidden`
 flags and each group's `joined` flag are kept in a small text file between
 runs. Nothing else is: every run starts on Home, Hot, at the top, with no
-query, focus, collapse or toast.
+query, focus, collapse or toast, and the help closed.
 
 **What is stored.** Only differences from the seed: a group whose `joined`
 differs from the seed's (both joining an unjoined group and leaving a joined
@@ -828,21 +959,22 @@ workit/
     app.rs      state, feeds, sorts, voting, saving, hiding, joining, the
                 Card/Compact toggle, search
                 (query parsing, matching, highlight positions), comment focus
-                and collapse, key handling, mouse handling (hit-testing the
-                click regions). No rendering
+                and collapse, key handling (the help's keys included), mouse
+                handling (hit-testing the click regions). No rendering
     data.rs     seed groups, posts, comments
     state.rs    the state file: content keys, format, loading, atomic saving,
                 path selection
-    ui.rs       all rendering (cards and compact rows, the view switch), including
-                offset upkeep, post-view scroll clamping, revealing the focused
-                comment and recording the click regions
+    ui.rs       all rendering (cards and compact rows, the view switch, the
+                help overlay and its table, the footer's hint sets), including
+                offset upkeep, post-view and help scroll clamping, revealing the
+                focused comment and recording the click regions
 ```
 
 ## Testing
 
-140 unit tests, run with `cargo test`:
+160 unit tests, run with `cargo test`:
 
-- **`app.rs`** (49), on small custom data sets:
+- **`app.rs`** (53), on small custom data sets:
   - Home hides unjoined groups, and Popular hides low scores.
   - The exact order for each sort.
   - Feed cycling wraps in both directions, with Saved and then Hidden between
@@ -906,7 +1038,14 @@ workit/
     opens nothing) while the wheel still works.
   - Hiding in the Compact view removing exactly that post, `selected`
     keeping its index.
-- **`ui.rs`** (68), rendering into a `TestBackend`:
+  - The help closed at startup, and `?` opening it, changing nothing else,
+    from the Card and Compact views, a group feed, an empty Hidden feed, a
+    kept search, and the post view with and without a focused comment (and
+    a collapsed one); `?` typed into the query in search mode; `q` closing
+    it without quitting (the next `q` quits) and Ctrl-C quitting with it
+    open from the feed and the post view; a key press clearing a toast while
+    `a` does nothing.
+- **`ui.rs`** (83), rendering into a `TestBackend`:
   - The helpers `compact`, `age`, `wrap` and `truncate`.
   - The frontpage contents.
   - Sidebars hidden at narrow widths.
@@ -932,12 +1071,13 @@ workit/
     with a kept search staying, and Hidden's sidebar.
   - The group sidebar button and nav mark flipping with `J`.
   - Every hint set (feed, kept search, search, post view unfocused and
-    focused) fitting in 80 columns on every feed, Hidden included, in both
-    the Card and Compact views, with the exact plain and group feed sets,
-    `h hide` and `v view` in both, `J join` only in the feed set on group
-    feeds, the exact search-mode and post-view sets, the toggle's toast, a
-    toast replacing the focused set, and `Esc` bringing back the unfocused
-    one.
+    focused, help) fitting in 80 columns on every feed, Hidden included, in
+    both the Card and Compact views, with the exact plain and group feed
+    sets, `h hide` and `? help` in both, `J join` only in the feed set on
+    group feeds, the exact search-mode, post-view and help sets, the
+    toggle's toast, a toast replacing the focused set, and `Esc` bringing
+    back the unfocused one. Closing the help bringing back the set it
+    replaced.
   - Highlight cells: a title match black on orange and still bold, in the
     original case, with its neighbors untouched, in a kept search too.
   - A phrase wrapping across two title rows highlighted on both.
@@ -1055,7 +1195,61 @@ workit/
       before the first frame. Every event it rejects (moves, releases,
       drags, right and middle buttons, horizontal scroll) leaves every
       field of `App` unchanged, the toast included.
-- **`state.rs`** (23), on in-memory strings and on files in a directory
+  - The help overlay:
+    - At 80×24, the box centered over the body (67×20 at column 6),
+      titled ` Keys `, the header unchanged, the footer the help's set,
+      every cell outside the box as without the help, and inside exactly the
+      help's lines with blank padding: nothing shows through and nothing
+      wraps. The feed's section first and `1-18 of N` on the bottom border.
+    - The current mode's section first: Feed (with a kept search too), or
+      Post view then Feed, the rest in table order.
+    - At 80×24, 100×30, 110×24 and 200×70, from the feed and the post view,
+      scrolling through all of it: every line, and every description whole,
+      on screen. Tall enough, no scrolling and no position shown.
+    - Each scrolling key, clamped at both ends; `G` storing `u16::MAX` and
+      the renderer clamping it so the last row (`Ctrl-C`) is the box's last;
+      `G` then `k` moving at once; the feed never moving.
+    - The wheel scrolling 3 lines from inside the box and from anywhere
+      else, clamped at both ends, in the feed and the post view, the post's
+      own scroll untouched.
+    - A click outside closing it and changing nothing else (every field of
+      `App` the same after a render) where the help-free frame drew a card,
+      its `▲`, `▼` and `★ Saved`, a sort tab, the view switch, a nav entry,
+      the search box and a comment header; also with no frame drawn since
+      `?`. Clicks inside (corners, title, padding, text, over cards and
+      comment headers) changing nothing.
+    - With no frame drawn since `?`, so `hits` still holds the screen's
+      regions and no box: a click on a card's `▲` and `▼`, the card, a sort
+      tab, a nav entry, an unfocused comment header and the focused one
+      (which a click would collapse), each first checked to be that region,
+      closing the help and changing nothing else, before and after the next
+      frame; the wheel not reaching the feed or the post.
+    - Resizing while open: after `G` at 80×24, 80×50, 30×8, 80×70 and back
+      at 80×24, the scroll re-clamped to the new content and box, the last
+      line on the box's last row (the whole content, unscrolled, when it
+      fits) and `k` moving on the very next frame; a scroll left at the old
+      bottom clamped by a bigger box alone, and down to 1×1 no panic.
+    - From cards and compact rows scrolled down, a group feed with a kept
+      search, an empty feed and a post view with a focused and a collapsed
+      comment, scrolled: `?`, `Esc` and `q` each closing it and restoring
+      every field of `App`.
+    - `a`, `z`, `s`, `h`, `J`, `v`, `c`, `n`, `p`, the digits, `[`, `]`,
+      `/`, Enter, Tab, Backspace and other keys changing nothing, rendering
+      after each, on a group feed, in the Compact view with a kept search
+      and in the post view with a focused comment.
+    - The mouse events the app ignores changing nothing and not counting,
+      with the help open, inside and outside the box.
+    - Every size from 1×1 to 32×12, plus 80×4, 80×5, 200×4, 30×24, 79×24
+      and 63×22, from the feed and the post view: no panic, the box inside
+      the body (or not drawn with no body), the header as without the help,
+      the footer the help's set (where the body has 2 rows or more), and the
+      scroll within its clamp after `G`.
+    - Every key of every footer hint set listed in the help table under its
+      mode's section, along with the keys the feed sets leave out; each
+      section once; and the footer only ever showing one of those sets.
+    - Every char of the help table and the hint sets one cell wide in
+      ratatui (`↓`, `↑`, `▲`, `▼` and `☆` included), and `▦`/`≡` unused.
+- **`state.rs`** (24), on in-memory strings and on files in a directory
   under the system temp dir that each test creates and removes itself. No
   test reads or writes a real state file or reads `HOME`, `XDG_STATE_HOME`
   or `WORKIT_STATE`:
@@ -1112,6 +1306,9 @@ workit/
   - A shared key belonging to the first item, for posts and comments.
   - Every key in the real seed unique, and the seed with no votes, saves or
     hidden posts.
+  - Ctrl-C with the help open saving the vote made before it and nothing
+    pressed while it was open, the file unchanged in format, and the next
+    run starting with the help closed.
 
 Lint with `arc f`, `arc lint` and `arc rust-clippy`. The `arc lint -e extra`
 engine isn't configured for `users/`.

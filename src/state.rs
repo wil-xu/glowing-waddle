@@ -738,6 +738,26 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_c_with_the_help_open_saves_and_the_help_is_never_saved() {
+        let dir = TempDir::new("help-ctrl-c");
+        let path = dir.0.join("state");
+        run(&path, seed(), |app| {
+            press(app, "a?Gjz");
+            assert!(app.help.is_some());
+            app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+            assert!(app.should_quit);
+        });
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "workit-state 1\nvote\tup\tEngineering\tdana\tdead code\n",
+            "the vote before the help, and nothing pressed while it was open"
+        );
+        let app = run(&path, seed(), |_| {});
+        assert_eq!(app.help, None, "every run starts with the help closed");
+        assert_eq!(find(&app, "dead code").score, 101);
+    }
+
+    #[test]
     fn restored_upvote_undone_with_a_gives_the_seed_score() {
         let dir = TempDir::new("undo-upvote");
         let path = dir.0.join("state");
