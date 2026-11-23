@@ -79,16 +79,24 @@ enum Item {
 /// post's is its group's name, author and title, and a comment's is its
 /// post's key followed by the author and body of each comment on the way
 /// down to it, its own last.
-fn items(app: &App) -> Vec<(Vec<&'static str>, Item)> {
-    fn walk(
-        comments: &[Comment],
-        key: &[&'static str],
+///
+/// Comments you wrote this session (`Comment::mine`) are not items, and
+/// neither is anything under one: they are never saved, can't own a key,
+/// and no record can name them. Each item's path is its current one, so a
+/// seeded comment pushed to a later index by one of yours keeps its key.
+fn items(app: &App) -> Vec<(Vec<&str>, Item)> {
+    fn walk<'a>(
+        comments: &'a [Comment],
+        key: &[&'a str],
         path: &[usize],
         post: usize,
-        out: &mut Vec<(Vec<&'static str>, Item)>,
+        out: &mut Vec<(Vec<&'a str>, Item)>,
     ) {
         for (n, comment) in comments.iter().enumerate() {
-            let key = [key, &[comment.author, comment.body]].concat();
+            if comment.mine {
+                continue;
+            }
+            let key = [key, &[comment.author, &comment.body]].concat();
             let path = [path, &[n]].concat();
             out.push((key.clone(), Item::Comment(post, path.clone())));
             walk(&comment.replies, &key, &path, post, out);
@@ -111,7 +119,7 @@ fn items(app: &App) -> Vec<(Vec<&'static str>, Item)> {
 /// Which item each key names. When several items share a key, the first in
 /// seed order owns it; the others are never saved or loaded. Group keys have
 /// one field and post and comment keys at least three, so they never clash.
-fn owners<'a>(items: &'a [(Vec<&'static str>, Item)]) -> HashMap<&'a [&'static str], &'a Item> {
+fn owners<'a, 'k>(items: &'a [(Vec<&'k str>, Item)]) -> HashMap<&'a [&'k str], &'a Item> {
     let mut owners = HashMap::new();
     for (key, item) in items {
         owners.entry(key.as_slice()).or_insert(item);
@@ -264,7 +272,7 @@ impl Record {
 
     /// What the record asks of the item its key names, or `None` when the
     /// key names nothing in the current data.
-    fn resolve(self, owners: &HashMap<&[&'static str], &Item>) -> Option<Change> {
+    fn resolve(self, owners: &HashMap<&[&str], &Item>) -> Option<Change> {
         let owner = |key: &[String]| {
             let key: Vec<&str> = key.iter().map(String::as_str).collect();
             owners.get(key.as_slice()).copied()
@@ -1365,5 +1373,167 @@ mod tests {
         store.save(&app).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), contents);
         assert_eq!(dir.entries(), ["state"]);
+    }
+
+    fn esc(app: &mut App) {
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    }
+
+    /// The same votes on "dead code" with and without your comments: a
+    /// downvote on lin (depth 2) and an upvote on sam. With them, a comment
+    /// of yours goes first (pushing marco and sam down one), downvoted; a
+    /// reply to dana goes before lin; and you reply to your own reply.
+    fn vote_with_comments(app: &mut App) {
+        press(app, "\nrfirst!\nz");
+        assert_eq!(app.posts[0].comments[0].author, "you");
+        press(app, "nnrme too\nrand me\n");
+        assert_eq!(app.posts[0].comments[1].replies[0].replies[0].author, "you");
+        press(app, "nzna");
+        let dead = &app.posts[0];
+        let lin = &dead.comments[1].replies[0].replies[1];
+        assert_eq!(
+            (lin.author, lin.vote),
+            ("lin", Vote::Down),
+            "pushed down one"
+        );
+        assert_eq!(
+            (dead.comments[2].author, dead.comments[2].vote),
+            ("sam", Vote::Up)
+        );
+        assert_eq!(dead.comment_count, 3);
+    }
+
+    fn vote_without_comments(app: &mut App) {
+        press(app, "\nnnnznaq");
+    }
+
+    const VOTED: &str = "workit-state 1\n\
+        vote\tdown\tEngineering\tdana\tdead code\tmarco\tcongrats\tdana\tthanks\tlin\tdeep\n\
+        vote\tup\tEngineering\tdana\tdead code\tsam\tbroke?\n";
+
+    #[test]
+    fn your_comments_leave_the_saved_file_byte_for_byte_the_same() {
+        let dir = TempDir::new("your-comments");
+        let with = dir.0.join("with");
+        let without = dir.0.join("without");
+        run(&with, seed(), vote_with_comments);
+        run(&without, seed(), vote_without_comments);
+        let saved = fs::read(&with).unwrap();
+        assert_eq!(saved, fs::read(&without).unwrap());
+        assert_eq!(String::from_utf8(saved).unwrap(), VOTED);
+
+        // Loading restores the seeded votes onto the right comments, and none
+        // of yours: every run starts with the seed tree.
+        let app = run(&with, seed(), |_| {});
+        let dead = find(&app, "dead code");
+        assert_eq!(dead.comments.len(), 2);
+        assert_eq!(dead.comment_count, seed().posts[0].comment_count);
+        let marco = &dead.comments[0];
+        assert_eq!(marco.replies[0].replies.len(), 1);
+        let lin = &marco.replies[0].replies[0];
+        assert_eq!((lin.author, lin.score, lin.vote), ("lin", 29, Vote::Down));
+        let sam = &dead.comments[1];
+        assert_eq!((sam.author, sam.score, sam.vote), ("sam", 41, Vote::Up));
+        assert_eq!((marco.score, marco.vote), (10, Vote::None));
+        assert!(items(&app).iter().all(|(key, _)| !key.contains(&"you")));
+        assert_eq!(
+            fs::read_to_string(&with).unwrap(),
+            VOTED,
+            "written back the same"
+        );
+    }
+
+    #[test]
+    fn writing_comments_alone_saves_nothing() {
+        let dir = TempDir::new("only-comments");
+        let path = dir.0.join("state");
+        run(&path, seed(), |app| {
+            press(app, "\nrhello\nrback at you\n");
+            esc(app);
+            press(app, "rtop again\nq");
+        });
+        assert_eq!(dir.entries(), Vec::<String>::new(), "no file created");
+        assert_eq!(encode(&seed(), &seed_joined(&seed())), "workit-state 1\n");
+    }
+
+    #[test]
+    fn loading_never_touches_your_comments() {
+        let mut app = seed();
+        vote_with_comments(&mut app);
+        let mine = |app: &App| {
+            let dead = &app.posts[0];
+            let reply = &dead.comments[1].replies[0].replies[0];
+            (
+                dead.comments[0].clone(),
+                reply.clone(),
+                dead.comments.len(),
+                dead.comment_count,
+            )
+        };
+        let before = format!("{:?}", mine(&app));
+        // Records naming your comments' keys match nothing; the seeded ones
+        // land on the seeded comments where they are now.
+        let file = "workit-state 1\n\
+            vote\tup\tEngineering\tdana\tdead code\tyou\tfirst!\n\
+            vote\tup\tEngineering\tdana\tdead code\tmarco\tcongrats\tdana\tthanks\tyou\tme too\n\
+            vote\tup\tEngineering\tdana\tdead code\tmarco\tcongrats\n";
+        assert_eq!(apply(&mut app, file.as_bytes()), Ok(0));
+        assert_eq!(format!("{:?}", mine(&app)), before);
+        let marco = &app.posts[0].comments[1];
+        assert_eq!(
+            (marco.author, marco.score, marco.vote),
+            ("marco", 11, Vote::Up)
+        );
+    }
+
+    #[test]
+    fn your_comment_never_takes_a_seeded_siblings_key() {
+        // A seeded comment by someone whose name is `you`, so that one of
+        // yours with the same text has exactly its key.
+        let same = || {
+            let groups = vec![group("Engineering", true)];
+            let posts = vec![post(
+                &groups,
+                "Engineering",
+                "dana",
+                "dead code",
+                100,
+                1,
+                vec![c("you", 5, 1, "same")],
+            )];
+            App::with_data(groups, posts)
+        };
+        let mut app = same();
+        // Yours goes first and stays upvoted; the seeded one is downvoted.
+        press(&mut app, "\nrsame\nnz");
+        let comments = &app.posts[0].comments;
+        assert!(comments[0].mine && !comments[1].mine);
+        assert_eq!(
+            (comments[0].body.as_ref(), comments[0].vote),
+            ("same", Vote::Up)
+        );
+        assert_eq!(
+            (comments[1].body.as_ref(), comments[1].vote),
+            ("same", Vote::Down)
+        );
+        let text = encode(&app, &seed_joined(&same()));
+        assert_eq!(
+            text, "workit-state 1\nvote\tdown\tEngineering\tdana\tdead code\tyou\tsame\n",
+            "only the seeded comment's vote, under its key"
+        );
+
+        let mut fresh = same();
+        assert_eq!(apply(&mut fresh, text.as_bytes()), Ok(0));
+        let seeded = &fresh.posts[0].comments[0];
+        assert_eq!((seeded.score, seeded.vote), (4, Vote::Down));
+
+        // Loaded into a run with your comment first, it still lands on the
+        // seeded one.
+        let mut again = same();
+        press(&mut again, "\nrsame\n");
+        assert_eq!(apply(&mut again, text.as_bytes()), Ok(0));
+        let comments = &again.posts[0].comments;
+        assert_eq!((comments[0].score, comments[0].vote), (1, Vote::Up));
+        assert_eq!((comments[1].score, comments[1].vote), (4, Vote::Down));
     }
 }

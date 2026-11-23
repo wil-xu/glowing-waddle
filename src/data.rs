@@ -1,5 +1,7 @@
 //! Seed content. Every group, person and post here is fictional.
 
+use std::borrow::Cow;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum Vote {
     Up,
@@ -17,14 +19,25 @@ pub(crate) struct Group {
     pub joined: bool,
 }
 
+/// The user, shown in the header as `u/you` and as the author of the
+/// comments they write.
+pub(crate) const YOU: &str = "you";
+
+/// The most chars a comment you write can have.
+pub(crate) const MAX_COMMENT_CHARS: usize = 500;
+
 #[derive(Debug, Clone)]
 pub(crate) struct Comment {
     pub author: &'static str,
-    pub body: &'static str,
+    /// Borrowed for the seed, owned for a comment typed at runtime.
+    pub body: Cow<'static, str>,
     pub score: i32,
     pub hours_ago: u32,
     pub replies: Vec<Comment>,
     pub vote: Vote,
+    /// Written by you this session (see `Comment::yours`). Never saved, and
+    /// never part of a state-file key.
+    pub mine: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -49,15 +62,30 @@ pub(crate) struct Post {
 pub(crate) fn c(author: &'static str, score: i32, hours_ago: u32, body: &'static str) -> Comment {
     Comment {
         author,
-        body,
+        body: Cow::Borrowed(body),
         score,
         hours_ago,
         replies: Vec::new(),
         vote: Vote::None,
+        mine: false,
     }
 }
 
 impl Comment {
+    /// A comment you just wrote: by `u/you`, just now, already upvoted by
+    /// you (score 1), with no replies yet.
+    pub(crate) fn yours(body: String) -> Self {
+        Comment {
+            author: YOU,
+            body: Cow::Owned(body),
+            score: 1,
+            hours_ago: 0,
+            replies: Vec::new(),
+            vote: Vote::Up,
+            mine: true,
+        }
+    }
+
     /// This comment plus all of its replies, recursively.
     pub(crate) fn total(&self) -> u32 {
         1 + self.replies.iter().map(Comment::total).sum::<u32>()

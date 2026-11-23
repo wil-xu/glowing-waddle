@@ -17,6 +17,7 @@ use ratatui::widgets::Padding;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Wrap;
 
+use crate::app;
 use crate::app::App;
 use crate::app::CommentPath;
 use crate::app::Density;
@@ -28,8 +29,10 @@ use crate::app::Query;
 use crate::app::Sort;
 use crate::app::Target;
 use crate::data::Comment;
+use crate::data::MAX_COMMENT_CHARS;
 use crate::data::Post;
 use crate::data::Vote;
+use crate::data::YOU;
 
 const ORANGE: Color = Color::Rgb(255, 69, 0);
 const PERIWINKLE: Color = Color::Rgb(113, 147, 255);
@@ -46,6 +49,8 @@ const PREVIEW_LINES: usize = 2;
 const SCORE_WIDTH: usize = 5;
 /// The room a compact row keeps for its title by shortening its meta.
 const MIN_TITLE: usize = 20;
+/// The composer's text rows, inside its border.
+const COMPOSER_ROWS: u16 = 3;
 
 fn compact(n: i64) -> String {
     if n.abs() < 1_000 {
@@ -142,7 +147,9 @@ pub(crate) fn render(frame: &mut Frame, app: &mut App) {
         render_sidebar(frame, app, sidebar);
     }
     match app.mode {
-        Mode::Post { scroll } => render_post(frame, app, main, scroll, &mut hits),
+        Mode::Post { scroll } | Mode::Compose { scroll, .. } => {
+            render_post(frame, app, main, scroll, &mut hits)
+        }
         Mode::Feed | Mode::Search => render_feed(frame, app, main, &mut hits),
     }
     // Last, so it covers the body as drawn. Header and footer stay.
@@ -206,7 +213,7 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
     frame.render_widget(
         Line::from(vec![
             Span::styled("● ", Style::new().fg(Color::Green)),
-            Span::styled("u/you", Style::new().bold()),
+            Span::styled(format!("u/{YOU}"), Style::new().bold()),
             Span::styled(
                 format!("  ✦ {} karma", compact(i64::from(app.karma))),
                 Style::new().fg(DIM),
@@ -266,21 +273,26 @@ const SEARCH_HINTS: &[Hint] = &[
     ("enter", "keep"),
     ("esc", "clear"),
 ];
+// With `r reply` this set is 80 columns, counting the blank after the last
+// hint: exactly the limit.
 const POST_HINTS: &[Hint] = &[
     ("j/k", "scroll"),
     ("n/p", "comments"),
     ("a/z", "vote"),
+    ("r", "reply"),
     ("s", "save"),
     ("c", "share"),
     ("?", "help"),
     ("esc", "back"),
 ];
-// With `? help` this set would be 81, so it leaves out `j/k scroll`: the set
-// above always shows it first, since a comment is only focused from the
-// unfocused post view, and the wheel scrolls too.
+// With `? help` and `r reply` this set would be 90, so it leaves out
+// `j/k scroll`: the set above always shows it first, since a comment is only
+// focused from the unfocused post view, and the wheel scrolls too. `vote
+// comment` stays, as it says what `a`/`z` act on. That makes 78.
 const FOCUSED_HINTS: &[Hint] = &[
     ("n/p", "comments"),
     ("a/z", "vote comment"),
+    ("r", "reply"),
     ("enter", "collapse"),
     ("?", "help"),
     ("esc", "unfocus"),
@@ -288,6 +300,9 @@ const FOCUSED_HINTS: &[Hint] = &[
 // Short enough (42 columns) that `close` still shows at 50 columns. The
 // help itself lists `PgDn`/`PgUp`/`Space`, on screen while this is.
 const HELP_HINTS: &[Hint] = &[("j/k", "scroll"), ("g/G", "top/bottom"), ("?/esc", "close")];
+// The composer types every plain key, `?` included, so it has no `? help`.
+const REPLY_HINTS: &[Hint] = &[("type", "reply"), ("enter", "post"), ("esc", "cancel")];
+const COMMENT_HINTS: &[Hint] = &[("type", "comment"), ("enter", "post"), ("esc", "cancel")];
 
 /// The footer's hint set for the current mode.
 fn hints(app: &App) -> &'static [Hint] {
@@ -301,6 +316,8 @@ fn hints(app: &App) -> &'static [Hint] {
         Mode::Search => SEARCH_HINTS,
         Mode::Post { .. } if app.thread.focus.is_some() => FOCUSED_HINTS,
         Mode::Post { .. } => POST_HINTS,
+        Mode::Compose { .. } if app.thread.focus.is_some() => REPLY_HINTS,
+        Mode::Compose { .. } => COMMENT_HINTS,
     }
 }
 
@@ -335,6 +352,7 @@ enum Section {
     Feed,
     Post,
     Search,
+    Compose,
     Mouse,
     Help,
     Anywhere,
@@ -347,7 +365,7 @@ type HelpRow = (&'static [&'static str], &'static str);
 /// shows a few of these; a test checks that each footer key is listed here,
 /// in the section for its mode. Keep it in step with PLAN.md's "Key
 /// bindings" and "Mouse".
-const HELP: [(Section, &str, &[HelpRow]); 6] = [
+const HELP: [(Section, &str, &[HelpRow]); 7] = [
     (
         Section::Feed,
         "Feed",
@@ -381,6 +399,7 @@ const HELP: [(Section, &str, &[HelpRow]); 6] = [
             (&["g/G", "Home/End"], "top / bottom"),
             (&["n/p"], "focus the next / previous comment"),
             (&["a/z"], "vote on the focused comment, or the post"),
+            (&["r"], "reply to the focused comment, or the post"),
             (&["enter"], "collapse / expand the focused comment"),
             (&["s"], "save / unsave the post"),
             (&["c"], "copy the post's link"),
@@ -401,6 +420,16 @@ const HELP: [(Section, &str, &[HelpRow]); 6] = [
         ],
     ),
     (
+        Section::Compose,
+        "Composer",
+        &[
+            (&["type"], "write the reply: q, j, ? and digits too"),
+            (&["Backspace"], "delete a character"),
+            (&["enter"], "post it"),
+            (&["esc"], "discard it, back to the post"),
+        ],
+    ),
+    (
         Section::Mouse,
         "Mouse",
         &[
@@ -412,6 +441,7 @@ const HELP: [(Section, &str, &[HelpRow]); 6] = [
             (&["click nav"], "go to that feed"),
             (&["click search"], "search, like /"),
             (&["click comment"], "focus it, again to collapse / expand"),
+            (&["click Reply"], "reply to that comment, like r"),
             (&["wheel"], "next / previous post, or scroll a post 3 lines"),
         ],
     ),
@@ -471,6 +501,7 @@ fn help_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         Mode::Feed => Section::Feed,
         Mode::Search => Section::Search,
         Mode::Post { .. } => Section::Post,
+        Mode::Compose { .. } => Section::Compose,
     };
     let sections = HELP
         .iter()
@@ -1249,6 +1280,8 @@ fn render_compact_row(
 
 /// One comment, without its replies. A collapsed one is only its header,
 /// marked `[+]` and counting the replies it hides, and its guide row.
+/// Returns where the `Reply` label is drawn, if it is: the index in `out`
+/// of the action row, and the label's columns from the start of the row.
 fn comment_lines(
     comment: &Comment,
     depth: usize,
@@ -1256,7 +1289,7 @@ fn comment_lines(
     focused: bool,
     width: usize,
     out: &mut Vec<Line<'static>>,
-) {
+) -> Option<(usize, Range<u16>)> {
     let guide = Style::new().fg(BORDER);
     let prefix = "│ ".repeat(depth);
     let text_width = width.saturating_sub(prefix.chars().count());
@@ -1287,9 +1320,10 @@ fn comment_lines(
     }
     out.push(Line::from(header));
 
+    let mut reply = None;
     if !collapsed {
         out.extend(
-            wrap(comment.body, text_width)
+            wrap(&comment.body, text_width)
                 .into_iter()
                 .map(|l| Line::from(vec![Span::styled(prefix.clone(), guide), Span::raw(l)])),
         );
@@ -1300,7 +1334,8 @@ fn comment_lines(
             Vote::None => DIM,
             vote => vote_color(vote),
         };
-        out.push(Line::from(vec![
+        let label = Style::new().fg(DIM).bold();
+        let action = Line::from(vec![
             Span::styled(prefix.clone(), guide),
             arrow(comment.vote == Vote::Up, "▲", ORANGE),
             Span::styled(
@@ -1308,13 +1343,45 @@ fn comment_lines(
                 Style::new().fg(score).bold(),
             ),
             arrow(comment.vote == Vote::Down, "▼", PERIWINKLE),
-            Span::styled("   Reply   Share", Style::new().fg(DIM).bold()),
-        ]));
+            Span::styled("   ", label),
+            Span::styled("Reply", label),
+            Span::styled("   Share", label),
+        ]);
+        // Every glyph on the row is one cell wide.
+        let cells = |spans: &[Span]| -> u16 {
+            spans
+                .iter()
+                .map(|span| span.content.chars().count() as u16)
+                .sum()
+        };
+        let start = cells(&action.spans[..5]);
+        reply = Some((out.len(), start..start + cells(&action.spans[5..6])));
+        out.push(action);
     }
     out.push(Line::styled(format!("{prefix}│"), guide));
+    reply
 }
 
+/// The post view, as a scrolled viewport. In `Mode::Compose` the composer
+/// is docked below it, across the column, and the viewport (its scroll
+/// clamp and click regions included) is the height left above it.
 fn render_post(frame: &mut Frame, app: &mut App, area: Rect, scroll: u16, hits: &mut Hits) {
+    let composing = matches!(app.mode, Mode::Compose { .. });
+    let (area, composer) = if composing {
+        let height = (COMPOSER_ROWS + 2).min(area.height);
+        let post = Rect {
+            height: area.height - height,
+            ..area
+        };
+        let composer = Rect {
+            y: post.bottom(),
+            height,
+            ..area
+        };
+        (post, Some(composer))
+    } else {
+        (area, None)
+    };
     let Some(post) = app.selected_post() else {
         return;
     };
@@ -1374,22 +1441,26 @@ fn render_post(frame: &mut Frame, app: &mut App, area: Rect, scroll: u16, hits: 
 
     let mut focus_row = None;
     let mut headers: Vec<(u16, CommentPath)> = Vec::new();
+    let mut replies: Vec<(u16, Range<u16>, CommentPath)> = Vec::new();
     for shown in app.thread.visible(&post.comments) {
         let focused = app.thread.focus.as_ref() == Some(&shown.path);
         if focused {
             focus_row = Some(lines.len() as u16);
         }
         headers.push((lines.len() as u16, shown.path.clone()));
-        comment_lines(
+        if let Some((row, columns)) = comment_lines(
             shown.comment,
             shown.depth(),
             shown.collapsed,
             focused,
             width,
             &mut lines,
-        );
+        ) {
+            replies.push((row as u16, columns, shown.path.clone()));
+        }
     }
-    // Counts the whole seeded tree, so collapsing doesn't change it.
+    // Counts the whole tree, so collapsing doesn't change it. A comment you
+    // write adds 1 here and 1 to `comment_count`, so it doesn't either.
     let shown: u32 = post.comments.iter().map(Comment::total).sum();
     let hidden = post.comment_count.saturating_sub(shown);
     if hidden > 0 {
@@ -1401,24 +1472,44 @@ fn render_post(frame: &mut Frame, app: &mut App, area: Rect, scroll: u16, hits: 
 
     let max_scroll = (lines.len() as u16).saturating_sub(inner.height);
     let mut scroll = scroll.min(max_scroll);
-    // Right after the focus moves, scroll the least that shows its header.
+    // Right after the focus moves, or the composer opens and shrinks the
+    // viewport, scroll the least that shows the focused header.
     if app.thread.reveal
         && let Some(row) = focus_row
     {
         scroll = scroll.clamp(row.saturating_sub(inner.height.saturating_sub(1)), row);
     }
     app.thread.reveal = false;
-    app.mode = Mode::Post { scroll };
+    app.mode = match app.mode {
+        Mode::Compose { restore, .. } => Mode::Compose { scroll, restore },
+        _ => Mode::Post { scroll },
+    };
 
     hits.max_scroll = max_scroll;
+    let on_screen = |row: u16| {
+        row.checked_sub(scroll)
+            .filter(|&dy| dy < text.height)
+            .map(|dy| text.y + dy)
+    };
     for (row, path) in headers {
-        if let Some(y) = row.checked_sub(scroll).filter(|&dy| dy < text.height) {
+        if let Some(y) = on_screen(row) {
             let rect = Rect {
-                y: text.y + y,
+                y,
                 height: 1,
                 ..text
             };
             hits.regions.push((rect, Target::Comment(path)));
+        }
+    }
+    // Only the cells of `Reply` that the clipped row actually shows.
+    for (row, columns, path) in replies {
+        let x = text.x.saturating_add(columns.start);
+        let right = text.x.saturating_add(columns.end).min(text.right());
+        if let Some(y) = on_screen(row)
+            && x < right
+        {
+            let rect = Rect::new(x, y, right - x, 1);
+            hits.regions.push((rect, Target::Reply(path)));
         }
     }
 
@@ -1428,6 +1519,84 @@ fn render_post(frame: &mut Frame, app: &mut App, area: Rect, scroll: u16, hits: 
             .block(block.padding(Padding::horizontal(1))),
         area,
     );
+    if let Some(composer) = composer {
+        render_composer(frame, app, composer);
+    }
+}
+
+/// The draft word-wrapped to `width` like a comment body, with the cursor
+/// after its last char: the rows, and the cursor's column on the last one.
+/// A trailing whitespace run shows as one space before the cursor, as
+/// `wrap` shows a run between words. When the cursor doesn't fit after the
+/// last row, it starts a new one.
+fn draft_rows(draft: &str, width: usize) -> (Vec<String>, usize) {
+    let width = width.max(1);
+    let mut rows = wrap(draft, width);
+    let last = rows.last_mut().expect("wrap returns at least one row");
+    if draft.ends_with(char::is_whitespace) && !last.is_empty() {
+        last.push(' ');
+    }
+    let mut cursor = last.chars().count();
+    if cursor >= width {
+        if last.ends_with(' ') {
+            last.pop();
+        }
+        rows.push(String::new());
+        cursor = 0;
+    }
+    (rows, cursor)
+}
+
+/// The composer: a bordered box saying what it answers, the wrapped draft
+/// (its last rows, so the cursor is always visible) and the char count.
+fn render_composer(frame: &mut Frame, app: &App, area: Rect) {
+    let author = app
+        .selected_post()
+        .zip(app.thread.focus.as_ref())
+        .and_then(|(post, path)| app::comment(&post.comments, path))
+        .map(|comment| comment.author);
+    let title = match author {
+        Some(author) => format!(" Replying to u/{author} "),
+        None => " Commenting on the post ".to_owned(),
+    };
+    let count = app.draft.chars().count();
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(ORANGE)
+        .title(Line::styled(title, Style::new().fg(Color::White).bold()))
+        .title_bottom(
+            Line::styled(
+                format!(" {count}/{MAX_COMMENT_CHARS} "),
+                Style::new().fg(DIM),
+            )
+            .right_aligned(),
+        )
+        .padding(Padding::horizontal(1));
+    let text = block.inner(area);
+
+    let (rows, cursor) = draft_rows(&app.draft, usize::from(text.width));
+    let skip = rows.len().saturating_sub(usize::from(text.height.max(1)));
+    let last = rows.len() - 1;
+    let lines: Vec<Line> = rows
+        .into_iter()
+        .enumerate()
+        .skip(skip)
+        .map(|(n, row)| {
+            if n < last {
+                return Line::raw(row);
+            }
+            let pad = cursor.saturating_sub(row.chars().count());
+            Line::from(vec![
+                Span::raw(row),
+                Span::raw(" ".repeat(pad)),
+                Span::styled(
+                    "▏",
+                    Style::new().fg(ORANGE).add_modifier(Modifier::SLOW_BLINK),
+                ),
+            ])
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 #[cfg(test)]
@@ -1818,26 +1987,44 @@ mod tests {
                 let post = footer(&mut app);
                 assert!(post.ends_with("esc back"), "{feed:?}: {post:?}");
                 assert_eq!(
-                    post, " j/k scroll  n/p comments  a/z vote  s save  c share  ? help  esc back",
+                    post,
+                    " j/k scroll  n/p comments  a/z vote  r reply  s save  c share  ? help  esc back",
                     "{feed:?}"
                 );
+                assert!(post.chars().count() <= 80, "{feed:?}: {post:?}");
                 press(&mut app, KeyCode::Char('?'));
                 assert_eq!(footer(&mut app), HELP_FOOTER, "{feed:?}: post view");
                 press(&mut app, KeyCode::Esc);
                 assert_eq!(footer(&mut app), post, "{feed:?}: help closed");
 
+                // The composer for a top-level comment, typed into and cancelled.
+                press(&mut app, KeyCode::Char('r'));
+                let comment = footer(&mut app);
+                assert_eq!(comment, " type comment  enter post  esc cancel", "{feed:?}");
+                type_str(&mut app, "hi?");
+                assert_eq!(footer(&mut app), comment, "{feed:?}: typing keeps it");
+                press(&mut app, KeyCode::Esc);
+                assert_eq!(footer(&mut app), post, "{feed:?}: cancelled");
+
                 press(&mut app, KeyCode::Char('n'));
                 assert!(app.thread.focus.is_some(), "{feed:?}");
                 let focused = footer(&mut app);
                 assert_eq!(
-                    focused, " n/p comments  a/z vote comment  enter collapse  ? help  esc unfocus",
+                    focused,
+                    " n/p comments  a/z vote comment  r reply  enter collapse  ? help  esc unfocus",
                     "{feed:?}"
                 );
-                assert!(focused.chars().count() < 80, "{feed:?}: {focused:?}");
+                assert!(focused.chars().count() <= 80, "{feed:?}: {focused:?}");
                 press(&mut app, KeyCode::Char('?'));
                 assert_eq!(footer(&mut app), HELP_FOOTER, "{feed:?}: focused");
                 press(&mut app, KeyCode::Char('q'));
                 assert_eq!(footer(&mut app), focused, "{feed:?}: help closed");
+
+                press(&mut app, KeyCode::Char('r'));
+                let reply = footer(&mut app);
+                assert_eq!(reply, " type reply  enter post  esc cancel", "{feed:?}");
+                press(&mut app, KeyCode::Esc);
+                assert_eq!(footer(&mut app), focused, "{feed:?}: cancelled");
                 press(&mut app, KeyCode::Char('c'));
                 assert_eq!(footer(&mut app), " ✔ Link copied to clipboard!", "{feed:?}");
                 press(&mut app, KeyCode::Esc);
@@ -4087,7 +4274,7 @@ mod tests {
 
     #[test]
     fn the_section_for_the_current_mode_comes_first() {
-        let others = ["Search mode", "Mouse", "This help", "Anywhere"];
+        let others = ["Search mode", "Composer", "Mouse", "This help", "Anywhere"];
         let mut app = thread_post();
         press(&mut app, KeyCode::Char('?'));
         assert_eq!(headings(&app)[..2], ["Feed", "Post view"]);
@@ -4121,7 +4308,7 @@ mod tests {
             .iter()
             .flat_map(|(_, _, rows)| rows.iter().map(|(_, what)| *what))
             .collect();
-        for (width, height) in [(80, 24), (100, 30), (110, 24), (200, 70)] {
+        for (width, height) in [(80, 24), (100, 30), (110, 24), (200, 80)] {
             for post in [false, true] {
                 let mut app = App::new();
                 if post {
@@ -4157,7 +4344,7 @@ mod tests {
         // Tall enough for all of it: no scrolling and no position.
         let mut app = App::new();
         press(&mut app, KeyCode::Char('?'));
-        let buf = buffer(&mut app, 200, 70);
+        let buf = buffer(&mut app, 200, 80);
         assert_eq!(app.hits.as_ref().unwrap().max_scroll, 0);
         let area = help_box(&app).unwrap();
         assert_eq!(area.height, help_text(&app, usize::MAX).len() as u16 + 2);
@@ -4381,7 +4568,7 @@ mod tests {
         press(&mut app, KeyCode::Char('?'));
         buffer(&mut app, 80, 24);
         press(&mut app, KeyCode::Char('G'));
-        for (width, height) in [(80, 24), (80, 50), (30, 8), (80, 70), (80, 24)] {
+        for (width, height) in [(80, 24), (80, 50), (30, 8), (80, 80), (80, 24)] {
             press(&mut app, KeyCode::Char('G'));
             let buf = buffer(&mut app, width, height);
             let area = help_box(&app).expect("drawn");
@@ -4428,7 +4615,7 @@ mod tests {
         assert!(big < small, "{big} < {small}");
         let inner = usize::from(help_box(&app).unwrap().width - 4);
         assert_eq!(usize::from(big), help_text(&app, inner).len() - 44);
-        buffer(&mut app, 80, 70);
+        buffer(&mut app, 80, 80);
         assert_eq!(help_scroll(&app), 0);
         buffer(&mut app, 30, 8);
         assert_eq!(
@@ -4732,13 +4919,15 @@ mod tests {
                 .flat_map(|(keys, _)| keys.iter())
                 .any(|k| *k == key || (key.chars().count() > 1 && k.eq_ignore_ascii_case(key)))
         };
-        let sets: [(&[Hint], Section); 7] = [
+        let sets: [(&[Hint], Section); 9] = [
             (FEED_HINTS, Section::Feed),
             (GROUP_HINTS, Section::Feed),
             (KEPT_SEARCH_HINTS, Section::Feed),
             (POST_HINTS, Section::Post),
             (FOCUSED_HINTS, Section::Post),
             (SEARCH_HINTS, Section::Search),
+            (REPLY_HINTS, Section::Compose),
+            (COMMENT_HINTS, Section::Compose),
             (HELP_HINTS, Section::Help),
         ];
         for (set, section) in sets {
@@ -4758,6 +4947,7 @@ mod tests {
             Section::Feed,
             Section::Post,
             Section::Search,
+            Section::Compose,
             Section::Mouse,
             Section::Help,
             Section::Anywhere,
@@ -4771,7 +4961,8 @@ mod tests {
             assert!(sets.iter().any(|(set, _)| *set == shown), "{shown:?}");
         };
         for keys in [
-            "", "?", "?q/e", "\n", "\n", "\nn", "\nn?", "q", "\n\x1b", "[[[[[[[",
+            "", "?", "?q/e", "\n", "\n", "\nn", "\nn?", "q", "rhi?\x1b", "\n\x1b", "r?\x1b",
+            "[[[[[[[",
         ] {
             for ch in keys.chars() {
                 press(
@@ -4804,6 +4995,8 @@ mod tests {
             POST_HINTS,
             FOCUSED_HINTS,
             SEARCH_HINTS,
+            REPLY_HINTS,
+            COMMENT_HINTS,
             HELP_HINTS,
         ] {
             for (key, what) in set {
@@ -4822,5 +5015,663 @@ mod tests {
         }
         // The view switch's glyphs stay the switch's alone.
         assert!(!all.contains('▦') && !all.contains('≡'));
+    }
+
+    // ---- The composer and the `Reply` target ----
+
+    /// The post column's x and width at `width` columns: the nav shows from
+    /// 70 columns, the sidebar from 100.
+    fn main_column(width: u16) -> (u16, u16) {
+        let nav = if width >= 70 { NAV_WIDTH } else { 0 };
+        let sidebar = if width >= 100 { SIDEBAR_WIDTH } else { 0 };
+        (nav, width - nav - sidebar)
+    }
+
+    /// Row `y` of `buf`, from column `x` for `w` cells.
+    fn cut(buf: &Buffer, x: u16, w: u16, y: u16) -> String {
+        (x..x + w).map(|x| buf[(x, y)].symbol()).collect()
+    }
+
+    fn compose_scroll(app: &App) -> u16 {
+        let Mode::Compose { scroll, .. } = app.mode else {
+            panic!("the composer should be open");
+        };
+        scroll
+    }
+
+    #[test]
+    fn draft_rows_wrap_like_comments_with_the_cursor_after_the_last_char() {
+        assert_eq!(draft_rows("", 10), (vec![String::new()], 0));
+        assert_eq!(draft_rows("hello", 10), (vec!["hello".to_owned()], 5));
+        assert_eq!(
+            draft_rows("hello   ", 10),
+            (vec!["hello ".to_owned()], 6),
+            "a trailing run shows as one space"
+        );
+        assert_eq!(draft_rows("   ", 10), (vec![String::new()], 0));
+        assert_eq!(
+            draft_rows("ab cd ef", 5),
+            (vec!["ab cd".to_owned(), "ef".to_owned()], 2)
+        );
+        assert_eq!(
+            draft_rows("abcde", 5),
+            (vec!["abcde".to_owned(), String::new()], 0),
+            "a full row pushes the cursor to the next"
+        );
+        assert_eq!(
+            draft_rows("abcd ", 5),
+            (vec!["abcd".to_owned(), String::new()], 0)
+        );
+        assert_eq!(draft_rows("ñ°ñ", 2).0, ["ñ°", "ñ"], "chars, not bytes");
+        assert_eq!(draft_rows("x", 0), (vec!["x".to_owned(), String::new()], 0));
+    }
+
+    #[test]
+    fn composer_shows_its_title_counter_and_the_last_three_rows_of_the_draft() {
+        for width in [110, 80] {
+            let (x, w) = main_column(width);
+            let inner = usize::from(w) - 4;
+            let line = |n: usize| "─".repeat(n);
+            let text_row = |text: &str| format!("│ {text:<inner$} │");
+
+            let mut app = thread_post();
+            press(&mut app, KeyCode::Enter);
+            press(&mut app, KeyCode::Char('r'));
+            let buf = buffer(&mut app, width, 24);
+            let title = " Commenting on the post ";
+            let top = format!("╭{title}{}╮", line(usize::from(w) - 2 - title.len()));
+            assert_eq!(cut(&buf, x, w, 18), top, "{width}");
+            assert_eq!(cut(&buf, x, w, 19), text_row("▏"), "{width}: the cursor");
+            assert_eq!(cut(&buf, x, w, 20), text_row(""), "{width}");
+            assert_eq!(cut(&buf, x, w, 21), text_row(""), "{width}");
+            let bottom = format!("╰{} 0/500 ╯", line(usize::from(w) - 9));
+            assert_eq!(cut(&buf, x, w, 22), bottom, "{width}");
+            let (cx, cy) = find(&buf, "▏");
+            assert_eq!((cx, cy, buf[(cx, cy)].fg), (x + 2, 19, ORANGE));
+            assert!(
+                rows(&buf)[17].contains("╰──"),
+                "{width}: the post box ends right above"
+            );
+            assert_eq!(
+                rows(&buf)[23].trim_end(),
+                " type comment  enter post  esc cancel"
+            );
+
+            press(&mut app, KeyCode::Esc);
+            type_str(&mut app, "nn");
+            press(&mut app, KeyCode::Char('r'));
+            let draft = "Same thing happened to us last quarter. ".repeat(4) + "Deleting code wins";
+            type_str(&mut app, &draft);
+            let buf = buffer(&mut app, width, 24);
+            let title = " Replying to u/bob ";
+            let top = format!("╭{title}{}╮", line(usize::from(w) - 2 - title.len()));
+            assert_eq!(cut(&buf, x, w, 18), top, "{width}");
+
+            let wrapped = wrap(&draft, inner);
+            assert!(wrapped.len() > 3, "{width}: {wrapped:?}");
+            let last3 = &wrapped[wrapped.len() - 3..];
+            assert!(last3[2].chars().count() < inner, "the cursor fits after it");
+            assert_eq!(cut(&buf, x, w, 19), text_row(&last3[0]), "{width}");
+            assert_eq!(cut(&buf, x, w, 20), text_row(&last3[1]), "{width}");
+            assert_eq!(
+                cut(&buf, x, w, 21),
+                text_row(&format!("{}▏", last3[2])),
+                "{width}: the cursor right after the last char"
+            );
+            assert!(
+                !rows(&buf).join("\n").contains(&wrapped[0]),
+                "first rows scrolled off"
+            );
+            let counter = format!(" {}/500 ", draft.chars().count());
+            let bottom = format!("╰{}{counter}╯", line(usize::from(w) - 2 - counter.len()));
+            assert_eq!(cut(&buf, x, w, 22), bottom, "{width}");
+            assert_eq!(
+                rows(&buf)[23].trim_end(),
+                " type reply  enter post  esc cancel"
+            );
+        }
+    }
+
+    #[test]
+    fn the_post_view_above_the_composer_is_a_shorter_viewport_at_every_width() {
+        // The same post, scrolled 5 lines: composing at 24 rows, without the
+        // composer at 19 rows (the same viewport height), and at 24 rows.
+        let open = |compose: bool| {
+            let mut app = thread_post();
+            press(&mut app, KeyCode::Enter);
+            type_str(&mut app, "jjjjj");
+            if compose {
+                press(&mut app, KeyCode::Char('r'));
+                type_str(&mut app, "A draft long enough to wrap in narrow columns");
+            }
+            app
+        };
+        let comment_regions = |app: &App| -> Vec<(Rect, Target)> {
+            app.hits
+                .as_ref()
+                .expect("drawn")
+                .regions
+                .iter()
+                .filter(|(_, t)| matches!(t, Target::Comment(_) | Target::Reply(_)))
+                .cloned()
+                .collect()
+        };
+        for width in 1..=120 {
+            let (x, w) = main_column(width);
+            let mut composing = open(true);
+            let with = buffer(&mut composing, width, 24);
+            let mut short = open(false);
+            let shorter = buffer(&mut short, width, 19);
+            let mut plain = open(false);
+            let without = buffer(&mut plain, width, 24);
+
+            for y in 0..23 {
+                for cx in 0..width {
+                    let in_column = (x..x + w).contains(&cx);
+                    if in_column && (18..23).contains(&y) {
+                        continue;
+                    }
+                    let expected = if in_column && y >= 3 {
+                        &shorter[(cx, y)]
+                    } else {
+                        &without[(cx, y)]
+                    };
+                    assert_eq!(&with[(cx, y)], expected, "{width} wide: ({cx}, {y})");
+                }
+            }
+            if w >= 2 {
+                let right = x + w - 1;
+                let corners =
+                    [(x, 18), (right, 18), (x, 22), (right, 22)].map(|at| with[at].symbol());
+                assert_eq!(corners, ["╭", "╮", "╰", "╯"], "{width}");
+                for y in 19..22 {
+                    assert_eq!(
+                        (with[(x, y)].symbol(), with[(right, y)].symbol()),
+                        ("│", "│")
+                    );
+                }
+            }
+            assert_eq!(compose_scroll(&composing), scroll(&short), "{width}");
+            assert_eq!(
+                composing.hits.as_ref().unwrap().max_scroll,
+                short.hits.as_ref().unwrap().max_scroll,
+                "{width}: the clamp of the shorter viewport"
+            );
+            assert_eq!(
+                comment_regions(&composing),
+                comment_regions(&short),
+                "{width}"
+            );
+            assert!(
+                comment_regions(&composing)
+                    .iter()
+                    .all(|(r, _)| r.y >= 4 && r.bottom() <= 17),
+                "{width}: regions only in the viewport above the composer"
+            );
+        }
+    }
+
+    #[test]
+    fn the_composer_draws_inside_tiny_terminals() {
+        for (width, height) in [(40, 12), (30, 8), (20, 6), (10, 5), (5, 4), (1, 1)] {
+            let mut app = deep_thread();
+            press(&mut app, KeyCode::Enter);
+            press(&mut app, KeyCode::Char('n'));
+            press(&mut app, KeyCode::Char('r'));
+            type_str(&mut app, &"wrap me ".repeat(30));
+            let buf = buffer(&mut app, width, height);
+            assert_eq!(buf.area, Rect::new(0, 0, width, height));
+            assert!(matches!(app.mode, Mode::Compose { .. }));
+        }
+    }
+
+    #[test]
+    fn a_posted_comment_is_drawn_and_counted_without_changing_more_comments() {
+        let mut app = thread_post();
+        press(&mut app, KeyCode::Enter);
+        let before = screen(&mut app, 110, 60);
+        assert!(before.contains("··· 4 more comments"));
+        press(&mut app, KeyCode::Char('r'));
+        type_str(&mut app, "  Hello there  ");
+        press(&mut app, KeyCode::Enter);
+        let buf = buffer(&mut app, 110, 60);
+        let text = rows(&buf).join("\n");
+        assert!(text.contains("··· 4 more comments"), "{text}");
+        assert!(!text.contains("Commenting on"), "the composer closed");
+        let (hx, hy) = find(&buf, "u/you · just now");
+        assert!(is_focus_style(&buf, hx, hy), "the new comment is focused");
+        assert!(
+            hy < find(&buf, "u/ann").1,
+            "first among the top-level comments"
+        );
+        let (bx, by) = find(&buf, "Hello there");
+        assert_eq!((bx, by), (hx, hy + 1), "its body, trimmed, right below");
+        assert_eq!(
+            cut(&buf, hx, 21, hy + 2),
+            "▲ 1 ▼   Reply   Share",
+            "upvoted by you"
+        );
+        assert_eq!(buf[(hx, hy + 2)].fg, ORANGE);
+        assert!(find(&buf, " ✔ Comment posted").1 == 59);
+
+        press(&mut app, KeyCode::Char('a'));
+        let buf = buffer(&mut app, 110, 60);
+        assert_eq!(cut(&buf, hx, 21, hy + 2), "▲ 0 ▼   Reply   Share");
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.mode, Mode::Feed);
+        assert!(screen(&mut app, 110, 24).contains("▤ 11 Comments"));
+    }
+
+    #[test]
+    fn a_reply_to_the_last_comment_is_scrolled_into_view_once() {
+        let mut app = thread_post();
+        press(&mut app, KeyCode::Enter);
+        buffer(&mut app, 110, 24);
+        for _ in 0..6 {
+            press(&mut app, KeyCode::Char('n'));
+            buffer(&mut app, 110, 24);
+        }
+        let before = scroll(&app);
+        press(&mut app, KeyCode::Char('r'));
+        type_str(&mut app, "replying to fay");
+        let buf = buffer(&mut app, 110, 24);
+        let (x, y) = find(&buf, "u/fay");
+        assert!(
+            (4..17).contains(&y) && is_focus_style(&buf, x, y),
+            "fay's header kept above the composer"
+        );
+        let composing = compose_scroll(&app);
+        assert!(composing > before, "opening scrolled");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.mode, Mode::Post { scroll: composing }, "carried on");
+        let buf = buffer(&mut app, 110, 24);
+        let (x, y) = find(&buf, "u/you · just now");
+        assert!(
+            (4..22).contains(&y) && is_focus_style(&buf, x, y),
+            "revealed"
+        );
+        assert!(scroll(&app) > before);
+        assert!(!app.thread.reveal, "only once");
+        let at = scroll(&app);
+        press(&mut app, KeyCode::Char('k'));
+        buffer(&mut app, 110, 24);
+        assert_eq!(scroll(&app), at - 1, "k scrolls freely afterwards");
+    }
+
+    #[test]
+    fn collapsed_comments_stay_drawn_collapsed_after_a_submit() {
+        // Every `u/` on screen up to the next border: the header bar's
+        // `u/you`, the post's meta row, then the comment headers.
+        let headers = |buf: &Buffer| -> Vec<String> {
+            rows(buf)
+                .iter()
+                .filter_map(|row| {
+                    let at = row.find("[+] u/").or_else(|| row.find("u/"))?;
+                    Some(row[at..].split('│').next()?.trim_end().to_owned())
+                })
+                .collect()
+        };
+        let mut app = thread_post();
+        press(&mut app, KeyCode::Enter);
+        // Collapse bob ([0, 0]) and dan ([1]).
+        type_str(&mut app, "nn");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Esc);
+        let buf = buffer(&mut app, 110, 60);
+        assert_eq!(
+            headers(&buf)[2..],
+            [
+                "u/ann · 1h ago",
+                "[+] u/bob · 1h ago (1 reply)",
+                "[+] u/dan · 1h ago (1 reply)",
+                "u/fay · 1h ago"
+            ]
+        );
+
+        // A top-level comment shifts ann, dan and fay, and bob under ann.
+        press(&mut app, KeyCode::Char('r'));
+        type_str(&mut app, "top");
+        press(&mut app, KeyCode::Enter);
+        let buf = buffer(&mut app, 110, 60);
+        let expected = [
+            "u/you · just now",
+            "u/ann · 1h ago",
+            "[+] u/bob · 1h ago (1 reply)",
+            "[+] u/dan · 1h ago (1 reply)",
+            "u/fay · 1h ago",
+        ];
+        assert_eq!(headers(&buf)[2..], expected);
+        let text = rows(&buf).join("\n");
+        assert!(!text.contains("cat replies") && !text.contains("eve replies"));
+
+        // A reply to ann goes before bob, who is still collapsed.
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Char('r'));
+        type_str(&mut app, "deep");
+        press(&mut app, KeyCode::Enter);
+        let buf = buffer(&mut app, 110, 60);
+        assert_eq!(
+            headers(&buf)[2..],
+            [
+                "u/you · just now",
+                "u/ann · 1h ago",
+                "u/you · just now",
+                "[+] u/bob · 1h ago (1 reply)",
+                "[+] u/dan · 1h ago (1 reply)",
+                "u/fay · 1h ago",
+            ]
+        );
+        let text = rows(&buf).join("\n");
+        assert!(!text.contains("cat replies") && !text.contains("eve replies"));
+        assert!(text.contains("│ deep"), "the reply's body, one level in");
+    }
+
+    fn reply_regions(app: &App) -> Vec<(Rect, CommentPath)> {
+        app.hits
+            .as_ref()
+            .expect("drawn")
+            .regions
+            .iter()
+            .filter_map(|(rect, target)| match target {
+                Target::Reply(path) => Some((*rect, path.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn clicking_reply_focuses_that_comment_and_opens_its_composer() {
+        let mut app = thread_post();
+        press(&mut app, KeyCode::Enter);
+        let buf = buffer(&mut app, 110, 40);
+        let regions = reply_regions(&app);
+        let drawn = find_all(&buf, "Reply");
+        assert_eq!(regions.len(), 6, "one per expanded comment");
+        assert_eq!(
+            regions.iter().map(|(r, _)| (r.x, r.y)).collect::<Vec<_>>(),
+            drawn,
+            "exactly where Reply is drawn"
+        );
+        for (rect, _) in &regions {
+            assert_eq!((rect.width, rect.height), (5, 1));
+            assert_eq!(cut(&buf, rect.x, 5, rect.y), "Reply");
+        }
+        let dan = regions.iter().find(|(_, p)| *p == vec![1]).unwrap().0;
+        assert!(find(&buf, "u/dan").1 < dan.y);
+
+        // The blanks on both sides of the label do nothing.
+        for x in [dan.x - 1, dan.right()] {
+            click(&mut app, (x, dan.y));
+            buffer(&mut app, 110, 40);
+            assert_eq!(
+                (app.mode, &app.thread.focus),
+                (Mode::Post { scroll: 0 }, &None)
+            );
+        }
+        // Its last cell focuses dan and opens the composer, in one click.
+        click(&mut app, (dan.right() - 1, dan.y));
+        assert_eq!(
+            app.mode,
+            Mode::Compose {
+                scroll: 0,
+                restore: 0
+            }
+        );
+        assert_eq!(app.thread.focus, Some(vec![1]));
+        let buf = buffer(&mut app, 110, 40);
+        assert_eq!(
+            compose_scroll(&app),
+            0,
+            "dan's header is above the composer, so nothing scrolls"
+        );
+        assert!(rows(&buf).join("\n").contains("╭ Replying to u/dan ─"));
+        type_str(&mut app, "via the mouse");
+        press(&mut app, KeyCode::Enter);
+        let dan = &app.posts[0].comments[1];
+        assert_eq!((dan.replies[0].author, dan.replies.len()), ("you", 2));
+
+        // Reply on the focused comment opens the composer too, without
+        // collapsing it.
+        buffer(&mut app, 110, 40);
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('n'));
+        let buf = buffer(&mut app, 110, 40);
+        let ann = reply_regions(&app)
+            .into_iter()
+            .find(|(_, p)| *p == vec![0])
+            .unwrap()
+            .0;
+        assert_eq!(cut(&buf, ann.x, 5, ann.y), "Reply");
+        click(&mut app, (ann.x, ann.y));
+        assert_eq!(
+            (app.mode, app.thread.focus.clone()),
+            (
+                Mode::Compose {
+                    scroll: 0,
+                    restore: 0
+                },
+                Some(vec![0])
+            )
+        );
+        assert!(app.thread.collapsed.is_empty());
+
+        // No Reply regions in the feed.
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.mode, Mode::Feed);
+        buffer(&mut app, 110, 40);
+        assert!(reply_regions(&app).is_empty());
+    }
+
+    #[test]
+    fn reply_regions_are_only_the_drawn_cells_inside_the_viewport() {
+        for width in 8..=60 {
+            let (x, w) = main_column(width);
+            let height = 16;
+            let text = (x + 2)..(x + w).saturating_sub(2);
+            let mut app = deep_thread();
+            press(&mut app, KeyCode::Enter);
+            let mut seen = 0;
+            for _ in 0..60 {
+                let buf = buffer(&mut app, width, height);
+                for (rect, _) in reply_regions(&app) {
+                    let why = format!("{width}: {rect:?}");
+                    assert!(rect.y >= 4 && rect.y < height - 2, "{why}: in the viewport");
+                    assert!(text.contains(&rect.x) && rect.right() <= text.end, "{why}");
+                    assert!((1..=5).contains(&rect.width) && rect.height == 1, "{why}");
+                    let cells = cut(&buf, rect.x, rect.width, rect.y);
+                    assert_eq!(cells, "Reply"[..usize::from(rect.width)], "{why}");
+                    seen += 1;
+                }
+                // Every whole label in the viewport is a region.
+                let starts: Vec<_> = reply_regions(&app)
+                    .iter()
+                    .map(|(r, _)| (r.x, r.y))
+                    .collect();
+                for at in find_all(&buf, "Reply") {
+                    assert!(starts.contains(&at), "{width}: {at:?} has no region");
+                }
+                press(&mut app, KeyCode::Char('j'));
+            }
+            assert!(seen > 0 || w < 14, "{width}: some Reply was clickable");
+        }
+    }
+
+    #[test]
+    fn the_mouse_does_nothing_while_the_composer_is_open() {
+        let mut app = thread_post();
+        press(&mut app, KeyCode::Enter);
+        let buf = buffer(&mut app, 110, 24);
+        let header = find(&buf, "u/ann");
+        let reply = reply_regions(&app)[0].0;
+        press(&mut app, KeyCode::Char('r'));
+        type_str(&mut app, "draft");
+        press(&mut app, KeyCode::Backspace);
+        let buf = buffer(&mut app, 110, 24);
+        let composer = find(&buf, "Commenting");
+        assert!(
+            app.hits.as_ref().unwrap().regions.len() > 1,
+            "regions are recorded"
+        );
+        let kinds = [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Down(MouseButton::Right),
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Moved,
+            MouseEventKind::ScrollDown,
+            MouseEventKind::ScrollUp,
+            MouseEventKind::ScrollLeft,
+        ];
+        let spots = [
+            header,
+            (reply.x, reply.y),
+            composer,
+            find(&buf, "⌕"),
+            find(&buf, "◎ All"),
+            (60, 10),
+            (0, 23),
+        ];
+        let before = (state(&app), app.draft.clone());
+        assert_eq!(app.draft, "draf");
+        for at in spots {
+            for kind in kinds {
+                let event = MouseEvent {
+                    kind,
+                    column: at.0,
+                    row: at.1,
+                    modifiers: KeyModifiers::NONE,
+                };
+                assert!(!app.handles_mouse(&event), "{kind:?} at {at:?}");
+                app.on_mouse(event);
+                assert_eq!(
+                    (state(&app), app.draft.clone()),
+                    before,
+                    "{kind:?} at {at:?}"
+                );
+            }
+        }
+        assert_eq!(compose_scroll(&app), 0);
+    }
+
+    /// The row of `author`'s header if it is drawn focused inside the post
+    /// box's text rows at 110×24 (rows 4 to 21, or 4 to 16 above the
+    /// composer).
+    fn focused_header_row(buf: &Buffer, author: &str) -> Option<u16> {
+        find_all(buf, &format!("u/{author} ·"))
+            .into_iter()
+            .find(|&(x, y)| (4..22).contains(&y) && is_focus_style(buf, x, y))
+            .map(|(_, y)| y)
+    }
+
+    #[test]
+    fn opening_the_composer_keeps_the_focused_header_visible_and_esc_restores_the_scroll() {
+        // At 110×24 the post box shows rows 4 to 21; above the composer, 4 to
+        // 16. dan's and fay's headers, at every scroll position: already
+        // above the composer, in the last 5 rows, or off screen (fay can't
+        // reach the upper rows, the post isn't long enough).
+        let mut cases = [0; 3];
+        for (steps, author) in [(4, "dan"), (6, "fay")] {
+            let focus = |scroll: u16| {
+                let mut app = thread_post();
+                press(&mut app, KeyCode::Enter);
+                (0..steps).for_each(|_| press(&mut app, KeyCode::Char('n')));
+                buffer(&mut app, 110, 24);
+                assert!(app.thread.focus.is_some());
+                app.mode = Mode::Post { scroll };
+                let buf = buffer(&mut app, 110, 24);
+                (app, buf)
+            };
+            let max = focus(0).0.hits.unwrap().max_scroll;
+            for before in 0..=max {
+                let (mut app, buf) = focus(before);
+                assert_eq!(scroll(&app), before);
+                let was = focused_header_row(&buf, author);
+                press(&mut app, KeyCode::Char('r'));
+                let buf = buffer(&mut app, 110, 24);
+                let now = focused_header_row(&buf, author);
+                let why = format!("{author} at scroll {before}, header {was:?} -> {now:?}");
+                let now = now.unwrap_or_else(|| panic!("{why}: hidden"));
+                assert!(now <= 16, "{why}: under the composer");
+                match was {
+                    Some(y) if y <= 16 => {
+                        assert_eq!((compose_scroll(&app), now), (before, y), "{why}");
+                        cases[0] += 1;
+                    }
+                    Some(y) => {
+                        // The least scroll: the header lands on the last row.
+                        assert_eq!(now, 16, "{why}");
+                        assert_eq!(compose_scroll(&app), before + (y - 16), "{why}");
+                        cases[1] += 1;
+                    }
+                    None => cases[2] += 1,
+                }
+                type_str(&mut app, "never mind");
+                press(&mut app, KeyCode::Esc);
+                let buf = buffer(&mut app, 110, 24);
+                assert_eq!(scroll(&app), before, "{why}: Esc restores the scroll");
+                assert_eq!(focused_header_row(&buf, author), was, "{why}");
+            }
+        }
+        assert!(cases.iter().all(|&n| n > 0) && cases[1] >= 10, "{cases:?}");
+    }
+
+    #[test]
+    fn opening_the_composer_with_nothing_focused_never_scrolls() {
+        let mut app = thread_post();
+        press(&mut app, KeyCode::Enter);
+        buffer(&mut app, 110, 24);
+        let max = app.hits.as_ref().unwrap().max_scroll;
+        for before in 0..=max {
+            app.mode = Mode::Post { scroll: before };
+            buffer(&mut app, 110, 24);
+            press(&mut app, KeyCode::Char('r'));
+            buffer(&mut app, 110, 24);
+            assert_eq!(compose_scroll(&app), before);
+            press(&mut app, KeyCode::Esc);
+            buffer(&mut app, 110, 24);
+            assert_eq!(scroll(&app), before);
+        }
+    }
+
+    #[test]
+    fn clicking_reply_in_the_bottom_rows_keeps_that_header_above_the_composer() {
+        let mut app = thread_post();
+        press(&mut app, KeyCode::Enter);
+        // Scroll until dan's Reply is on the last row of the post box.
+        let mut found = None;
+        for before in 0..30 {
+            app.mode = Mode::Post { scroll: before };
+            buffer(&mut app, 110, 24);
+            if let Some((rect, _)) = reply_regions(&app)
+                .into_iter()
+                .find(|(r, p)| *p == vec![1] && r.y == 21)
+            {
+                found = Some((before, rect));
+                break;
+            }
+        }
+        let (before, reply) = found.expect("dan's Reply reaches the last row");
+        click(&mut app, (reply.x, reply.y));
+        assert_eq!(app.thread.focus, Some(vec![1]));
+        let buf = buffer(&mut app, 110, 24);
+        assert_eq!(
+            focused_header_row(&buf, "dan"),
+            Some(16),
+            "the least scroll"
+        );
+        assert_eq!(
+            compose_scroll(&app),
+            before + 3,
+            "header was 2 rows above Reply"
+        );
+        press(&mut app, KeyCode::Esc);
+        buffer(&mut app, 110, 24);
+        assert_eq!(scroll(&app), before);
+        assert_eq!(app.thread.focus, Some(vec![1]), "still focused");
     }
 }

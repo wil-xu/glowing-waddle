@@ -15,7 +15,8 @@ fix whichever one is wrong. Don't let them drift apart.
   community info.
 - It responds the way Reddit does: voting, sort tabs (Hot / New / Top /
   Rising), filtering by group, joining and leaving groups, opening a post to
-  read its comment tree (voting on comments and collapsing threads), saving
+  read its comment tree (voting on comments and collapsing threads),
+  commenting on a post and replying to any comment (yours included), saving
   posts and listing them in a Saved feed, and hiding posts, which then show up
   only in a Hidden feed where they can be unhidden.
 - Like Reddit, the feed has a Card view (a bordered card per post, the
@@ -37,6 +38,10 @@ fix whichever one is wrong. Don't let them drift apart.
   The feed, sort, search, Card/Compact view, selection, scroll, comment focus
   and collapse state, the help overlay and the toast start fresh on every run,
   on Home, Hot, in the Card view, at the top, with the help closed.
+- Keeping the comments you write. They last for the session only: every run
+  starts with the seed tree, and nothing about them (their text, your upvote
+  on them, any vote you cast on them, the higher comment count) reaches the
+  state file. Editing or deleting a comment isn't supported either.
 
 ## Build & run
 
@@ -167,9 +172,9 @@ The screen is a header (3 rows), a body, and a footer (1 row).
     bottom.
 - **Footer:** key hints, which change with the mode. There are separate sets
   for the feed, the feed with a kept search, search mode, the post view with
-  and without a focused comment, and the help overlay. They are constants
-  next to `render_footer` (`FEED_HINTS`, `GROUP_HINTS`, ...), picked by
-  `hints`. The plain feed set is `a/z vote`, `1-4 sort`, `[/] feed`,
+  and without a focused comment, the composer and the help overlay. They are
+  constants next to `render_footer` (`FEED_HINTS`, `GROUP_HINTS`, ...),
+  picked by `hints`. The plain feed set is `a/z vote`, `1-4 sort`, `[/] feed`,
   `/ search`, `s save`, `h hide`, `? help`, `q quit` (72 columns, counting
   the blank after the last hint). On a group feed it adds `J join` before
   `? help` (80 columns, exactly the limit). Every set must fit on one line at
@@ -195,12 +200,19 @@ The screen is a header (3 rows), a body, and a footer (1 row).
   `j/k move`, `enter open`, `/ edit search`, `esc clear search`, `q quit`.
   The search set is `type filter`, `w/ u/ flair: narrow`, `enter keep`,
   `esc clear`. The post view set is `j/k scroll`, `n/p comments`, `a/z vote`,
-  `s save`, `c share`, `? help`, `esc back` (71 columns). With a comment
-  focused it is `n/p comments`, `a/z vote comment`, `enter collapse`,
-  `? help`, `esc unfocus` (69): with `j/k scroll` it would be 81, and that is
-  the hint to drop, since a comment is only ever focused from the unfocused
-  post view, whose set shows it, and the wheel scrolls too. While the help is
-  open the footer shows `j/k scroll`, `g/G top/bottom`, `?/esc close` (42
+  `r reply`, `s save`, `c share`, `? help`, `esc back` (80 columns, exactly
+  the limit). With a comment focused it is `n/p comments`,
+  `a/z vote comment`, `r reply`, `enter collapse`, `? help`, `esc unfocus`
+  (78): with `j/k scroll` it would be 90, and that is the hint to drop, since
+  a comment is only ever focused from the unfocused post view, whose set
+  shows it, the arrow keys scroll too, and `j`/`k` still work. `vote comment`
+  was the other candidate (shortening it to `vote` saves 8), but it is the
+  one hint that says the votes now go to the comment rather than the post,
+  which you can't guess. The composer's set is `type reply`, `enter post`,
+  `esc cancel` when replying to a comment, and `type comment`, `enter post`,
+  `esc cancel` when commenting on the post; it has no `? help`, since the
+  composer types `?` like any other printable key. While the help is open
+  the footer shows `j/k scroll`, `g/G top/bottom`, `?/esc close` (42
   columns, so `close` still shows at 50; the help itself lists `PgDn`, `PgUp`
   and `Space`). The hints are the same in both views. A status toast
   (green, `✔ …`) replaces the hints until the next key press, left click or
@@ -331,14 +343,16 @@ as on Reddit's post page. It shows:
 - the comment tree, in pre-order (a comment, then its replies, then its next
   sibling). Each reply level adds a `│ ` guide. Each comment shows its
   author and age, its wrapped body, `▲ score ▼   Reply   Share`, and a
-  trailing guide line. `Reply` and `Share` are decorative.
+  trailing guide line. `Reply` opens the composer (see below, and Mouse).
+  `Share` is decorative.
 - "··· N more comments", where N is `comment_count` minus the comments in the
-  seeded tree. It counts the whole tree, so collapsing doesn't change it.
+  tree. It counts the whole tree, so collapsing doesn't change it. A comment
+  you write adds 1 to both, so it doesn't change N either.
 
 **Comment focus.** When a post is opened, no comment is focused. `n` focuses
 the next visible comment in display order (the first one when nothing is
 focused), and `p` the previous one (nothing when nothing is focused). Both
-stop at the ends, and do nothing on a post without seeded comments. The
+stop at the ends, and do nothing on a post without comments. The
 focused comment's header row (`u/<author> · <age>`, and the `[+]` and reply
 count when collapsed) is drawn like the active nav entry: orange on the
 highlight background, bold. `Esc` clears the focus and stays in the post; the
@@ -364,14 +378,85 @@ own state, so a collapsed reply is still collapsed after its parent is
 collapsed and expanded again. Focus and collapse state reset every time a
 post is opened from the feed; votes don't.
 
-**Keeping the focus on screen.** After `n` or `p` moves the focus, the next
-render scrolls by the least amount that brings the focused comment's header
-row into view, up or down (none if it is already visible). It happens once:
-`n`/`p` set `Thread.reveal` and the renderer clears it, so `j`/`k`/`PgUp`/
+**Keeping the focus on screen.** After `n` or `p` moves the focus, the
+composer opens (and shrinks the viewport), or a submit focuses your new
+comment, the next render scrolls by the least amount that brings the focused
+comment's header row into view, up or down (none if it is already visible,
+or if nothing is focused). It happens once: `n`/`p`, opening the composer
+and the submit set `Thread.reveal` and the renderer clears it, so `j`/`k`/`PgUp`/
 `PgDn`/`Space`/`g`/`G` then scroll freely. `n` or `p` stopped at an end
 doesn't move the focus and doesn't scroll. Collapsing doesn't scroll either:
 it only removes rows below the focused header, so a header on screen stays
 on screen even when the scroll is clamped to the shorter content.
+
+**The composer (`r`).** In the post view, `r` opens the composer: with a
+comment focused it replies to that comment, with none it writes a top-level
+comment on the post. Clicking a comment's `Reply` label does the same for
+that comment, focusing it first (see Mouse). `r` does nothing in the feed and
+is typed into the query in search mode. The composer is a bordered box
+(orange, like the post box) docked at the bottom of the post column, across
+its full width, 3 text rows high (5 with the border). Its title says what it
+answers, ` Replying to u/<author> ` or ` Commenting on the post `, and its
+bottom border shows, right-aligned, `<n>/500`: the number of chars typed. The
+post view keeps working above it as a scrolled viewport in the remaining
+height: its scroll clamp, the reveal and its click regions are computed for
+the shorter area, exactly as if the terminal were 5 rows shorter. The header,
+nav, sidebar and footer stay as they are; only the footer's hints change.
+When the column is shorter than 5 rows, the composer takes all of it and is
+clipped, and the post view gets none.
+
+The draft is word-wrapped like comment bodies (`wrap`), and a cursor cell
+(the search box's orange `▏`) is drawn right after the last char. A trailing
+whitespace run shows as one space before the cursor, as `wrap` shows a run
+between words, and when the last row is full the cursor starts a new one
+(`draft_rows` in `ui.rs`). When the draft needs more than 3 rows, the box
+shows the last 3, so the cursor is always visible.
+
+**Keeping what you answer on screen.** The composer takes 5 rows from the
+bottom of the post viewport, so a focused comment whose header was in those
+rows would end up under it, and you would type a reply to something you
+can't see. Opening the composer (by `r` or a click on `Reply`) therefore
+asks for the same reveal as `n`/`p`: the first frame with the composer
+scrolls the shrunk viewport by the least amount that keeps the focused
+header row visible. A header already above the composer doesn't scroll,
+and with nothing focused (a top-level comment) nothing scrolls. A header in
+the last 5 rows lands on the last row above the composer. Esc must give back
+the view you had, so `Mode::Compose` keeps two scrolls: `scroll`, the shrunk
+viewport's (moved by that reveal), and `restore`, the post view's scroll
+from just before the composer opened. Esc returns to `Mode::Post` with
+`restore`, exactly the old scroll, and drops a reveal not yet drawn so it
+can't move it. A submit carries `scroll` on, since that is the view you
+were looking at, and then reveals the new comment as usual.
+
+While it is open, every printable key is typed into the draft (see Key
+bindings), up to 500 chars. Enter submits, Esc cancels: the draft is
+discarded and you are back in the post view with the same focus and the
+scroll from before it opened. The focus can't move while the composer is
+open (no key reaches the post view and the mouse is ignored), so
+`Thread.focus` is what it answers.
+
+**Submitting.** Enter on a draft that is empty or only whitespace does
+nothing and keeps the composer open. Otherwise the composer closes and the
+draft, trimmed at both ends, becomes a new comment (`Comment::yours`):
+
+- by `u/you` (the user in the header), `just now` (`hours_ago` 0), already
+  upvoted by you: `vote` `Up` and `score` 1, so `a` clears it to 0 and `z`
+  flips it to -1 with the usual `cast` arithmetic;
+- placed **first** among its siblings, as Reddit shows your new comment at
+  the top: first among the post's top-level comments, or first among the
+  focused comment's replies. Replying to a collapsed comment expands it, so
+  the reply is visible;
+- the post's `comment_count` goes up by 1, so its card shows the new total,
+  while `··· N more comments` stays the same;
+- the focus moves to the new comment and the next render reveals it once,
+  like `n`/`p`;
+- toast: `Comment posted` or `Reply posted`.
+
+It works on any post (a hidden one, one with no seeded comments) and on any
+comment, your own included, at any depth. Inserting shifts the paths of
+later siblings; see Data model for how the focus and collapse state follow.
+Your comments behave like any other (focus, votes, collapse, replies) but are
+never saved (see Persistence).
 
 Free-text search terms are highlighted in the title and body the same way as
 on the cards, whenever a query is set (so a post opened from a searched feed
@@ -414,18 +499,19 @@ right after `?` on the frontpage:
 │                    │   esc            clear a kept search                            │cements · 332 comme… │
 │                    │   ?              this help                                      │─────────────────────╯
 │                    │   q              quit                                           │
-╰────────────────────╰───────────────────────────────────────────────────── 1-18 of 62 ╯
+╰────────────────────╰───────────────────────────────────────────────────── 1-18 of 70 ╯
  j/k scroll  g/G top/bottom  ?/esc close
 ```
 
-- **One table.** Everything in the box comes from `HELP` in `ui.rs`: six
-  sections (Feed, Post view, Search mode, Mouse, This help, Anywhere for
-  Ctrl-C), each a list of rows, each row its keys (shown joined by `, `) and
+- **One table.** Everything in the box comes from `HELP` in `ui.rs`: seven
+  sections (Feed, Post view, Search mode, Composer, Mouse, This help,
+  Anywhere for Ctrl-C), each a list of rows, each row its keys (shown joined by `, `) and
   what they do. It mirrors "Key bindings" and "Mouse" below, so change them
   together. A test fails if a key of any footer hint set is missing from its
   mode's section, so the footer can't name a key the help doesn't explain.
 - **Order.** The section for the mode it was opened from comes first (Feed
-  or Post view), then the others in table order. A blank line separates
+  or Post view), then the others in table order. It never opens from search
+  mode or the composer, which type `?` like any other printable key. A blank line separates
   sections. Headings are white and bold, keys orange and bold, as in the
   footer. Each section's key column is as wide as its longest keys.
 - **Layout.** The box is centered over the body, whatever the mode drew
@@ -442,7 +528,7 @@ right after `?` on the frontpage:
   it to the content height and writes it back on every frame, as in the post
   view, so `G` then `k` moves at once, and after a resize the scroll fits the
   new box: never past the last line, and none at all when everything fits. When there is more than fits, the bottom border
-  shows the lines in view, `1-18 of 62` at 80×24.
+  shows the lines in view, `1-18 of 70` at 80×24.
 - **Modal.** The help sits on top of the mode and leaves it alone. Closing
   it returns to exactly the screen it was opened from: mode, feed, sort,
   kept search, selection, `offset`, view, post scroll, focus and collapse.
@@ -466,8 +552,9 @@ right after `?` on the frontpage:
 
 ```rust
 struct Group   { name, description, members, online, joined: bool }
-struct Comment { author, body, score, hours_ago, replies: Vec<Comment>,
-                 vote: Vote }
+struct Comment { author: &'static str, body: Cow<'static, str>, score,
+                 hours_ago, replies: Vec<Comment>, vote: Vote,
+                 mine: bool }
 struct Post    { group: usize, author, title, body, flair: Option<&str>,
                  score, hours_ago, comment_count: u32,
                  comments: Vec<Comment>, vote: Vote, saved: bool,
@@ -479,21 +566,54 @@ enum Vote { Up, None /* default */, Down }
   A card may say "194 Comments" while the tree holds 5, just as most of a
   Reddit thread sits behind "load more". Don't "fix" the count to
   `comments.len()` or `Comment::total()`. The post view shows the difference
-  as "N more comments".
+  as "N more comments". A comment you write adds 1 to `comment_count` as
+  well as to the tree, so the card shows the new total and the difference
+  stays the same.
 - **Posts have no ID.** While running, they're identified by their index in
   `App.posts`, which never changes after startup. Indices shift whenever the
   seed changes, so the state file names a post by its content instead (see
   Persistence).
 - **Comments have no ID either.** The post view identifies a comment by its
   path (`CommentPath` in `app.rs`): its index among the top-level comments,
-  then among that comment's replies, and so on. The tree never changes while
-  running, so a path always names the same comment. The state file names a
+  then among that comment's replies, and so on. The state file names a
   comment by content, not by path. `Thread::visible` is the only walk
   over the tree. It lists the visible comments in display order, with their
   paths and collapse state, and both `n`/`p` and the renderer use it. A
   vote just follows the focused path down the tree.
+- **How paths stay valid.** The only change to a tree while running is a
+  comment you write, inserted at index 0 of its parent's list. That moves
+  every later sibling up one index, and with it every descendant of one,
+  since a descendant's path starts with its ancestor's. Nothing else moves:
+  ancestors, earlier siblings and other branches keep their paths. Paths
+  are held in only three places: `Thread.focus`, `Thread.collapsed` and the
+  last frame's click regions. Before anything reads them again, the submit
+  calls `Thread::make_room(at)`, which, for the new comment's path `at` =
+  `parent + [i]`, adds 1 at position `parent.len()` to every path that
+  starts with `parent` and has an index of `i` or more there. So each
+  collapsed comment is still collapsed and drawn as collapsed, and `n`/`p`
+  and votes (which only ever follow `focus`) reach the comments you meant.
+  Then the parent is removed from `collapsed` (a reply expands it) and the
+  focus is set to `at`. The click regions are simply dropped, as a view
+  toggle drops them, so a click before the next frame hits nothing; the
+  next frame records them afresh. Paths stay plain paths and seed comments
+  get no ID: the shift is a few lines in one place, and every other rule
+  (pre-order walk, stale-region checks, persistence keys) is unchanged.
+- **Comment text.** `author` stays `&'static str`: seed authors are literals
+  and yours is the constant `YOU` (`"you"`, the same one the header draws as
+  `u/you`). `body` is a `Cow<'static, str>`: `Borrowed` for the seed, so the
+  seed allocates nothing and `c(…)` still takes a string literal, and
+  `Owned` for a comment typed at runtime, so no text is leaked to fake a
+  `'static`. A `String` would have worked too but would copy every seed body
+  at startup for no gain. A separate type for your comments would have
+  needed a second kind of node in `replies` (or a second tree), and every
+  walk, the renderer and the key code to handle both, while yours behave
+  exactly like seed comments apart from persistence. `mine` marks them; it
+  is what keeps them out of the state file, rather than the author's name,
+  so a seed comment by someone called `you` is still saved.
 - **Comments are built with `c(…)`** (and `.with(replies)`), which sets
-  `vote` to `Vote::None`. The tests use the same helpers.
+  `vote` to `Vote::None` and `mine` to false, and keeps the seed as readable
+  as before. The tests use the same helpers. `Comment::yours(body)` builds
+  one of yours: `u/you`, `hours_ago` 0, `vote` `Up`, `score` 1, `mine`.
 - **Ages:** stored as `hours_ago`, not timestamps, so ordering and the tests
   are deterministic.
 - **Groups:** 8 groups. Six start joined: Engineering, RemoteWork, OfficeLife,
@@ -510,19 +630,20 @@ enum Vote { Up, None /* default */, Down }
 
 | Field | Meaning |
 |---|---|
-| `groups`, `posts` | seed data, with the state file applied by `main` before the first frame. `posts` is mutated in place by votes, saves and hides, `groups[g].joined` by `J` |
+| `groups`, `posts` | seed data, with the state file applied by `main` before the first frame. `posts` is mutated in place by votes, saves, hides and the comments you write (inserted into `comments`, and `comment_count` + 1), `groups[g].joined` by `J` |
 | `view: Vec<usize>` | indices into `posts` after feed filter, search and sort. Changed only by a rebuild, except that `h` removes the card it takes out of the feed (see Selection behavior) |
 | `selected` | index into `view` |
 | `offset` | first card (or compact row) drawn. Maintained by the renderer (see Scrolling) |
 | `density: Density` | `Card` (the default) or `Compact`. Toggled by `v` and the view switch, never by a rebuild, and not saved |
 | `sort: Sort` | `Hot`, `New`, `Top`, `Rising` |
 | `feed: Feed` | `Home`, `Popular`, `All`, `Saved`, `Hidden`, `Group(usize)` |
-| `mode: Mode` | `Feed`, `Search`, `Post { scroll: u16 }`. `scroll` is clamped, and moved to reveal a newly focused comment, by the renderer |
+| `mode: Mode` | `Feed`, `Search`, `Post { scroll: u16 }`, `Compose { scroll: u16, restore: u16 }` (the post view with the composer open; `scroll` is the shrunk viewport's, which a submit carries on, and `restore` the post view's scroll from before it opened, which Esc goes back to). `scroll` is clamped, and moved to reveal a newly focused comment, by the renderer. `Mode` stays `Copy`: the draft lives in `draft` |
 | `query: String` | search text, raw as typed. Kept after leaving search mode with Enter |
 | `search: Query` | `query` parsed into free-text terms and filters. Re-parsed on every rebuild of `view`, and used both to filter and to highlight |
 | `help: Option<Help>` | the `?` overlay: `None` when closed (at startup), else `Help { scroll: u16 }`. While it is open, keys and clicks go to it and `mode` is left as it was. `scroll` is clamped by the renderer. Not saved |
-| `hits: Option<Hits>` | where the most recent frame drew each clickable thing, written by the renderer on every frame. `None` until the first frame (see Mouse) |
-| `thread: Thread` | the open post's comment state: `focus: Option<CommentPath>`, `collapsed: HashSet<CommentPath>` (see Data model) and `reveal: bool` (set when `focus` moves, cleared by the renderer once it has scrolled). Reset to the default whenever a post is opened. Only read in the post view |
+| `hits: Option<Hits>` | where the most recent frame drew each clickable thing, written by the renderer on every frame. `None` until the first frame (see Mouse). A submit empties its regions |
+| `draft: String` | the composer's text, raw as typed, at most 500 chars. Emptied when the composer opens, on Esc and on a submit. Only used in `Mode::Compose`. What it answers is `thread.focus`, which can't change while the composer is open |
+| `thread: Thread` | the open post's comment state: `focus: Option<CommentPath>`, `collapsed: HashSet<CommentPath>` (see Data model, and how a submit shifts both) and `reveal: bool` (set when `focus` moves by `n`/`p` or a submit, cleared by the renderer once it has scrolled). Reset to the default whenever a post is opened. Only read in the post view and the composer |
 | `status: Option<&'static str>` | toast text. Every toast is a fixed string. Cleared on the next key press, left click or wheel event |
 | `karma: u32` | fixed at 1,337 (shown as `1.3k`). Votes don't change it |
 | `should_quit` | checked by the event loop in `main.rs`, and by `main`, which saves the state file only when it is set |
@@ -647,8 +768,9 @@ current feed and sort, and the view updates on every keystroke.
 
 ## Key bindings
 
-**Global:** Ctrl-C quits from any mode, including search and with the help
-open. Like `q` in the feed, it saves the state file (see Persistence).
+**Global:** Ctrl-C quits from any mode, including search, the composer and
+with the help open. Like `q` in the feed, it saves the state file (see
+Persistence).
 
 | Key | Feed | Post view |
 |---|---|---|
@@ -663,6 +785,7 @@ open. Like `q` in the feed, it saves the state file (see Persistence).
 | `J` | join / leave the group (toast). Only on a group feed, with or without a kept search | — |
 | `v` | switch between the Card and Compact views (toast: `Compact view` / `Card view`). Works in every feed, an empty one included, and with a kept search | — |
 | `c` | "Link copied to clipboard!" toast | same, always for the post |
+| `r` | — | open the composer: a reply to the focused comment, or a top-level comment with none focused |
 | `Enter` | open post (does nothing in an empty feed) | collapse / expand the focused comment (nothing with none focused) |
 | `1`-`4` / `Tab` | set / cycle sort | — |
 | `[` / `]` | prev / next feed | — |
@@ -682,9 +805,13 @@ on a card's action row stays decorative.
 
 **Search mode:**
 
-- Every printable key, including `q`, `j`, `J`, `h`, `v`, `n`, `p`, `?` and
+- Every printable key, including `q`, `j`, `J`, `h`, `v`, `n`, `p`, `r`, `?` and
   digits, is typed into the query. Phrases and the `w/`, `u/` and `flair:` filters are
   described under Search.
+- Known limitation: modifiers are ignored here, so a Ctrl or Alt chord
+  (Ctrl-W, Ctrl-U, Alt-x) is typed as its plain letter (`w`, `u`, `x`).
+  Ctrl-C still quits. The composer doesn't have this quirk (below); search
+  mode was left as it was.
 - Backspace deletes a character.
 - Enter returns to the feed and keeps the filter.
 - Esc returns to the feed and clears it.
@@ -699,6 +826,25 @@ on a card's action row stays decorative.
 | `?`, `Esc`, `q` | close, back to exactly where it was opened |
 | anything else | nothing (it never reaches the screen underneath) |
 
+**Composer** (`r` or a `Reply` click in the post view):
+
+- Every printable key, including `q`, `j`, `k`, `r`, `n`, `p`, `a`, `z`,
+  `s`, `c`, `h`, `v`, `J`, `g`, `G`, `?`, space and digits, is typed into the
+  draft, and none of them acts. Only unmodified or Shift-modified keys
+  count: Shift is how capitals and symbols arrive. Any key with Ctrl, Alt or
+  another modifier (Ctrl-W, Ctrl-U, Alt-x, Ctrl-Backspace, Alt-Enter) does
+  nothing, except Ctrl-C, which quits as from any mode. Control characters
+  aren't typed. Once the draft has 500 chars (chars, not bytes), further
+  printable keys are ignored.
+- Backspace deletes one char (`ñ` or `°` included), and does nothing on an
+  empty draft.
+- There are no newlines: Enter submits (see Submitting), and does nothing
+  on a draft that is empty or only whitespace.
+- Tab, the arrow keys and every other key do nothing.
+- Esc discards the draft and returns to the post view with the same focus
+  and the exact scroll from before the composer opened, even if opening it
+  scrolled to keep the focused header visible.
+
 ## Mouse
 
 `main.rs` turns mouse capture on after `ratatui::init()` and off again
@@ -712,8 +858,9 @@ below), and only those go to `App::on_mouse`.
 down). Releases, drags, moves, right and middle clicks and horizontal scrolls
 are ignored completely, so they don't even clear the toast. A left press or
 a wheel event clears the toast first, as a key press does, even when it
-lands on nothing. In search mode every mouse event is ignored, and so is any
-event before the first frame is drawn. `handles_mouse` is that rule, and
+lands on nothing. In search mode and while the composer is open every mouse
+event is ignored, clicks and the wheel included, and so is any event before
+the first frame is drawn. `handles_mouse` is that rule, and
 `on_mouse` checks it first, so an event it rejects changes no state.
 
 | Where | Feed | Post view |
@@ -729,6 +876,7 @@ event before the first frame is drawn. `handles_mouse` is that rule, and
 | a nav entry's row (`⊘ Hidden` included) | switch to that feed, as `[`/`]` would landing on it. A kept search stays. The current feed: nothing, so the view and selection stay | — |
 | the header search box | enter search mode, like `/` | — |
 | a comment's header row (`u/<author> · <age>`, `[+]` headers included), across the post box | not drawn | focus it. If it is already focused, collapse / expand it, like `Enter` |
+| a comment's `Reply` label, exactly its 5 cells | not drawn | focus that comment and open the composer for it, in one click, like `r`. On the focused comment it just opens the composer |
 | the wheel, anywhere | select the next / previous card or row, like `j` / `k` | scroll 3 lines, clamped like `j` / `k` |
 
 **While the help is open** (feed or post view underneath), the table above
@@ -743,12 +891,16 @@ horizontal scroll) are ignored here too, and cause no redraw.
 `—` means the click does nothing. So do the `GROUPS` heading, the blank nav
 row, every border outside a card, the logo, the user and karma, the sidebar
 (its Join button included) and the footer. In the post view only comment
-headers are clickable: bodies, action rows, the post itself, the nav and the
-search box do nothing. The nav isn't drawn below 70 columns, and then
+headers and `Reply` labels are clickable: bodies, the rest of the action
+rows (the arrows, the blanks and `Share`, which stays decorative), the post
+itself, the nav and the search box do nothing. The nav isn't drawn below 70 columns, and then
 nothing in it is clickable.
 
-A click never scrolls. Focusing a comment by clicking it doesn't set
-`Thread.reveal`, since its header is already on screen. Collapsing by click
+A click never scrolls by itself. Focusing a comment by clicking its header
+doesn't set `Thread.reveal`, since it is already on screen. A click on
+`Reply` opens the composer, and that may scroll, by the least amount that
+keeps the comment's header above the composer (see the composer in Post
+view). Esc then restores the scroll from before the click. Collapsing by click
 works like `Enter`: it only removes rows below the header, and the renderer
 re-clamps the scroll to the shorter content.
 
@@ -758,15 +910,16 @@ drawing order, and `max_scroll`, the scroll clamp of what the wheel scrolls
 (the help while it is open, else the post view, 0 in the feed). `Target` is
 `Card(i)`, `Vote(i, Vote)` or `Save(i)` with `i` an index into `view` (a
 compact row records the same three), `Sort(Sort)`, `Density` (the view
-switch), `Feed(Feed)`, `Search`, `Comment(CommentPath)` or `Help` (the help's
-box). A click takes the last region containing the cell,
+switch), `Feed(Feed)`, `Search`, `Comment(CommentPath)`, `Reply(CommentPath)`
+or `Help` (the help's box). A click takes the last region containing the cell,
 so a card's arrows and Save label, and a compact row's arrows and star,
 recorded after the card or row, win over it.
 
 - Regions cover only what was drawn: nav rows only when the nav is drawn and
   only the rows that fit, a clipped card's visible part, arrows and Save
-  labels only when their row is drawn, and comment headers only inside the
-  scrolled viewport. Everything is clipped like the widgets, so a click
+  labels only when their row is drawn, and comment headers and `Reply`
+  labels only inside the scrolled viewport (above the composer when it is
+  open). Everything is clipped like the widgets, so a click
   follows the responsive layout, the feed offset and the post-view scroll.
 - The arrows are drawn one cell each, where a centered one-cell line goes,
   so the cell recorded is the cell drawn. The Save label's columns come from
@@ -775,11 +928,22 @@ recorded after the card or row, win over it.
   recorded as one cell only when it is inside the row's area. The view
   switch is recorded only when it is drawn, so only in the feed (and in
   search mode, where clicks are ignored).
+- `Reply` is recorded on exactly the cells it is drawn on, in the post view
+  only. Its columns come from `comment_lines`, which builds the action row
+  (the label is a span of its own, styled as before, so the row renders the
+  same), and are clipped to the post box's text area like the row: at a
+  narrow width only the visible part of the label is a region, and none
+  when it is cut off entirely. Collapsed comments have no action row and so
+  no `Reply`. The regions are also recorded while the composer is open, for
+  the shorter viewport, though no click reaches them.
 - `on_mouse` decides what a target does from the mode: card, sort, view
-  switch, nav and search targets only act in the feed, `Comment` only in the post view. It
-  ignores a target that no longer applies, such as a card index past the end
-  of `view` or a comment hidden under a collapsed ancestor, so a stale
-  region can't break the focus invariants.
+  switch, nav and search targets only act in the feed, `Comment` and
+  `Reply` only in the post view, and nothing in search mode or the
+  composer. It ignores a target that no longer applies, such as a card
+  index past the end of `view` or a comment hidden under a collapsed
+  ancestor, so a stale region can't break the focus invariants. A submit
+  shifts paths (see Data model), so it drops the last frame's regions
+  rather than leave any that name a path from before the insert.
 - The wheel in the post view clamps to `max_scroll` straight away, and the
   renderer clamps again as it does for `j`. So does the wheel in the help
   (before the first frame after `?`, against the stale `max_scroll`, which
@@ -796,7 +960,8 @@ recorded after the card or row, win over it.
 tracking, so the terminal sends a steady stream of `Moved` events while the
 pointer moves. The event loop draws a frame only after an event that may
 have changed something: a key press, a mouse event `handles_mouse` accepts,
-or any non-mouse event (a resize, for one). A mouse event it rejects changes
+or any non-mouse event (a resize, for one). `handles_mouse` rejects every
+mouse event in search mode and the composer, so those cost no redraw either. A mouse event it rejects changes
 nothing, so the frame on screen, and the click regions recorded with it,
 are still current. Measured in a 110×24 tmux pane, 300 pointer moves and
 a click used to cost 302 full renders, and now cost 2 (startup and the
@@ -808,7 +973,33 @@ debug build at that size.
 Your vote on each post and on each comment, each post's `saved` and `hidden`
 flags and each group's `joined` flag are kept in a small text file between
 runs. Nothing else is: every run starts on Home, Hot, at the top, with no
-query, focus, collapse or toast, and the help closed.
+query, focus, collapse or toast, the help closed, and with the seed's comment tree.
+
+**Your comments are never saved.** The comments you write last for the
+session only (see Non-goals). `items`, the one list of what can be saved,
+skips every comment with `mine` set, and everything under one (which can
+only be yours, and whose key would contain your text anyway). From that:
+
+- no record is ever written for one of your comments: not its text, not the
+  upvote it starts with, not any vote you cast on it;
+- writing comments changes nothing in the file. The records come in seed
+  order, and inserting your comments doesn't change the relative order of
+  the seeded ones, so with the same votes, saves, hides and joins the file
+  is byte for byte what it would be without them. `comment_count` was never
+  saved, so the higher count isn't either;
+- your comment can never own or shadow a seeded comment's key, even when its
+  author and text are exactly a seeded sibling's (a seed author called
+  `you`): it isn't in the list the first-owner rule picks from;
+- loading never touches your comments: a record can only resolve to an item
+  in that list. At load time there are none anyway (`main` loads before the
+  first frame), but the code doesn't rely on it.
+
+A seeded comment that one of yours pushed to a later index still saves
+under its own key and loads back onto it: the key is built from content
+(the authors and bodies on the way down), never from the path, and `items`
+pairs each key with the comment's current path when it is built, at save
+time. On the next run the comment is back at its seed path, which is the
+path `items` finds for that key then.
 
 **What is stored.** Only differences from the seed: a group whose `joined`
 differs from the seed's (both joining an unjoined group and leaving a joined
@@ -959,22 +1150,26 @@ workit/
     app.rs      state, feeds, sorts, voting, saving, hiding, joining, the
                 Card/Compact toggle, search
                 (query parsing, matching, highlight positions), comment focus
-                and collapse, key handling (the help's keys included), mouse
-                handling (hit-testing the click regions). No rendering
-    data.rs     seed groups, posts, comments
-    state.rs    the state file: content keys, format, loading, atomic saving,
-                path selection
+                and collapse, the composer (typing, submitting, inserting your
+                comment and shifting the paths), key handling (the help's keys
+                included), mouse handling (hit-testing the click regions). No
+                rendering
+    data.rs     seed groups, posts, comments; `Comment::yours`, `YOU` and the
+                500-char limit
+    state.rs    the state file: content keys (never for your comments), format,
+                loading, atomic saving, path selection
     ui.rs       all rendering (cards and compact rows, the view switch, the
-                help overlay and its table, the footer's hint sets), including
-                offset upkeep, post-view and help scroll clamping, revealing the
-                focused comment and recording the click regions
+                composer, the help overlay and its table, the footer's hint
+                sets), including offset upkeep, post-view and help scroll
+                clamping, revealing the focused comment and recording the
+                click regions
 ```
 
 ## Testing
 
-160 unit tests, run with `cargo test`:
+197 unit tests, run with `cargo test`:
 
-- **`app.rs`** (53), on small custom data sets:
+- **`app.rs`** (73), on small custom data sets:
   - Home hides unjoined groups, and Popular hides low scores.
   - The exact order for each sort.
   - Feed cycling wraps in both directions, with Saved and then Hidden between
@@ -1045,7 +1240,45 @@ workit/
     it without quitting (the next `q` quits) and Ctrl-C quitting with it
     open from the feed and the post view; a key press clearing a toast while
     `a` does nothing.
-- **`ui.rs`** (83), rendering into a `TestBackend`:
+  - The composer: `r` with and without a focused comment opening it for
+    that comment or the post, keeping the scroll; `r` doing nothing in the
+    feed and typed in search mode; `q`, `j`, `r`, `a`, `z`, `s`, `c`, `h`,
+    `v`, `J`, digits and more typed without acting (no quit, no vote, no
+    toast, posts and thread unchanged); Backspace deleting `°` and `ñ` one
+    char each; the 500-char limit counted in chars, with room again after a
+    Backspace; Tab, the arrows and other keys doing nothing; Esc discarding
+    the draft and keeping the focus and scroll, and the next composer
+    starting empty; Ctrl-C quitting from it.
+  - Enter on an empty, a spaces-only and a no-break-space draft doing
+    nothing and keeping the composer and the draft.
+  - A top-level comment (trimmed) and a nested reply landing first among
+    their siblings, by `you`, `just now`, score 1 and upvoted, then `a`
+    clearing it to 0 and `z` flipping it to -1; `comment_count` + 1; the
+    focus on the new comment with a reveal asked for; the `Comment posted`
+    and `Reply posted` toasts.
+  - Replying to a collapsed comment expanding it.
+  - After a top-level insert, a later sibling and a descendant of one still
+    collapsed (their shifted paths in `collapsed`), `n`/`p` walking the
+    tree in order, and a vote landing on the comment meant; the same after
+    a deep insert, with a comment in another branch untouched, and a
+    collapsed comment expanded afterwards showing its reply, which takes a
+    vote. `make_room` on its own shifting exactly the later siblings and
+    their descendants, the focus included.
+  - Replying on a post with no seeded comments, to your own comments five
+    levels deep, a second top-level comment going before the first, and on
+    a hidden post.
+  - A submit dropping the last frame's click regions, so a click before the
+    next frame does nothing.
+  - Ctrl-W, Ctrl-U, Alt-x, Alt-q, Ctrl-Alt-a, Ctrl-Shift-W, Super-j,
+    Ctrl/Alt-Backspace, Ctrl/Alt-Enter and Alt-Esc doing nothing in the
+    composer (draft, mode, posts and thread unchanged), Shift-modified `A`,
+    `?`, `Ñ` and Shift-Backspace working, Ctrl-C still quitting; search mode
+    still typing Ctrl-W and Alt-x as `w` and `x`.
+  - Opening the composer asking for a reveal, with `restore` set to the
+    scroll; Esc returning to `restore` even when the composer's scroll
+    moved, and dropping a pending reveal; a submit carrying the composer's
+    scroll on and revealing the new comment.
+- **`ui.rs`** (96), rendering into a `TestBackend`:
   - The helpers `compact`, `age`, `wrap` and `truncate`.
   - The frontpage contents.
   - Sidebars hidden at narrow widths.
@@ -1071,13 +1304,58 @@ workit/
     with a kept search staying, and Hidden's sidebar.
   - The group sidebar button and nav mark flipping with `J`.
   - Every hint set (feed, kept search, search, post view unfocused and
-    focused, help) fitting in 80 columns on every feed, Hidden included, in
-    both the Card and Compact views, with the exact plain and group feed
-    sets, `h hide` and `? help` in both, `J join` only in the feed set on
-    group feeds, the exact search-mode, post-view and help sets, the
-    toggle's toast, a toast replacing the focused set, and `Esc` bringing
-    back the unfocused one. Closing the help bringing back the set it
-    replaced.
+    focused, the composer for a comment and for the post, help) fitting in
+    80 columns on every feed, Hidden included, in both the Card and Compact
+    views, with the exact plain and group feed sets, `h hide` and `? help`
+    in both, `J join` only in the feed set on group feeds, the exact
+    search-mode, post-view (`r reply` in both), composer and help sets, the
+    toggle's toast, a toast replacing the focused set, typing (`?`
+    included) keeping the composer's set, `Esc` from the composer bringing
+    back the post set it came from, and `Esc` bringing back the unfocused
+    one. Closing the help bringing back the set it replaced.
+  - The composer at 110×24 and 80×24, row by row: the ` Commenting on the
+    post ` and ` Replying to u/bob ` titles, the cursor in orange right
+    after the last char, `0/500` and `<n>/500` right-aligned on the bottom
+    border, a long draft showing exactly the last 3 rows `wrap` makes, the
+    post box ending right above it, and the composer's hints. `draft_rows`
+    on its own: an empty draft, a trailing run shown as one space, a full
+    row pushing the cursor down, non-ASCII chars, width 0.
+  - At 24 rows and every width from 1 to 120, with the post scrolled: every
+    cell outside the composer identical to the post view without it (at 19
+    rows inside the post column, at 24 outside it), the composer's corners
+    and sides on the column's edges, and the scroll, the scroll clamp and
+    the comment and `Reply` regions those of the 19-row view, all above the
+    composer. Tiny terminals (down to 1×1) not panicking.
+  - A posted comment drawn first and focused, its trimmed body below, its
+    `▲ 1 ▼` orange, then `▲ 0 ▼` after `a`, `··· 4 more comments` unchanged
+    and the card back in the feed saying `▤ 11 Comments`. A reply to the
+    last comment scrolled into view once, opening the composer keeping
+    the last comment's header above it, the submit carrying that scroll on,
+    and `k` free afterwards.
+  - Collapsed `[+]` headers still drawn collapsed, their replies hidden,
+    after a top-level insert and after a reply to an earlier comment.
+  - `Reply` regions exactly on the drawn labels, 5 cells each, one per
+    expanded comment; the blanks beside a label doing nothing; a click on
+    its last cell focusing that comment and opening ` Replying to u/dan `
+    (its header already above the composer, so nothing scrolls), and
+    posting from there; a click on the focused
+    comment's `Reply` opening the composer without collapsing; no `Reply`
+    region in the feed. At every width from 8 to 60, scrolling through a
+    deep thread, every region inside the viewport and the text area, its
+    cells spelling the visible part of `Reply`, and every whole label drawn
+    having a region.
+  - With the composer open, left, right and middle clicks, releases, drags,
+    moves and the wheel, on a header, a `Reply`, the composer, the search
+    box and the nav: `handles_mouse` false and nothing changed, the draft
+    included.
+  - Opening the composer at 110×24 with dan's or fay's header at every
+    scroll position: a header already above the composer not scrolling, one
+    in the last 5 rows landing on the last row above it (the least scroll),
+    one off screen brought into view, and Esc restoring the exact scroll and
+    header row each time. With nothing focused, opening never scrolls and
+    Esc restores the scroll. A click on dan's `Reply` on the last row of the
+    post box scrolling by 3 so dan's header sits right above the composer,
+    and Esc restoring the scroll with dan still focused.
   - Highlight cells: a title match black on orange and still bold, in the
     original case, with its neighbors untouched, in a kept search too.
   - A phrase wrapping across two title rows highlighted on both.
@@ -1202,8 +1480,9 @@ workit/
       help's lines with blank padding: nothing shows through and nothing
       wraps. The feed's section first and `1-18 of N` on the bottom border.
     - The current mode's section first: Feed (with a kept search too), or
-      Post view then Feed, the rest in table order.
-    - At 80×24, 100×30, 110×24 and 200×70, from the feed and the post view,
+      Post view then Feed, the rest in table order (Search mode, Composer,
+      Mouse, This help, Anywhere).
+    - At 80×24, 100×30, 110×24 and 200×80, from the feed and the post view,
       scrolling through all of it: every line, and every description whole,
       on screen. Tall enough, no scrolling and no position shown.
     - Each scrolling key, clamped at both ends; `G` storing `u16::MAX` and
@@ -1224,7 +1503,7 @@ workit/
       (which a click would collapse), each first checked to be that region,
       closing the help and changing nothing else, before and after the next
       frame; the wheel not reaching the feed or the post.
-    - Resizing while open: after `G` at 80×24, 80×50, 30×8, 80×70 and back
+    - Resizing while open: after `G` at 80×24, 80×50, 30×8, 80×80 and back
       at 80×24, the scroll re-clamped to the new content and box, the last
       line on the box's last row (the whole content, unscrolled, when it
       fits) and `k` moving on the very next frame; a scroll left at the old
@@ -1245,11 +1524,13 @@ workit/
       the footer the help's set (where the body has 2 rows or more), and the
       scroll within its clamp after `G`.
     - Every key of every footer hint set listed in the help table under its
-      mode's section, along with the keys the feed sets leave out; each
-      section once; and the footer only ever showing one of those sets.
+      mode's section (the composer's sets under Composer), along with the
+      keys the feed sets leave out; each section once; and the footer only
+      ever showing one of those sets, walking through the feed, search, the
+      post view, the help and the composer for a reply and a comment.
     - Every char of the help table and the hint sets one cell wide in
       ratatui (`↓`, `↑`, `▲`, `▼` and `☆` included), and `▦`/`≡` unused.
-- **`state.rs`** (24), on in-memory strings and on files in a directory
+- **`state.rs`** (28), on in-memory strings and on files in a directory
   under the system temp dir that each test creates and removes itself. No
   test reads or writes a real state file or reads `HOME`, `XDG_STATE_HOME`
   or `WORKIT_STATE`:
@@ -1309,6 +1590,20 @@ workit/
   - Ctrl-C with the help open saving the vote made before it and nothing
     pressed while it was open, the file unchanged in format, and the next
     run starting with the help closed.
+  - A run that writes a top-level comment and votes on it, replies to a
+    seeded reply and to that reply, then votes on a seeded reply and a
+    seeded top-level comment that were both pushed down, saving a file byte
+    for byte the one the same votes save without the comments; loading it
+    restoring those votes onto the right comments, with the seed tree and
+    seed comment count back; and the file written back the same.
+  - Writing comments and nothing else creating no file.
+  - Loading into an app that has your comments: records naming their keys
+    matching nothing, your comments unchanged, a seeded record landing on
+    the seeded comment at its shifted path.
+  - A comment of yours with exactly a seeded sibling's key (a seed author
+    called `you`, the same text) never saved and never taking the key: only
+    the seeded comment's vote is written, and it loads onto the seeded
+    comment, with or without yours in front of it.
 
 Lint with `arc f`, `arc lint` and `arc rust-clippy`. The `arc lint -e extra`
 engine isn't configured for `users/`.

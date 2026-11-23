@@ -14,6 +14,7 @@ use ratatui::layout::Rect;
 use crate::data;
 use crate::data::Comment;
 use crate::data::Group;
+use crate::data::MAX_COMMENT_CHARS;
 use crate::data::Post;
 use crate::data::Vote;
 
@@ -72,7 +73,19 @@ pub(crate) enum Density {
 pub(crate) enum Mode {
     Feed,
     Search,
-    Post { scroll: u16 },
+    Post {
+        scroll: u16,
+    },
+    /// The post view with the composer open below it. The draft is
+    /// `App.draft`, and what it answers is `Thread.focus` (the post when
+    /// `None`), which can't move while the composer is open. `scroll` is the
+    /// post view's above the composer, which the renderer may have moved to
+    /// keep the focused header visible; a submit carries it on. `restore` is
+    /// the scroll from before the composer opened, which Esc goes back to.
+    Compose {
+        scroll: u16,
+        restore: u16,
+    },
 }
 
 /// The `?` help overlay, while it is open. It sits on top of whatever mode
@@ -86,8 +99,10 @@ pub(crate) struct Help {
 }
 
 /// A comment's position in a post's tree: its index among the top-level
-/// comments, then among that comment's replies, and so on. The tree never
-/// changes, so a path always names the same comment.
+/// comments, then among that comment's replies, and so on. The only change
+/// to a tree while running is a comment you write, inserted first among its
+/// siblings; `Thread::make_room` then shifts every path that pointed past
+/// it, so a path held in `Thread` keeps naming the same comment.
 pub(crate) type CommentPath = Vec<usize>;
 
 /// The open post's comment state. Reset whenever a post is opened.
@@ -178,6 +193,35 @@ impl Thread {
             self.collapsed.insert(focus.clone());
         }
     }
+
+    /// Makes room for a comment about to be inserted at `at`: every sibling
+    /// from index `at.last()` on moves one index up, and so does every
+    /// descendant of one, since its path starts with its ancestor's. Each
+    /// path in `focus` and `collapsed` then still names the comment it named
+    /// before the insert. Paths elsewhere in the tree (ancestors of `at`,
+    /// earlier siblings and their descendants, other branches) don't change.
+    fn make_room(&mut self, at: &[usize]) {
+        let Some((&index, parent)) = at.split_last() else {
+            return;
+        };
+        let depth = parent.len();
+        let shift = |path: &mut CommentPath| {
+            if path.len() > depth && path[..depth] == *parent && path[depth] >= index {
+                path[depth] += 1;
+            }
+        };
+        self.collapsed = self
+            .collapsed
+            .drain()
+            .map(|mut path| {
+                shift(&mut path);
+                path
+            })
+            .collect();
+        if let Some(focus) = &mut self.focus {
+            shift(focus);
+        }
+    }
 }
 
 /// Something on screen that a left click acts on. What it does depends on
@@ -203,6 +247,8 @@ pub(crate) enum Target {
     Comment(CommentPath),
     /// The help overlay's box. While it is open, it is the only region.
     Help,
+    /// The `Reply` label on a comment's action row in the post view.
+    Reply(CommentPath),
 }
 
 /// What the most recent frame drew where, written by the renderer on every
@@ -226,6 +272,17 @@ impl Hits {
             .rev()
             .find(|(rect, _)| rect.contains(pos))
             .map(|(_, target)| target)
+    }
+}
+
+/// The comment at `path` in `comments` (see `CommentPath`).
+pub(crate) fn comment<'a>(comments: &'a [Comment], path: &[usize]) -> Option<&'a Comment> {
+    let (&first, rest) = path.split_first()?;
+    let comment = comments.get(first)?;
+    if rest.is_empty() {
+        Some(comment)
+    } else {
+        self::comment(&comment.replies, rest)
     }
 }
 
@@ -278,6 +335,9 @@ pub(crate) struct App {
     pub help: Option<Help>,
     /// Clickable regions of the most recent frame; `None` until the first.
     pub hits: Option<Hits>,
+    /// The composer's text, raw as typed. Only used in `Mode::Compose`, and
+    /// emptied whenever the composer opens.
+    pub draft: String,
     pub status: Option<&'static str>,
     pub karma: u32,
     pub should_quit: bool,
@@ -464,6 +524,7 @@ impl App {
             thread: Thread::default(),
             help: None,
             hits: None,
+            draft: String::new(),
             status: None,
             karma: 1_337,
             should_quit: false,
@@ -682,15 +743,16 @@ impl App {
             Mode::Feed => self.on_feed_key(key.code),
             Mode::Search => self.on_search_key(key.code),
             Mode::Post { scroll } => self.on_post_key(key.code, scroll),
+            Mode::Compose { scroll, restore } => self.on_compose_key(key, scroll, restore),
         }
     }
 
     /// Whether `on_mouse` acts on `event` at all: a left press or the wheel,
-    /// after the first frame, outside search mode. The rest change nothing,
-    /// so the event loop doesn't redraw for them.
+    /// after the first frame, outside search mode and the composer. The rest
+    /// change nothing, so the event loop doesn't redraw for them.
     pub(crate) fn handles_mouse(&self, event: &MouseEvent) -> bool {
         self.hits.is_some()
-            && self.mode != Mode::Search
+            && !matches!(self.mode, Mode::Search | Mode::Compose { .. })
             && matches!(
                 event.kind,
                 MouseEventKind::Down(MouseButton::Left)
@@ -743,12 +805,12 @@ impl App {
                     scroll: wheel_scroll(scroll, delta, max_scroll),
                 };
             }
-            (Mode::Post { .. }, None) => {
-                if let Some(Target::Comment(path)) = target {
-                    self.click_comment(path);
-                }
-            }
-            (Mode::Search, _) => {}
+            (Mode::Post { scroll }, None) => match target {
+                Some(Target::Comment(path)) => self.click_comment(path),
+                Some(Target::Reply(path)) => self.click_reply(path, scroll),
+                _ => {}
+            },
+            (Mode::Search | Mode::Compose { .. }, _) => {}
         }
     }
 
@@ -794,6 +856,123 @@ impl App {
         {
             self.thread.focus = Some(path);
             self.thread.reveal = false;
+        }
+    }
+
+    /// Focuses the comment whose `Reply` label was clicked and opens the
+    /// composer for it, in one click. A comment that is no longer visible (a
+    /// stale region) is ignored. The click itself doesn't scroll; opening the
+    /// composer may, to keep the header above it (see `open_composer`).
+    fn click_reply(&mut self, path: CommentPath, scroll: u16) {
+        let Some(&i) = self.view.get(self.selected) else {
+            return;
+        };
+        if self
+            .thread
+            .visible(&self.posts[i].comments)
+            .iter()
+            .any(|s| s.path == path)
+        {
+            if self.thread.focus.as_ref() != Some(&path) {
+                self.thread.focus = Some(path);
+                self.thread.reveal = false;
+            }
+            self.open_composer(scroll);
+        }
+    }
+
+    /// Opens the composer on an empty draft. It answers the focused comment,
+    /// or the post with none focused. It takes rows from the post viewport,
+    /// so it asks for a reveal: the next render scrolls the shrunk viewport
+    /// by the least amount that keeps the focused header visible (none when
+    /// it already is, or with nothing focused). `scroll` is kept for Esc.
+    fn open_composer(&mut self, scroll: u16) {
+        self.draft.clear();
+        self.thread.reveal = true;
+        self.mode = Mode::Compose {
+            scroll,
+            restore: scroll,
+        };
+    }
+
+    /// Every printable key, unmodified or with Shift, is typed, up to
+    /// `MAX_COMMENT_CHARS` chars. Any key with Ctrl, Alt or another modifier
+    /// does nothing (Ctrl-C has already quit in `on_key`), so Ctrl-W or
+    /// Alt-x isn't typed as `w` or `x`. There are no newlines: Enter
+    /// submits. Esc discards the draft and goes back to the scroll from
+    /// before the composer opened.
+    fn on_compose_key(&mut self, key: KeyEvent, scroll: u16, restore: u16) {
+        if !key.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
+            return;
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.draft.clear();
+                // A reveal asked for on opening and not drawn yet would move
+                // the restored scroll.
+                self.thread.reveal = false;
+                self.mode = Mode::Post { scroll: restore };
+            }
+            KeyCode::Enter => self.submit(scroll),
+            KeyCode::Backspace => {
+                self.draft.pop();
+            }
+            KeyCode::Char(ch)
+                if !ch.is_control() && self.draft.chars().count() < MAX_COMMENT_CHARS =>
+            {
+                self.draft.push(ch);
+            }
+            _ => {}
+        }
+    }
+
+    /// Posts the draft, trimmed, as your comment: first among the post's
+    /// top-level comments, or first among the focused comment's replies
+    /// (expanding it if it was collapsed). A blank draft does nothing and
+    /// keeps the composer open. The new comment takes the focus and is
+    /// revealed once, like `n`/`p`.
+    fn submit(&mut self, scroll: u16) {
+        let body = self.draft.trim();
+        if body.is_empty() {
+            return;
+        }
+        let Some(&i) = self.view.get(self.selected) else {
+            return;
+        };
+        let comment = Comment::yours(body.to_owned());
+        let parent = self.thread.focus.clone();
+        let post = &mut self.posts[i];
+        let at = match &parent {
+            None => {
+                post.comments.insert(0, comment);
+                vec![0]
+            }
+            Some(path) => {
+                let Some(parent) = comment_mut(&mut post.comments, path) else {
+                    return;
+                };
+                parent.replies.insert(0, comment);
+                [path.as_slice(), &[0]].concat()
+            }
+        };
+        post.comment_count = post.comment_count.saturating_add(1);
+        self.thread.make_room(&at);
+        if let Some(path) = &parent {
+            self.thread.collapsed.remove(path);
+        }
+        self.thread.focus = Some(at);
+        self.thread.reveal = true;
+        self.draft.clear();
+        self.mode = Mode::Post { scroll };
+        self.status = Some(if parent.is_some() {
+            "Reply posted"
+        } else {
+            "Comment posted"
+        });
+        // The last frame's comment regions name paths from before the
+        // insert. The next frame records them afresh.
+        if let Some(hits) = &mut self.hits {
+            hits.regions.clear();
         }
     }
 
@@ -920,6 +1099,10 @@ impl App {
             KeyCode::Char('?') => {
                 self.help = Some(Help::default());
                 scroll
+            }
+            KeyCode::Char('r') => {
+                self.open_composer(scroll);
+                return;
             }
             _ => scroll,
         };
@@ -2274,5 +2457,618 @@ mod tests {
         assert_eq!(app.status, None);
         assert!(app.help.is_some());
         assert_eq!(app.posts[app.view[0]].vote, Vote::None, "a didn't vote");
+    }
+
+    // ---- The composer ----
+
+    /// The open post's comment at `path`.
+    fn at<'a>(app: &'a App, path: &[usize]) -> &'a Comment {
+        comment(&app.posts[app.view[app.selected]].comments, path).expect("a comment there")
+    }
+
+    /// Opens the composer with `r`, types `text` and submits it with Enter.
+    fn post_comment(app: &mut App, text: &str) {
+        press(app, KeyCode::Char('r'));
+        press_str(app, text);
+        press(app, KeyCode::Enter);
+    }
+
+    fn assert_yours(comment: &Comment, body: &str) {
+        assert_eq!(
+            (comment.author, comment.body.as_ref(), comment.hours_ago),
+            ("you", body, 0)
+        );
+        assert_eq!((comment.score, comment.vote), (1, Vote::Up), "self-upvoted");
+        assert!(comment.mine && comment.replies.is_empty());
+    }
+
+    #[test]
+    fn r_opens_the_composer_for_the_focused_comment_or_the_post() {
+        let mut app = thread_sample();
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('r'));
+        assert_eq!(
+            app.mode,
+            Mode::Compose {
+                scroll: 1,
+                restore: 1
+            }
+        );
+        assert_eq!(app.thread.focus, None, "a top-level comment on the post");
+
+        press(&mut app, KeyCode::Esc);
+        press_str(&mut app, "nn");
+        press(&mut app, KeyCode::Char('r'));
+        assert_eq!(
+            app.mode,
+            Mode::Compose {
+                scroll: 1,
+                restore: 1
+            }
+        );
+        assert_eq!(focused(&app), Some("b"), "a reply to b");
+    }
+
+    #[test]
+    fn r_does_nothing_in_the_feed_and_is_typed_in_search() {
+        let mut app = thread_sample();
+        press(&mut app, KeyCode::Char('r'));
+        assert_eq!((app.mode, app.status), (Mode::Feed, None));
+        assert!(app.draft.is_empty());
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Char('r'));
+        assert_eq!((app.mode, app.query.as_str()), (Mode::Search, "r"));
+        assert!(app.draft.is_empty());
+    }
+
+    #[test]
+    fn every_printable_key_is_typed_into_the_draft() {
+        let mut app = thread_sample();
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('n'));
+        let before = (app.posts.clone(), app.thread.clone());
+        press(&mut app, KeyCode::Char('r'));
+        let typed = "qjkrnpazschvJgG[]/ 0123456789!ñ°";
+        press_str(&mut app, typed);
+        assert_eq!(app.draft, typed);
+        assert_eq!(
+            app.mode,
+            Mode::Compose {
+                scroll: 0,
+                restore: 0
+            }
+        );
+        assert!(!app.should_quit, "q is typed, not quit");
+        assert_eq!(app.status, None, "c and s are typed, not acted on");
+        assert_eq!(
+            format!("{:?}", (&app.posts, &app.thread)),
+            format!("{before:?}")
+        );
+        assert_eq!((app.density, app.feed), (Density::Card, Feed::Home));
+    }
+
+    #[test]
+    fn backspace_deletes_one_char_even_when_it_is_not_ascii() {
+        let mut app = thread_sample();
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('r'));
+        press_str(&mut app, "jalapeño 30°");
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(app.draft, "jalapeño 30");
+        press_str(&mut app, "°");
+        for expected in [
+            "jalapeño 30",
+            "jalapeño 3",
+            "jalapeño ",
+            "jalapeño",
+            "jalapeñ",
+        ] {
+            press(&mut app, KeyCode::Backspace);
+            assert_eq!(app.draft, expected);
+        }
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(app.draft, "jalape", "ñ goes in one Backspace");
+        for _ in 0..10 {
+            press(&mut app, KeyCode::Backspace);
+        }
+        assert_eq!(
+            (app.draft.as_str(), app.mode),
+            (
+                "",
+                Mode::Compose {
+                    scroll: 0,
+                    restore: 0
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn the_draft_stops_at_500_chars() {
+        let mut app = thread_sample();
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('r'));
+        press_str(&mut app, &"ñ".repeat(499));
+        press_str(&mut app, "abc");
+        assert_eq!(app.draft.chars().count(), 500, "chars, not bytes");
+        assert!(app.draft.ends_with("ñña"));
+        press(&mut app, KeyCode::Backspace);
+        press_str(&mut app, "xy");
+        assert!(app.draft.ends_with("ñx"), "room again after a Backspace");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(at(&app, &[0]).body.chars().count(), 500);
+    }
+
+    #[test]
+    fn tab_arrows_and_other_keys_do_nothing_in_the_composer() {
+        let mut app = thread_sample();
+        press(&mut app, KeyCode::Enter);
+        press_str(&mut app, "jjn");
+        press(&mut app, KeyCode::Char('r'));
+        press_str(&mut app, "hi");
+        let before = (app.mode, app.thread.clone(), app.posts.clone());
+        for code in [
+            KeyCode::Tab,
+            KeyCode::BackTab,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::Delete,
+            KeyCode::Char('\t'),
+            KeyCode::Char('\n'),
+        ] {
+            press(&mut app, code);
+            assert_eq!(app.draft, "hi", "{code:?}");
+            assert_eq!(
+                format!("{:?}", (app.mode, &app.thread, &app.posts)),
+                format!("{before:?}"),
+                "{code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn esc_discards_the_draft_and_keeps_focus_and_scroll() {
+        let mut app = thread_sample();
+        press(&mut app, KeyCode::Enter);
+        press_str(&mut app, "jjjnn");
+        app.thread.reveal = false;
+        let thread = app.thread.clone();
+        press(&mut app, KeyCode::Char('r'));
+        press_str(&mut app, "never mind");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.mode, Mode::Post { scroll: 3 });
+        assert_eq!(app.thread, thread, "same focus, no reveal");
+        assert!(app.draft.is_empty());
+        assert_eq!(app.posts[0].comments[0].replies.len(), 2, "nothing posted");
+        assert_eq!(app.status, None);
+        press(&mut app, KeyCode::Char('r'));
+        assert!(app.draft.is_empty(), "the next composer starts empty");
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.thread.focus, None, "Esc in the post view unfocuses");
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_the_composer() {
+        let mut app = thread_sample();
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('r'));
+        press_str(&mut app, "draft");
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_quit);
+        assert_eq!(app.draft, "draft", "not typed");
+    }
+
+    #[test]
+    fn enter_on_a_blank_draft_does_nothing() {
+        let mut app = thread_sample();
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('r'));
+        for draft in ["", "   ", " \u{a0} "] {
+            app.draft = draft.to_owned();
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(
+                app.mode,
+                Mode::Compose {
+                    scroll: 0,
+                    restore: 0
+                },
+                "{draft:?}"
+            );
+            assert_eq!(app.draft, draft, "kept: {draft:?}");
+            assert_eq!(app.posts[0].comments.len(), 2, "{draft:?}");
+            assert_eq!(app.posts[0].comment_count, 0, "{draft:?}");
+            assert_eq!((app.status, &app.thread.focus), (None, &None));
+        }
+    }
+
+    #[test]
+    fn a_top_level_comment_goes_first_and_is_yours() {
+        let mut app = thread_sample();
+        app.posts[0].comment_count = 40;
+        press(&mut app, KeyCode::Enter);
+        press_str(&mut app, "jj");
+        post_comment(&mut app, "  Nice thread!  ");
+        assert_eq!(app.mode, Mode::Post { scroll: 2 });
+        assert_yours(at(&app, &[0]), "Nice thread!");
+        assert_eq!(
+            visible_authors(&app),
+            ["you", "a", "b", "c", "d", "e", "f", "g"]
+        );
+        assert_eq!(app.posts[0].comment_count, 41);
+        assert_eq!(app.thread.focus, Some(vec![0]));
+        assert!(app.thread.reveal, "scrolled into view once");
+        assert_eq!(app.status, Some("Comment posted"));
+        assert!(app.draft.is_empty());
+
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!((at(&app, &[0]).score, at(&app, &[0]).vote), (0, Vote::None));
+        press(&mut app, KeyCode::Char('z'));
+        assert_eq!(
+            (at(&app, &[0]).score, at(&app, &[0]).vote),
+            (-1, Vote::Down)
+        );
+        assert_eq!(app.posts[0].score, 50, "the post's score is untouched");
+    }
+
+    #[test]
+    fn a_reply_goes_first_among_the_replies_and_takes_the_focus() {
+        let mut app = thread_sample();
+        press(&mut app, KeyCode::Enter);
+        press_str(&mut app, "nn");
+        assert_eq!(focused(&app), Some("b"));
+        app.thread.reveal = false;
+        post_comment(&mut app, "same here");
+        assert_yours(at(&app, &[0, 0, 0]), "same here");
+        assert_eq!(at(&app, &[0, 0, 1]).author, "c", "c moved down one");
+        assert_eq!(
+            visible_authors(&app),
+            ["a", "b", "you", "c", "d", "e", "f", "g"]
+        );
+        assert_eq!(app.thread.focus, Some(vec![0, 0, 0]));
+        assert!(app.thread.reveal);
+        assert_eq!(app.status, Some("Reply posted"));
+        assert_eq!(app.posts[0].comment_count, 1);
+
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(at(&app, &[0, 0, 0]).score, 0, "a clears your upvote");
+        assert_eq!(at(&app, &[0, 0, 1]).score, 30, "c untouched");
+    }
+
+    #[test]
+    fn replying_to_a_collapsed_comment_expands_it() {
+        let mut app = thread_sample();
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(visible_authors(&app), ["a", "f", "g"]);
+        post_comment(&mut app, "reply");
+        assert!(app.thread.collapsed.is_empty());
+        assert_eq!(
+            visible_authors(&app),
+            ["a", "you", "b", "c", "d", "e", "f", "g"]
+        );
+        assert_eq!(focused(&app), Some("you"));
+    }
+
+    /// Collapses the comments named in `authors`, by key presses, and ends
+    /// with nothing focused.
+    fn collapse(app: &mut App, authors: &[&str]) {
+        unfocus(app);
+        let mut done = Vec::new();
+        for _ in 0..20 {
+            press(app, KeyCode::Char('n'));
+            let author = focused(app).unwrap();
+            if authors.contains(&author) && !done.contains(&author) {
+                press(app, KeyCode::Enter);
+                done.push(author);
+            }
+        }
+        assert_eq!(done.len(), authors.len());
+        unfocus(app);
+    }
+
+    /// `Esc` when a comment is focused, so the post stays open.
+    fn unfocus(app: &mut App) {
+        if app.thread.focus.is_some() {
+            press(app, KeyCode::Esc);
+        }
+        assert_eq!(app.thread.focus, None);
+        assert!(matches!(app.mode, Mode::Post { .. }));
+    }
+
+    fn collapsed_authors(app: &App) -> Vec<&'static str> {
+        let comments = &app.posts[app.view[app.selected]].comments;
+        app.thread
+            .visible(comments)
+            .iter()
+            .filter(|s| s.collapsed)
+            .map(|s| s.comment.author)
+            .collect()
+    }
+
+    /// `n` from nothing to the end, then `p` back to the start.
+    /// Each step that moves the focus is recorded once: `n` and `p` stop at
+    /// the ends.
+    fn walk(app: &mut App) -> (Vec<&'static str>, Vec<&'static str>) {
+        unfocus(app);
+        let mut steps = |key: char| {
+            let mut seen: Vec<(CommentPath, &'static str)> = Vec::new();
+            for _ in 0..20 {
+                press(app, KeyCode::Char(key));
+                let step = (app.thread.focus.clone().unwrap(), focused(app).unwrap());
+                if seen.last() != Some(&step) {
+                    seen.push(step);
+                }
+            }
+            seen.into_iter()
+                .map(|(_, author)| author)
+                .collect::<Vec<_>>()
+        };
+        let forward = steps('n');
+        let back = steps('p');
+        (forward, back)
+    }
+
+    #[test]
+    fn a_top_level_insert_keeps_later_collapsed_comments_collapsed() {
+        let mut app = thread_sample();
+        press(&mut app, KeyCode::Enter);
+        // c (a descendant of a, a later sibling) and f (a later sibling).
+        collapse(&mut app, &["c", "f"]);
+        assert_eq!(visible_authors(&app), ["a", "b", "c", "e", "f"]);
+        post_comment(&mut app, "first");
+        let expected: HashSet<CommentPath> = [vec![1, 0, 0], vec![2]].into();
+        assert_eq!(
+            app.thread.collapsed, expected,
+            "shifted with their comments"
+        );
+        assert_eq!(visible_authors(&app), ["you", "a", "b", "c", "e", "f"]);
+        assert_eq!(collapsed_authors(&app), ["c", "f"]);
+
+        let (forward, back) = walk(&mut app);
+        assert_eq!(forward, ["you", "a", "b", "c", "e", "f"]);
+        assert_eq!(back, ["e", "c", "b", "a", "you"]);
+
+        // A vote lands on the comment meant: e, now at [1, 1].
+        press_str(&mut app, "nnnn");
+        assert_eq!(focused(&app), Some("e"));
+        press(&mut app, KeyCode::Char('z'));
+        assert_eq!(
+            (at(&app, &[1, 1]).author, at(&app, &[1, 1]).score),
+            ("e", 49)
+        );
+        for (path, author, score) in [
+            (vec![0], "you", 1),
+            (vec![1], "a", 10),
+            (vec![1, 0], "b", 20),
+            (vec![1, 0, 0], "c", 30),
+            (vec![1, 0, 0, 0], "d", 40),
+            (vec![2], "f", 60),
+            (vec![2, 0], "g", 70),
+        ] {
+            assert_eq!(
+                (at(&app, &path).author, at(&app, &path).score),
+                (author, score)
+            );
+        }
+    }
+
+    #[test]
+    fn a_deep_insert_keeps_later_collapsed_comments_collapsed() {
+        let mut app = thread_sample();
+        press(&mut app, KeyCode::Enter);
+        // b's descendant c, b's later sibling e, and f in another branch.
+        collapse(&mut app, &["c", "e", "f"]);
+        // Reply to a: the new reply goes before b and e.
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(focused(&app), Some("a"));
+        post_comment(&mut app, "nested");
+        let expected: HashSet<CommentPath> = [vec![0, 1, 0], vec![0, 2], vec![1]].into();
+        assert_eq!(app.thread.collapsed, expected);
+        assert_eq!(visible_authors(&app), ["a", "you", "b", "c", "e", "f"]);
+        assert_eq!(collapsed_authors(&app), ["c", "e", "f"]);
+
+        let (forward, back) = walk(&mut app);
+        assert_eq!(forward, ["a", "you", "b", "c", "e", "f"]);
+        assert_eq!(back, ["e", "c", "b", "you", "a"]);
+
+        // Expanding c (now at [0, 1, 0]) shows d under it, and a vote on d
+        // lands on d.
+        press_str(&mut app, "nnn");
+        assert_eq!(focused(&app), Some("c"));
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(focused(&app), Some("d"));
+        press(&mut app, KeyCode::Char('a'));
+        let d = at(&app, &[0, 1, 0, 0]);
+        assert_eq!((d.author, d.score, d.vote), ("d", 41, Vote::Up));
+        assert_eq!(at(&app, &[0, 1, 0]).score, 30, "c untouched");
+        assert_eq!(collapsed_authors(&app), ["e", "f"]);
+    }
+
+    #[test]
+    fn make_room_shifts_exactly_the_later_siblings_and_their_descendants() {
+        let mut thread = Thread {
+            focus: Some(vec![1, 2, 0]),
+            collapsed: [
+                vec![0],
+                vec![1],
+                vec![1, 1],
+                vec![1, 2],
+                vec![1, 2, 5],
+                vec![1, 3, 0, 0],
+                vec![2, 2],
+            ]
+            .into(),
+            reveal: false,
+        };
+        thread.make_room(&[1, 2]);
+        let expected: HashSet<CommentPath> = [
+            vec![0],
+            vec![1],
+            vec![1, 1],
+            vec![1, 3],
+            vec![1, 3, 5],
+            vec![1, 4, 0, 0],
+            vec![2, 2],
+        ]
+        .into();
+        assert_eq!(thread.collapsed, expected);
+        assert_eq!(thread.focus, Some(vec![1, 3, 0]));
+    }
+
+    #[test]
+    fn replying_works_without_seeded_comments_and_to_your_own_comments() {
+        let mut app = sample();
+        press(&mut app, KeyCode::Enter);
+        assert!(app.posts[app.view[0]].comments.is_empty());
+        post_comment(&mut app, "first!");
+        assert_yours(at(&app, &[0]), "first!");
+        assert_eq!(app.status, Some("Comment posted"));
+        // Replies to your own comment, then to that reply, at any depth.
+        for depth in 1..5 {
+            post_comment(&mut app, &format!("depth {depth}"));
+            let path = vec![0; depth + 1];
+            assert_yours(at(&app, &path), &format!("depth {depth}"));
+            assert_eq!(app.thread.focus, Some(path));
+            assert_eq!(app.status, Some("Reply posted"));
+        }
+        assert_eq!(app.posts[app.view[0]].comment_count, 5);
+        assert_eq!(
+            walk(&mut app).0,
+            ["you"; 5],
+            "n walks all five of your comments"
+        );
+        // A second top-level comment goes before the first.
+        unfocus(&mut app);
+        post_comment(&mut app, "second");
+        assert_eq!(at(&app, &[0]).body, "second");
+        assert_eq!(at(&app, &[1]).body, "first!");
+        assert_eq!(at(&app, &[1, 0]).body, "depth 1");
+    }
+
+    #[test]
+    fn replying_works_on_a_hidden_post() {
+        let mut app = thread_sample();
+        press(&mut app, KeyCode::Char('h'));
+        go_to(&mut app, Feed::Hidden);
+        assert_eq!(titles(&app), ["thread"]);
+        press(&mut app, KeyCode::Enter);
+        press_str(&mut app, "nnnnn");
+        assert_eq!(focused(&app), Some("e"));
+        post_comment(&mut app, "hidden reply");
+        assert_yours(at(&app, &[0, 1, 0]), "hidden reply");
+        assert_eq!(app.status, Some("Reply posted"));
+        assert!(app.posts[0].hidden);
+    }
+
+    #[test]
+    fn a_submit_drops_the_last_frames_click_regions() {
+        let mut app = thread_sample();
+        press(&mut app, KeyCode::Enter);
+        app.hits = Some(Hits {
+            regions: vec![(Rect::new(0, 0, 100, 100), Target::Comment(vec![1]))],
+            max_scroll: 0,
+        });
+        post_comment(&mut app, "x");
+        assert_eq!(app.hits.as_ref().map(|h| h.regions.len()), Some(0));
+        // A click before the next frame hits nothing, so the focus stays.
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 1, 1);
+        assert_eq!(app.thread.focus, Some(vec![0]));
+    }
+
+    #[test]
+    fn modified_keys_are_not_typed_into_the_draft() {
+        let mut app = thread_sample();
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Char('r'));
+        press_str(&mut app, "ab");
+        let mode = app.mode;
+        let before = format!("{:?}", (&app.posts, &app.thread));
+        let ctrl = KeyModifiers::CONTROL;
+        let alt = KeyModifiers::ALT;
+        for (code, modifiers) in [
+            (KeyCode::Char('w'), ctrl),
+            (KeyCode::Char('u'), ctrl),
+            (KeyCode::Char('x'), alt),
+            (KeyCode::Char('q'), alt),
+            (KeyCode::Char('a'), ctrl | alt),
+            (KeyCode::Char('W'), ctrl | KeyModifiers::SHIFT),
+            (KeyCode::Char('j'), KeyModifiers::SUPER),
+            (KeyCode::Backspace, ctrl),
+            (KeyCode::Backspace, alt),
+            (KeyCode::Enter, ctrl),
+            (KeyCode::Enter, alt),
+            (KeyCode::Esc, alt),
+        ] {
+            app.on_key(KeyEvent::new(code, modifiers));
+            let why = format!("{modifiers:?} {code:?}");
+            assert_eq!((app.draft.as_str(), app.mode), ("ab", mode), "{why}");
+            assert_eq!(format!("{:?}", (&app.posts, &app.thread)), before, "{why}");
+            assert!(!app.should_quit, "{why}");
+        }
+        // Shift is how capitals and symbols arrive, so it is typed.
+        for ch in ['A', '?', 'Ñ'] {
+            app.on_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::SHIFT));
+        }
+        assert_eq!(app.draft, "abA?Ñ");
+        app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::SHIFT));
+        assert_eq!(app.draft, "abA?");
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), ctrl));
+        assert!(app.should_quit, "Ctrl-C still quits");
+        assert_eq!(app.draft, "abA?");
+
+        // Search mode is unchanged: a Ctrl or Alt chord is still typed as its
+        // letter there (a known limitation, see PLAN.md).
+        let mut app = thread_sample();
+        press(&mut app, KeyCode::Char('/'));
+        app.on_key(KeyEvent::new(KeyCode::Char('w'), ctrl));
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), alt));
+        assert_eq!((app.mode, app.query.as_str()), (Mode::Search, "wx"));
+    }
+
+    #[test]
+    fn opening_asks_for_a_reveal_and_esc_restores_the_old_scroll_even_before_a_frame() {
+        let mut app = thread_sample();
+        press(&mut app, KeyCode::Enter);
+        press_str(&mut app, "jjjn");
+        app.thread.reveal = false;
+        press(&mut app, KeyCode::Char('r'));
+        assert_eq!(
+            app.mode,
+            Mode::Compose {
+                scroll: 3,
+                restore: 3
+            }
+        );
+        assert!(app.thread.reveal, "the renderer keeps the header in view");
+        // As if a frame had scrolled the shrunk viewport.
+        app.mode = Mode::Compose {
+            scroll: 7,
+            restore: 3,
+        };
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.mode, Mode::Post { scroll: 3 });
+        assert!(!app.thread.reveal, "no reveal left to move it");
+
+        // A submit carries the composer's scroll on and reveals the reply.
+        press(&mut app, KeyCode::Char('r'));
+        app.mode = Mode::Compose {
+            scroll: 7,
+            restore: 3,
+        };
+        press_str(&mut app, "hi");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.mode, Mode::Post { scroll: 7 });
+        assert!(app.thread.reveal);
     }
 }
