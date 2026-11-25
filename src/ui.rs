@@ -39,6 +39,9 @@ const PERIWINKLE: Color = Color::Rgb(113, 147, 255);
 const DIM: Color = Color::Rgb(129, 131, 132);
 const BORDER: Color = Color::Rgb(52, 53, 54);
 const HIGHLIGHT_BG: Color = Color::Rgb(39, 39, 41);
+/// The title of a post you've opened: the dim grey of the meta, not bold,
+/// against the bold white of an unread title, like a visited link on Reddit.
+const READ_TITLE: Style = Style::new().fg(DIM);
 
 const NAV_WIDTH: u16 = 22;
 const SIDEBAR_WIDTH: u16 = 32;
@@ -411,6 +414,7 @@ const HELP: [(Section, &str, &[HelpRow]); 8] = [
             (&["a/z"], "upvote / downvote, again to undo"),
             (&["s"], "save / unsave"),
             (&["h"], "hide / unhide (hidden posts are in Hidden)"),
+            (&["m"], "mark read / unread (opening marks it read)"),
             (&["J"], "join / leave the group, on a group feed"),
             (&["v"], "switch between the Card and Compact views"),
             (&["c"], "copy the post's link"),
@@ -437,6 +441,7 @@ const HELP: [(Section, &str, &[HelpRow]); 8] = [
             (&["r"], "reply to the focused comment, or the post"),
             (&["enter"], "collapse / expand the focused comment"),
             (&["s"], "save / unsave the post"),
+            (&["m"], "mark the post read / unread"),
             (&["c"], "copy the post's link"),
             (&["/"], "find in comments, editing an active find"),
             (&["esc"], "clear the find, unfocus, or back to the feed"),
@@ -450,6 +455,10 @@ const HELP: [(Section, &str, &[HelpRow]); 8] = [
         &[
             (&["type"], "filter as you type: q, j, ? and digits too"),
             (&["w/ u/ flair:"], "narrow to a group, author or flair"),
+            (
+                &["is:read/unread"],
+                "only posts you've opened / haven't opened",
+            ),
             (&["Backspace"], "delete a character"),
             (&["enter"], "keep the search, back to the feed"),
             (&["esc"], "clear the search, back to the feed"),
@@ -507,7 +516,10 @@ const HELP: [(Section, &str, &[HelpRow]); 8] = [
     (
         Section::Anywhere,
         "Anywhere",
-        &[(&["Ctrl-C"], "quit, saving votes, saves, hides and groups")],
+        &[(
+            &["Ctrl-C"],
+            "quit, saving votes, saves, hides, reads and groups",
+        )],
     ),
 ];
 
@@ -1141,7 +1153,11 @@ fn render_card(
     }
 
     let width = usize::from(content.width.saturating_sub(2));
-    let title_style = Style::new().fg(Color::White).bold();
+    let title_style = if post.read {
+        READ_TITLE
+    } else {
+        Style::new().fg(Color::White).bold()
+    };
     let lines: Vec<Line> = std::iter::once(meta_line(app, post, width))
         .chain(highlight_rows(
             post.title,
@@ -1273,9 +1289,14 @@ fn compact_row(app: &App, post: &Post, selected: bool, width: usize) -> (Line<'s
         (truncate(&title, room), room.saturating_sub(1))
     };
     let shown_len = shown.chars().count();
-    let title_style = Style::new()
-        .fg(if selected { ORANGE } else { Color::White })
-        .bold();
+    // The selected row's title stays orange, read or not, as the row's mark
+    // along with its background; a read one only loses its bold.
+    let title_style = match (selected, post.read) {
+        (true, false) => Style::new().fg(ORANGE).bold(),
+        (true, true) => Style::new().fg(ORANGE),
+        (false, false) => Style::new().fg(Color::White).bold(),
+        (false, true) => READ_TITLE,
+    };
     let line = highlight_rows(
         post.title,
         &app.search.highlights(post.title),
@@ -2363,6 +2384,8 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         let plain_post = buffer(&mut app, 110, 24);
         press(&mut app, KeyCode::Esc);
+        // Opening marked it read, which mutes its title; back to unread.
+        press(&mut app, KeyCode::Char('m'));
 
         press(&mut app, KeyCode::Char('/'));
         type_str(&mut app, "W/eng u/ flair:");
@@ -6149,5 +6172,283 @@ mod tests {
             press(&mut app, KeyCode::Char('n'));
             buffer(&mut app, width, height);
         }
+    }
+
+    // ---- Read posts ----
+
+    /// Every cell where `read` and `unread` differ has the same symbol, and
+    /// is a title cell: `READ_TITLE` (or the selected row's non-bold orange)
+    /// in `read`, bold in `unread`. Returns how many there are.
+    fn only_titles_differ(read: &Buffer, unread: &Buffer) -> usize {
+        let mut differ = 0;
+        for y in 0..read.area.height {
+            for x in 0..read.area.width {
+                let (r, u) = (&read[(x, y)], &unread[(x, y)]);
+                if r == u {
+                    continue;
+                }
+                differ += 1;
+                assert_eq!(r.symbol(), u.symbol(), "({x}, {y})");
+                assert_eq!(r.bg, u.bg, "({x}, {y}): the background stays");
+                assert!(!r.modifier.contains(Modifier::BOLD), "({x}, {y})");
+                assert!(u.modifier.contains(Modifier::BOLD), "({x}, {y})");
+                assert!(
+                    (r.fg, u.fg) == (DIM, Color::White) || (r.fg, u.fg) == (ORANGE, ORANGE),
+                    "({x}, {y}): {:?} vs {:?}",
+                    r.fg,
+                    u.fg
+                );
+            }
+        }
+        differ
+    }
+
+    fn unread_all(app: &App) -> App {
+        let mut unread = App::new();
+        unread.posts = app.posts.clone();
+        unread.posts.iter_mut().for_each(|p| p.read = false);
+        unread.view = app.view.clone();
+        unread.selected = app.selected;
+        unread.density = app.density;
+        unread.query = app.query.clone();
+        unread.search = app.search.clone();
+        unread
+    }
+
+    #[test]
+    fn a_read_title_is_muted_on_cards_and_the_selected_card_still_stands_out() {
+        let mut app = App::new();
+        // The first Home post read with `m`, the second by opening it, and
+        // the second selected. The third stays unread.
+        press(&mut app, KeyCode::Char('m'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.selected, 1);
+        let buf = buffer(&mut app, 110, 40);
+        let read_style = |x: u16, y: u16| {
+            let cell = &buf[(x, y)];
+            (cell.fg, cell.modifier.contains(Modifier::BOLD))
+        };
+        for (i, read) in [(0, true), (1, true), (2, false)] {
+            let title = title_of(&app, i);
+            let (x, y) = find(&buf, &title);
+            for dx in 0..20 {
+                let want = if read {
+                    (DIM, false)
+                } else {
+                    (Color::White, true)
+                };
+                assert_eq!(read_style(x + dx, y), want, "card {i}, x {}", x + dx);
+            }
+            // The selected card keeps its orange border and highlighted vote
+            // column, read or not.
+            let border = (x - 8, y);
+            assert_eq!(buf[border].symbol(), "│");
+            let (border_fg, votes_bg) = if i == 1 {
+                (ORANGE, HIGHLIGHT_BG)
+            } else {
+                (BORDER, Color::Reset)
+            };
+            assert_eq!(buf[border].fg, border_fg, "card {i}");
+            assert_eq!(buf[(x - 4, y)].bg, votes_bg, "card {i}");
+        }
+        // Meta, vote column, preview and action row are as unread.
+        let unread = buffer(&mut unread_all(&app), 110, 40);
+        assert!(only_titles_differ(&buf, &unread) > 40);
+        assert_eq!(app.posts.iter().filter(|p| p.read).count(), 2);
+
+        // The post view doesn't change.
+        press(&mut app, KeyCode::Enter);
+        let post = buffer(&mut app, 110, 24);
+        let mut unread = unread_all(&app);
+        unread.mode = app.mode;
+        assert_eq!(post, buffer(&mut unread, 110, 24));
+    }
+
+    #[test]
+    fn a_read_title_is_muted_on_compact_rows_and_the_selected_row_still_stands_out() {
+        let mut app = compact_app();
+        press(&mut app, KeyCode::Char('m'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Esc);
+        app.status = None;
+        let buf = buffer(&mut app, 140, 30);
+        let style = |x: u16, y: u16| {
+            let cell = &buf[(x, y)];
+            (cell.fg, cell.bg, cell.modifier.contains(Modifier::BOLD))
+        };
+        // Rows 6, 7 and 8 hold the first three posts, titles from column 35.
+        for x in 35..60 {
+            assert_eq!(style(x, 6), (DIM, Color::Reset, false), "read, x {x}");
+            assert_eq!(
+                style(x, 7),
+                (ORANGE, HIGHLIGHT_BG, false),
+                "selected and read: orange on the highlight, not bold, x {x}"
+            );
+            assert_eq!(
+                style(x, 8),
+                (Color::White, Color::Reset, true),
+                "unread, x {x}"
+            );
+        }
+        for x in 22..108 {
+            assert_eq!(
+                buf[(x, 7)].bg,
+                HIGHLIGHT_BG,
+                "the whole selected row, x {x}"
+            );
+        }
+        let unread = buffer(&mut unread_all(&app), 140, 30);
+        assert!(only_titles_differ(&buf, &unread) > 40);
+
+        // Selecting the unread row: orange and bold, as before.
+        press(&mut app, KeyCode::Char('j'));
+        let buf = buffer(&mut app, 140, 30);
+        assert_eq!(buf[(35, 8)].fg, ORANGE);
+        assert!(buf[(35, 8)].modifier.contains(Modifier::BOLD));
+        assert_eq!((buf[(35, 7)].fg, buf[(35, 7)].bg), (DIM, Color::Reset));
+    }
+
+    #[test]
+    fn search_highlights_show_in_a_read_title() {
+        let mut app = one_post("Old huge post", "Nothing to see.");
+        press(&mut app, KeyCode::Char('m'));
+        press(&mut app, KeyCode::Char('/'));
+        type_str(&mut app, "HUGE is:read");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.view, [0]);
+        for density in [Density::Card, Density::Compact] {
+            app.density = density;
+            let buf = buffer(&mut app, 60, 20);
+            let (x, y) = find(&buf, "Old huge post");
+            assert_eq!(hits(&buf, x, y, 13), "....^^^^.....", "{density:?}");
+            // The selected row's title is orange; a card's read title is dim.
+            let plain = if density == Density::Card {
+                DIM
+            } else {
+                ORANGE
+            };
+            for dx in [0, 3, 8, 12] {
+                assert_eq!(buf[(x + dx, y)].fg, plain, "{density:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn clicking_a_card_or_a_compact_row_marks_it_read_and_mutes_its_title() {
+        let mut app = App::new();
+        let buf = buffer(&mut app, 110, 24);
+        let title = title_of(&app, 1);
+        let (x, y) = find(&buf, &title);
+        click(&mut app, (x + 3, y));
+        assert_eq!((app.mode, app.selected), (Mode::Post { scroll: 0 }, 1));
+        assert!(app.posts[app.view[1]].read);
+        press(&mut app, KeyCode::Esc);
+        let buf = buffer(&mut app, 110, 24);
+        assert_eq!(buf[(x + 3, y)].fg, DIM);
+
+        // A card's ▲ and Save don't mark it.
+        let first = app.view[0];
+        let (x, y) = find(&buf, &title_of(&app, 0));
+        click(&mut app, (glyph_x(&buf, "▲", x - 8, y - 1), y - 1));
+        assert_eq!(app.posts[first].vote, Vote::Up);
+        let buf = buffer(&mut app, 110, 24);
+        click(&mut app, find(&buf, "☆ Save   ···"));
+        assert!(app.posts[first].saved);
+        assert!(!app.posts[first].read && app.mode == Mode::Feed);
+
+        let mut app = compact_app();
+        let buf = buffer(&mut app, 110, 24);
+        let (_, y) = find(&buf, &title_of(&app, 2));
+        // ▲ and ☆ select and act without marking it.
+        click(&mut app, (glyph_x(&buf, "▲", 22, y), y));
+        let buf = buffer(&mut app, 110, 24);
+        click(&mut app, (glyph_x(&buf, "☆", 22, y), y));
+        let i = app.view[2];
+        assert_eq!((app.posts[i].vote, app.posts[i].saved), (Vote::Up, true));
+        assert!(!app.posts[i].read);
+        let buf = buffer(&mut app, 110, 24);
+        click(&mut app, (75, y));
+        assert_eq!((app.mode, app.selected), (Mode::Post { scroll: 0 }, 2));
+        assert!(app.posts[i].read);
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('k'));
+        let buf2 = buffer(&mut app, 110, 24);
+        let (x, _) = find(&buf, &title_of(&app, 2));
+        assert_eq!(buf2[(x, y)].fg, DIM, "muted once it isn't selected");
+    }
+
+    #[test]
+    fn clicking_a_cards_arrows_or_save_never_marks_it_read() {
+        // Cards: the second Home card's ▲, ▼ (flipping, then clearing),
+        // ☆ Save and ★ Saved, rendering between clicks as the event loop does.
+        let mut app = App::new();
+        let i = app.view[1];
+        let base = app.posts[i].score;
+        let card = |app: &mut App| {
+            let buf = buffer(app, 110, 30);
+            let (x, y) = find(&buf, &title_of(app, 1));
+            let up = (glyph_x(&buf, "▲", x - 8, y - 1), y - 1);
+            let down = (glyph_x(&buf, "▼", x - 8, y + 1), y + 1);
+            // The second card's action row: the second Save label on screen.
+            let save = find_all(&buf, "Save")
+                .into_iter()
+                .filter(|&(sx, _)| sx > x)
+                .nth(1)
+                .expect("the second card's Save label");
+            (buf, up, down, (save.0 - 2, save.1))
+        };
+        for (what, at, vote, score, saved) in [
+            ("▲", 0, Vote::Up, base + 1, false),
+            ("▼", 1, Vote::Down, base - 1, false),
+            ("▼ again", 1, Vote::None, base, false),
+            ("☆ Save", 2, Vote::None, base, true),
+            ("★ Saved", 2, Vote::None, base, false),
+        ] {
+            let (_, up, down, save) = card(&mut app);
+            click(&mut app, [up, down, save][at]);
+            let post = &app.posts[i];
+            assert_eq!(
+                (app.mode, app.selected, post.vote, post.score, post.saved),
+                (Mode::Feed, 1, vote, score, saved),
+                "card {what}"
+            );
+            assert!(!post.read, "card {what} doesn't mark it read");
+        }
+        // The control: a click on the card itself opens it and marks it.
+        let (buf, ..) = card(&mut app);
+        let title = find(&buf, &title_of(&app, 1));
+        click(&mut app, title);
+        assert_eq!(app.mode, Mode::Post { scroll: 0 });
+        assert!(app.posts[i].read);
+
+        // Compact rows: the third row's ▲, ▼, ☆ and ★.
+        let mut app = compact_app();
+        let i = app.view[2];
+        let base = app.posts[i].score;
+        for (what, glyph, vote, score, saved) in [
+            ("▲", "▲", Vote::Up, base + 1, false),
+            ("▼", "▼", Vote::Down, base - 1, false),
+            ("☆", "☆", Vote::Down, base - 1, true),
+            ("★", "★", Vote::Down, base - 1, false),
+        ] {
+            let buf = buffer(&mut app, 110, 24);
+            let (_, y) = find(&buf, &title_of(&app, 2));
+            click(&mut app, (glyph_x(&buf, glyph, 22, y), y));
+            let post = &app.posts[i];
+            assert_eq!(
+                (app.mode, app.selected, post.vote, post.score, post.saved),
+                (Mode::Feed, 2, vote, score, saved),
+                "row {what}"
+            );
+            assert!(!post.read, "row {what} doesn't mark it read");
+        }
+        let buf = buffer(&mut app, 110, 24);
+        let (_, y) = find(&buf, &title_of(&app, 2));
+        click(&mut app, (75, y));
+        assert_eq!(app.mode, Mode::Post { scroll: 0 });
+        assert!(app.posts[i].read);
     }
 }

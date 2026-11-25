@@ -465,12 +465,15 @@ pub(crate) struct Query {
     pub groups: Vec<String>,
     pub authors: Vec<String>,
     pub flairs: Vec<String>,
+    /// `is:` values. Only `read` and `unread` match a post; any other value
+    /// matches none.
+    pub states: Vec<String>,
 }
 
 impl Query {
     /// Splits on whitespace outside double quotes; an unclosed quote runs to
-    /// the end. An unquoted term starting with `w/`, `u/` or `flair:` (in any
-    /// case) is a filter on the rest of it. Terms and filter values that are
+    /// the end. An unquoted term starting with `w/`, `u/`, `flair:` or `is:`
+    /// (in any case) is a filter on the rest of it. Terms and filter values that are
     /// empty or only whitespace (`""`, `" "`, `w/`) are dropped; others keep
     /// any leading or trailing space.
     pub(crate) fn parse(input: &str) -> Query {
@@ -497,6 +500,7 @@ impl Query {
                 ("w/", &mut query.groups),
                 ("u/", &mut query.authors),
                 ("flair:", &mut query.flairs),
+                ("is:", &mut query.states),
             ]
             .into_iter()
             .filter(|_| !starts_quoted)
@@ -522,6 +526,7 @@ impl Query {
             && self.groups.is_empty()
             && self.authors.is_empty()
             && self.flairs.is_empty()
+            && self.states.is_empty()
     }
 
     pub(crate) fn matches(&self, post: &Post, group: &str) -> bool {
@@ -532,7 +537,15 @@ impl Query {
                     values.iter().any(|v| field.starts_with(v.as_str()))
                 })
         };
-        if !(starts_with(&self.groups, Some(group))
+        // `is:` values are whole words, not prefixes: `is:re` is no `is:read`.
+        let state = self.states.is_empty()
+            || self.states.iter().any(|v| match v.as_str() {
+                "read" => post.read,
+                "unread" => !post.read,
+                _ => false,
+            });
+        if !(state
+            && starts_with(&self.groups, Some(group))
             && starts_with(&self.authors, Some(post.author))
             && starts_with(&self.flairs, post.flair))
         {
@@ -735,7 +748,12 @@ impl App {
         }
     }
 
+    /// Opens the selected post, which marks it read. Nothing is rebuilt, so
+    /// with `is:unread` kept its card is still there when you go back.
     fn open_post(&mut self) {
+        if let Some(&i) = self.view.get(self.selected) {
+            self.posts[i].read = true;
+        }
         self.thread = Thread::default();
         self.find = None;
         self.mode = Mode::Post { scroll: 0 };
@@ -831,6 +849,22 @@ impl App {
         };
         self.thread.show(&matches[i]);
         self.match_toast = Some((i + 1, n));
+    }
+
+    /// Marks the selected (or open) post read or unread. Like a vote or an
+    /// unsave, it never rebuilds `view`, so the card stays under the cursor
+    /// even when it no longer matches a kept `is:` filter.
+    fn toggle_read(&mut self) {
+        let Some(&i) = self.view.get(self.selected) else {
+            return;
+        };
+        let post = &mut self.posts[i];
+        post.read = !post.read;
+        self.status = Some(if post.read {
+            "Marked read"
+        } else {
+            "Marked unread"
+        });
     }
 
     fn step_focus(&mut self, forward: bool) {
@@ -1222,6 +1256,7 @@ impl App {
             KeyCode::Char('z') => self.vote(Vote::Down),
             KeyCode::Char('s') => self.toggle_save(),
             KeyCode::Char('h') => self.toggle_hide(),
+            KeyCode::Char('m') => self.toggle_read(),
             KeyCode::Char('J') => self.toggle_join(),
             KeyCode::Char('v') => self.toggle_density(),
             KeyCode::Char('c') => self.status = Some("Link copied to clipboard!"),
@@ -1329,6 +1364,10 @@ impl App {
             }
             KeyCode::Char('s') => {
                 self.toggle_save();
+                scroll
+            }
+            KeyCode::Char('m') => {
+                self.toggle_read();
                 scroll
             }
             KeyCode::Char('c') => {
@@ -4010,5 +4049,299 @@ mod tests {
         press(&mut app, KeyCode::Backspace);
         assert_eq!(focused(&app), Some("dave"));
         assert_eq!(app.thread.collapsed, [vec![1]].into());
+    }
+
+    // ---- Read posts ----
+
+    /// The titles of the read posts, in seed order.
+    fn read_titles(app: &App) -> Vec<&'static str> {
+        app.posts
+            .iter()
+            .filter(|p| p.read)
+            .map(|p| p.title)
+            .collect()
+    }
+
+    fn click_target(app: &mut App, target: Target) {
+        app.hits = Some(Hits {
+            regions: vec![(Rect::new(0, 0, 100, 100), target)],
+            max_scroll: 0,
+        });
+        mouse(app, MouseEventKind::Down(MouseButton::Left), 1, 1);
+    }
+
+    #[test]
+    fn every_post_starts_unread() {
+        assert!(App::new().posts.iter().all(|p| !p.read));
+        assert!(read_titles(&sample()).is_empty());
+    }
+
+    #[test]
+    fn opening_a_post_marks_it_read_and_nothing_else_does() {
+        let mut app = sample();
+        assert_eq!(titles(&app), ["mid", "old huge", "fresh small"]);
+        // Selecting, voting, saving, sharing, scrolling past, the wheel and
+        // the view toggle.
+        press_str(&mut app, "jazasckjjgGv");
+        press(&mut app, KeyCode::PageDown);
+        press(&mut app, KeyCode::PageUp);
+        mouse(&mut app, MouseEventKind::ScrollDown, 0, 0);
+        click_target(&mut app, Target::Vote(1, Vote::Up));
+        click_target(&mut app, Target::Save(2));
+        assert_eq!(read_titles(&app), Vec::<&str>::new());
+        // Hiding, and unhiding in Hidden.
+        press_str(&mut app, "gh");
+        assert_eq!(titles(&app), ["old huge", "fresh small"]);
+        go_to(&mut app, Feed::Hidden);
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(read_titles(&app), Vec::<&str>::new());
+
+        let mut app = sample();
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(read_titles(&app), ["old huge"]);
+        press_str(&mut app, "jnpaszc");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(
+            read_titles(&app),
+            ["old huge"],
+            "going back changes nothing"
+        );
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('q'));
+        assert_eq!(
+            read_titles(&app),
+            ["old huge"],
+            "opening again keeps it read"
+        );
+
+        // In the Compact view, with a kept search, on another feed.
+        press(&mut app, KeyCode::Char('v'));
+        press(&mut app, KeyCode::Char('/'));
+        press_str(&mut app, "mid");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(read_titles(&app), ["old huge", "mid"]);
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Esc);
+        go_to(&mut app, Feed::Group(1));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(read_titles(&app), ["old huge", "other group", "mid"]);
+    }
+
+    #[test]
+    fn clicking_a_card_or_row_marks_it_read() {
+        for density in [Density::Card, Density::Compact] {
+            let mut app = sample();
+            app.density = density;
+            click_target(&mut app, Target::Card(2));
+            assert_eq!(app.mode, Mode::Post { scroll: 0 });
+            assert_eq!(read_titles(&app), ["fresh small"], "{density:?}");
+            // A stale region opens nothing and marks nothing.
+            press(&mut app, KeyCode::Esc);
+            click_target(&mut app, Target::Card(7));
+            assert_eq!(read_titles(&app), ["fresh small"], "{density:?}");
+        }
+    }
+
+    #[test]
+    fn m_toggles_read_in_the_feed_and_the_post_view() {
+        let mut app = sample();
+        press(&mut app, KeyCode::Char('m'));
+        assert_eq!(app.status, Some("Marked read"));
+        assert_eq!(read_titles(&app), ["mid"]);
+        assert_eq!(app.mode, Mode::Feed, "m doesn't open the post");
+        press(&mut app, KeyCode::Char('m'));
+        assert_eq!(app.status, Some("Marked unread"));
+        assert_eq!(read_titles(&app), Vec::<&str>::new());
+
+        // Open, mark unread, go back: it stays unread.
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('m'));
+        assert_eq!(app.status, Some("Marked unread"));
+        assert_eq!(app.mode, Mode::Post { scroll: 1 }, "the scroll stays");
+        assert_eq!(read_titles(&app), Vec::<&str>::new());
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.mode, Mode::Feed);
+        assert_eq!(read_titles(&app), Vec::<&str>::new(), "Esc doesn't mark it");
+        // And back again with `m`, `q` and Backspace.
+        for back in [KeyCode::Char('q'), KeyCode::Backspace] {
+            press(&mut app, KeyCode::Enter);
+            press(&mut app, KeyCode::Char('m'));
+            press(&mut app, back);
+            assert_eq!(app.mode, Mode::Feed);
+            assert_eq!(read_titles(&app), Vec::<&str>::new(), "{back:?}");
+        }
+        assert!(!app.should_quit);
+
+        // With a comment focused, `m` still acts on the post.
+        let mut app = thread_sample();
+        press(&mut app, KeyCode::Enter);
+        press_str(&mut app, "nn");
+        assert_eq!(focused(&app), Some("b"));
+        press(&mut app, KeyCode::Char('m'));
+        assert_eq!(app.status, Some("Marked unread"));
+        assert_eq!(focused(&app), Some("b"));
+        press(&mut app, KeyCode::Char('m'));
+        assert_eq!(app.status, Some("Marked read"));
+        assert!(app.posts[0].read);
+    }
+
+    #[test]
+    fn m_does_nothing_in_an_empty_feed() {
+        let mut app = sample();
+        go_to(&mut app, Feed::Saved);
+        assert!(app.view.is_empty());
+        press(&mut app, KeyCode::Char('m'));
+        assert_eq!(app.status, None);
+        assert_eq!(read_titles(&app), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn m_is_typed_in_search_the_composer_and_the_find_bar_and_swallowed_by_the_help() {
+        let mut app = sample();
+        press(&mut app, KeyCode::Char('/'));
+        press_str(&mut app, "m");
+        assert_eq!((app.mode, app.query.as_str()), (Mode::Search, "m"));
+        assert_eq!((app.status, read_titles(&app)), (None, vec![]));
+        assert_eq!(titles(&app), ["mid", "fresh small"], "a live search for m");
+
+        let mut app = thread_sample();
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('m'));
+        assert!(!app.posts[0].read);
+        press_str(&mut app, "rmm");
+        assert!(matches!(app.mode, Mode::Compose { .. }));
+        assert_eq!(app.draft, "mm");
+        assert_eq!((app.status, app.posts[0].read), (None, false));
+        press(&mut app, KeyCode::Esc);
+        press_str(&mut app, "/mm");
+        assert!(matches!(app.mode, Mode::Find { .. }));
+        assert_eq!(app.find.as_ref().map(|find| find.text.as_str()), Some("mm"));
+        assert_eq!((app.status, app.posts[0].read), (None, false));
+
+        let mut app = sample();
+        press_str(&mut app, "?m");
+        assert_eq!((app.status, read_titles(&app)), (None, vec![]));
+        assert!(app.help.is_some());
+        press(&mut app, KeyCode::Char('q'));
+        press(&mut app, KeyCode::Enter);
+        press_str(&mut app, "?m");
+        assert_eq!(app.mode, Mode::Post { scroll: 0 });
+        assert_eq!((app.status, read_titles(&app)), (None, vec!["mid"]));
+    }
+
+    /// Four posts, the first two read: "read one", "read two", "fresh",
+    /// "eng new", the last in group 1.
+    fn read_sample() -> App {
+        let mut posts = vec![
+            post(0, 400, 1, "read one"),
+            post(0, 300, 1, "read two"),
+            post(0, 200, 1, "fresh"),
+            post(1, 100, 1, "eng new"),
+        ];
+        posts[0].read = true;
+        posts[1].read = true;
+        App::with_data(vec![group("Food", true), group("Engineering", true)], posts)
+    }
+
+    fn read_searched(query: &str) -> Vec<&'static str> {
+        let mut app = read_sample();
+        press(&mut app, KeyCode::Char('/'));
+        press_str(&mut app, query);
+        titles(&app)
+    }
+
+    #[test]
+    fn is_filters_keep_read_or_unread_posts() {
+        let all = ["read one", "read two", "fresh", "eng new"];
+        assert_eq!(read_searched("is:read"), ["read one", "read two"]);
+        assert_eq!(read_searched("is:unread"), ["fresh", "eng new"]);
+        assert_eq!(read_searched("IS:Unread"), ["fresh", "eng new"]);
+        assert_eq!(read_searched(r#"is:"read""#), ["read one", "read two"]);
+        assert_eq!(read_searched(r#"Is:"UNREAD"#), ["fresh", "eng new"]);
+        assert_eq!(read_searched("is:"), all, "an empty value is ignored");
+        assert_eq!(read_searched(r#"is:"""#), all);
+        assert_eq!(read_searched(r#"is:" ""#), all);
+        for value in ["is:foo", "is:saved", "is:re", "is:reads", r#"is:" read""#] {
+            assert!(read_searched(value).is_empty(), "{value}");
+        }
+        assert_eq!(read_searched("is:read is:unread"), all, "ORed");
+        assert_eq!(read_searched("is:unread is:foo"), ["fresh", "eng new"]);
+        assert_eq!(read_searched("is:unread w/eng"), ["eng new"], "ANDed");
+        assert_eq!(read_searched("is:read w/eng"), Vec::<&str>::new());
+        assert_eq!(read_searched("is:read two"), ["read two"]);
+        // Quoted, it is a phrase: no post says "is:read".
+        assert!(read_searched(r#""is:read""#).is_empty());
+
+        let q = Query::parse(r#"IS:Read is:"unread" is: is:"" "is:x" two"#);
+        assert_eq!(q.states, ["read", "unread"]);
+        assert_eq!(q.text, ["is:x", "two"]);
+        assert!(
+            !Query::parse("is:foo").is_empty(),
+            "a filter, if one that matches nothing"
+        );
+        assert!(Query::parse(r#"is: is:"""#).is_empty());
+        // Filter values are never highlighted.
+        let q = Query::parse("is:read is:unread");
+        assert!(q.highlights("read unread is:read").iter().all(|&m| !m));
+        let q = Query::parse("is:read read");
+        assert_eq!(
+            q.highlights("is read"),
+            [false, false, false, true, true, true, true]
+        );
+    }
+
+    #[test]
+    fn with_is_unread_kept_opening_and_m_keep_the_card_until_the_next_rebuild() {
+        let mut app = read_sample();
+        press(&mut app, KeyCode::Char('/'));
+        press_str(&mut app, "is:unread");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(titles(&app), ["fresh", "eng new"]);
+
+        // Opening "eng new" and going back: still there, still selected.
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.posts[3].read);
+        assert_eq!(titles(&app), ["fresh", "eng new"]);
+        assert_eq!((app.mode, app.selected), (Mode::Feed, 1));
+
+        // `m` on "fresh": the same.
+        press(&mut app, KeyCode::Char('k'));
+        press(&mut app, KeyCode::Char('m'));
+        assert!(app.posts[2].read);
+        assert_eq!(titles(&app), ["fresh", "eng new"]);
+        assert_eq!(app.selected, 0);
+        // Marking it unread again doesn't rebuild either.
+        press_str(&mut app, "mm");
+        assert_eq!(titles(&app), ["fresh", "eng new"]);
+
+        // The next rebuild (a sort) drops them.
+        press(&mut app, KeyCode::Char('1'));
+        assert_eq!(titles(&app), Vec::<&str>::new());
+        assert_eq!(app.query, "is:unread", "the search is kept");
+
+        // With `is:read` kept, `m` marking unread keeps the card too, and
+        // so does the post view's `m`.
+        let mut app = read_sample();
+        press(&mut app, KeyCode::Char('/'));
+        press_str(&mut app, "is:read");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('m'));
+        press(&mut app, KeyCode::Char('k'));
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('m'));
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.posts[0].read && !app.posts[1].read);
+        assert_eq!(titles(&app), ["read one", "read two"]);
+        assert_eq!(app.selected, 0);
+        press(&mut app, KeyCode::Char(']'));
+        press(&mut app, KeyCode::Char('['));
+        assert_eq!(titles(&app), Vec::<&str>::new(), "a feed change rebuilds");
     }
 }

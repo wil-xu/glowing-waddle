@@ -1,5 +1,5 @@
-//! Votes, saves, hidden posts and group membership, kept between runs in a small text file
-//! (see Persistence in PLAN.md).
+//! Votes, saves, hidden posts, read posts and group membership, kept between runs in a
+//! small text file (see Persistence in PLAN.md).
 
 use std::collections::HashMap;
 use std::env;
@@ -19,13 +19,19 @@ use crate::app::CommentPath;
 use crate::data::Comment;
 use crate::data::Vote;
 
-/// The version line of a file with no `hidden` record. Builds from before
-/// hiding existed read only this one, so it is written whenever it can be.
+/// The version line of a file with no `hidden` or `read` record. Builds from
+/// before hiding existed read only this one, so it is written whenever it can
+/// be.
 const VERSION: &str = "workit-state 1";
 
-/// The version line of a file with at least one `hidden` record. An older
-/// build refuses it instead of dropping the records it doesn't know.
+/// The version line of a file with at least one `hidden` record and no `read`
+/// record. A build from before hiding refuses it instead of dropping the
+/// records it doesn't know, and one from before reading accepts it.
 const VERSION_HIDDEN: &str = "workit-state 2";
+
+/// The version line of a file with at least one `read` record. A build from
+/// before reading refuses it instead of dropping the `read` records.
+const VERSION_READ: &str = "workit-state 3";
 
 /// The largest state file loaded. Far above anything the seed can produce:
 /// every item in it changed is a few dozen KiB.
@@ -173,14 +179,16 @@ fn push_record<'a>(out: &mut String, fields: impl IntoIterator<Item = &'a str>) 
 
 /// The state file for `app`: the version line, then one record for each
 /// group whose `joined` differs from `seed_joined`, each saved post, each
-/// hidden post, and each post or comment with a vote, in seed order. The
-/// version is `VERSION_HIDDEN` when a `hidden` record is written, and
-/// `VERSION` otherwise.
+/// hidden post, each read post, and each post or comment with a vote, in
+/// seed order. The version is `VERSION_READ` when a `read` record is written,
+/// else `VERSION_HIDDEN` when a `hidden` record is, and `VERSION` otherwise:
+/// the oldest version that knows every record written.
 fn encode(app: &App, seed_joined: &[bool]) -> String {
     let items = items(app);
     let owners = owners(&items);
     let mut out = String::new();
     let mut any_hidden = false;
+    let mut any_read = false;
     for (key, item) in &items {
         if owners[key.as_slice()] != item {
             continue;
@@ -208,6 +216,10 @@ fn encode(app: &App, seed_joined: &[bool]) -> String {
                     record("hidden", None);
                     any_hidden = true;
                 }
+                if post.read {
+                    record("read", None);
+                    any_read = true;
+                }
                 post.vote
             }
             Item::Comment(i, path) => {
@@ -224,7 +236,13 @@ fn encode(app: &App, seed_joined: &[bool]) -> String {
             Vote::None => {}
         }
     }
-    let version = if any_hidden { VERSION_HIDDEN } else { VERSION };
+    let version = if any_read {
+        VERSION_READ
+    } else if any_hidden {
+        VERSION_HIDDEN
+    } else {
+        VERSION
+    };
     format!("{version}\n{out}")
 }
 
@@ -233,14 +251,25 @@ enum Record {
     Group(bool, String),
     Saved(Vec<String>),
     Hidden(Vec<String>),
+    Read(Vec<String>),
     Vote(Vote, Vec<String>),
+}
+
+/// The record kinds a file's version line allows beyond version 1's.
+#[derive(Debug, Clone, Copy)]
+struct Known {
+    /// `hidden`, in `VERSION_HIDDEN` and `VERSION_READ` files.
+    hidden: bool,
+    /// `read`, in `VERSION_READ` files only.
+    read: bool,
 }
 
 impl Record {
     /// `None` for a malformed line: a bad escape, an unknown kind or value,
-    /// or the wrong number of fields. `hidden` is a known kind only in a
-    /// `VERSION_HIDDEN` file, so `hidden_known` says which version this is.
-    fn parse(line: &str, hidden_known: bool) -> Option<Record> {
+    /// or the wrong number of fields. `known` says which kinds this file's
+    /// version allows: a `hidden` or `read` line in a version that doesn't
+    /// know it is malformed.
+    fn parse(line: &str, known: Known) -> Option<Record> {
         let fields: Vec<String> = line.split('\t').map(unescape).collect::<Option<_>>()?;
         let (kind, rest) = fields.split_first()?;
         match (kind.as_str(), rest) {
@@ -253,8 +282,11 @@ impl Record {
                 Some(Record::Group(joined, name.clone()))
             }
             ("saved", key) if key.len() == POST_KEY_LEN => Some(Record::Saved(key.to_vec())),
-            ("hidden", key) if hidden_known && key.len() == POST_KEY_LEN => {
+            ("hidden", key) if known.hidden && key.len() == POST_KEY_LEN => {
                 Some(Record::Hidden(key.to_vec()))
+            }
+            ("read", key) if known.read && key.len() == POST_KEY_LEN => {
+                Some(Record::Read(key.to_vec()))
             }
             ("vote", [value, key @ ..])
                 if key.len() >= POST_KEY_LEN && (key.len() - POST_KEY_LEN).is_multiple_of(2) =>
@@ -290,6 +322,10 @@ impl Record {
                 Item::Post(i) => Some(Change::Hide(*i)),
                 _ => None,
             },
+            Record::Read(key) => match owner(&key)? {
+                Item::Post(i) => Some(Change::Read(*i)),
+                _ => None,
+            },
             Record::Vote(vote, key) => match owner(&key)? {
                 Item::Post(i) => Some(Change::PostVote(*i, vote)),
                 Item::Comment(i, path) => Some(Change::CommentVote(*i, path.clone(), vote)),
@@ -303,6 +339,7 @@ enum Change {
     Join(usize, bool),
     Save(usize),
     Hide(usize),
+    Read(usize),
     PostVote(usize, Vote),
     CommentVote(usize, CommentPath, Vote),
 }
@@ -315,8 +352,8 @@ fn set_vote(current: &mut Vote, score: &mut i32, vote: Vote) {
     }
 }
 
-/// The file's first line is neither `VERSION` nor `VERSION_HIDDEN`: it is
-/// empty, garbage, binary, or from a newer version.
+/// The file's first line isn't `VERSION`, `VERSION_HIDDEN` or `VERSION_READ`:
+/// it is empty, garbage, binary, or from a newer version.
 #[derive(Debug, PartialEq, Eq)]
 struct Unrecognized;
 
@@ -326,9 +363,19 @@ struct Unrecognized;
 /// are dropped.
 fn apply(app: &mut App, bytes: &[u8]) -> Result<usize, Unrecognized> {
     let mut lines = bytes.split(|&b| b == b'\n');
-    let hidden_known = match lines.next() {
-        Some(line) if line == VERSION.as_bytes() => false,
-        Some(line) if line == VERSION_HIDDEN.as_bytes() => true,
+    let known = match lines.next() {
+        Some(line) if line == VERSION.as_bytes() => Known {
+            hidden: false,
+            read: false,
+        },
+        Some(line) if line == VERSION_HIDDEN.as_bytes() => Known {
+            hidden: true,
+            read: false,
+        },
+        Some(line) if line == VERSION_READ.as_bytes() => Known {
+            hidden: true,
+            read: true,
+        },
         _ => return Err(Unrecognized),
     };
     let mut skipped = 0;
@@ -340,7 +387,7 @@ fn apply(app: &mut App, bytes: &[u8]) -> Result<usize, Unrecognized> {
             .filter_map(|line| {
                 let record = std::str::from_utf8(line)
                     .ok()
-                    .and_then(|line| Record::parse(line, hidden_known));
+                    .and_then(|line| Record::parse(line, known));
                 if record.is_none() {
                     skipped += 1;
                 }
@@ -353,6 +400,7 @@ fn apply(app: &mut App, bytes: &[u8]) -> Result<usize, Unrecognized> {
             Change::Join(g, joined) => app.groups[g].joined = joined,
             Change::Save(i) => app.posts[i].saved = true,
             Change::Hide(i) => app.posts[i].hidden = true,
+            Change::Read(i) => app.posts[i].read = true,
             Change::PostVote(i, vote) => {
                 let post = &mut app.posts[i];
                 set_vote(&mut post.vote, &mut post.score, vote);
@@ -472,8 +520,9 @@ impl Store {
                 Err(Unrecognized) => {
                     store.writable = false;
                     Some(format!(
-                        "{shown} doesn't start with \"{VERSION}\" or \"{VERSION_HIDDEN}\", so it \
-                         wasn't loaded and was left unchanged. This run's changes weren't saved."
+                        "{shown} doesn't start with \"{VERSION}\", \"{VERSION_HIDDEN}\" or \
+                         \"{VERSION_READ}\", so it wasn't loaded and was left unchanged. This run's \
+                         changes weren't saved."
                     ))
                 }
             },
@@ -632,7 +681,8 @@ mod tests {
 
     /// Upvotes "dead code", downvotes and saves "pizza", downvotes lin
     /// (depth 2) and upvotes sam, leaves Engineering and joins Dogs, all by
-    /// key presses. Ends back on Home.
+    /// key presses. Opening "dead code" to vote on its comments marks it
+    /// read. Ends back on Home.
     fn change_everything(app: &mut App) {
         assert_eq!(titles(app), ["dead code", "pizza"]);
         press(app, "ajzs");
@@ -643,12 +693,14 @@ mod tests {
         assert_eq!(app.feed, Feed::Home);
     }
 
-    /// Undoes `change_everything` after a restore, by key presses.
+    /// Undoes `change_everything` after a restore, by key presses. Opening
+    /// "dead code" again leaves it read, so `m` marks it unread.
     fn undo_everything(app: &mut App) {
         assert_eq!(titles(app), ["pizza", "biscuit"]);
         press(app, "zs]]");
         assert_eq!(titles(app), ["dead code", "pizza", "biscuit"]);
-        press(app, "a\nnnnznaq");
+        press(app, "a\nnnnznamq");
+        assert!(!find(app, "dead code").read);
         press(app, "]]]J]J");
         assert_eq!(app.feed, Feed::Group(1));
     }
@@ -656,6 +708,18 @@ mod tests {
     const CHANGED: &str = "workit-state 1\n\
         group\tleft\tEngineering\n\
         group\tjoined\tDogs\n\
+        vote\tup\tEngineering\tdana\tdead code\n\
+        vote\tdown\tEngineering\tdana\tdead code\tmarco\tcongrats\tdana\tthanks\tlin\tdeep\n\
+        vote\tup\tEngineering\tdana\tdead code\tsam\tbroke?\n\
+        saved\tFood\tchef\tpizza\n\
+        vote\tdown\tFood\tchef\tpizza\n";
+
+    /// What `change_everything` saves: `CHANGED` with "dead code" read, so
+    /// version 3, its `read` record before its vote.
+    const CHANGED_READ: &str = "workit-state 3\n\
+        group\tleft\tEngineering\n\
+        group\tjoined\tDogs\n\
+        read\tEngineering\tdana\tdead code\n\
         vote\tup\tEngineering\tdana\tdead code\n\
         vote\tdown\tEngineering\tdana\tdead code\tmarco\tcongrats\tdana\tthanks\tlin\tdeep\n\
         vote\tup\tEngineering\tdana\tdead code\tsam\tbroke?\n\
@@ -703,16 +767,17 @@ mod tests {
         let mut app = seed();
         change_everything(&mut app);
         let text = encode(&app, &seed_joined(&seed()));
-        assert_eq!(text, CHANGED, "seed order, only what differs");
+        assert_eq!(text, CHANGED_READ, "seed order, only what differs");
 
         let mut app = seed();
         assert_eq!(apply(&mut app, text.as_bytes()), Ok(0));
         let dead = find(&app, "dead code");
         assert_eq!(
-            (dead.score, dead.vote),
-            (101, Vote::Up),
+            (dead.score, dead.vote, dead.read),
+            (101, Vote::Up, true),
             "seed + 1, not + 2"
         );
+        assert!(!find(&app, "pizza").read && !find(&app, "biscuit").read);
         let pizza = find(&app, "pizza");
         assert_eq!(
             (pizza.score, pizza.vote, pizza.saved),
@@ -742,7 +807,7 @@ mod tests {
         press(&mut app, "]]]");
         assert_eq!(app.feed, Feed::Saved);
         assert_eq!(titles(&app), ["pizza"], "and Saved the restored save");
-        assert_eq!(encode(&app, &seed_joined(&seed())), CHANGED);
+        assert_eq!(encode(&app, &seed_joined(&seed())), CHANGED_READ);
     }
 
     #[test]
@@ -784,7 +849,7 @@ mod tests {
         let dir = TempDir::new("undo-all");
         let path = dir.0.join("state");
         run(&path, seed(), change_everything);
-        assert_eq!(fs::read_to_string(&path).unwrap(), CHANGED);
+        assert_eq!(fs::read_to_string(&path).unwrap(), CHANGED_READ);
         run(&path, seed(), undo_everything);
         assert_eq!(fs::read_to_string(&path).unwrap(), "workit-state 1\n");
         let app = run(&path, seed(), |_| {});
@@ -810,11 +875,11 @@ mod tests {
         let seed_joined = seed_joined(&app);
         assert_eq!(apply(&mut app, text.as_bytes()), Ok(0));
         let dead = find(&app, "dead code");
-        assert_eq!((dead.score, dead.vote), (101, Vote::Up));
+        assert_eq!((dead.score, dead.vote, dead.read), (101, Vote::Up, true));
         let pizza = find(&app, "pizza");
         assert_eq!(
-            (pizza.score, pizza.vote, pizza.saved),
-            (69, Vote::Down, true)
+            (pizza.score, pizza.vote, pizza.saved, pizza.read),
+            (69, Vote::Down, true, false)
         );
         let [new, sam, marco] = &dead.comments[..] else {
             panic!("three top-level comments");
@@ -829,8 +894,8 @@ mod tests {
         assert_eq!((lin.author, lin.score, lin.vote), ("lin", 29, Vote::Down));
         let new_post = find(&app, "new post");
         assert_eq!(
-            (new_post.score, new_post.vote, new_post.saved),
-            (5, Vote::None, false)
+            (new_post.score, new_post.vote, new_post.saved, new_post.read),
+            (5, Vote::None, false, false)
         );
         assert!(!joined(&app, "Engineering") && joined(&app, "Dogs"));
         assert!(joined(&app, "Food") && !joined(&app, "Hackathon"));
@@ -838,11 +903,12 @@ mod tests {
         // Saved again, the records come out in the new seed order.
         assert_eq!(
             encode(&app, &seed_joined),
-            "workit-state 1\n\
+            "workit-state 3\n\
              group\tjoined\tDogs\n\
              group\tleft\tEngineering\n\
              saved\tFood\tchef\tpizza\n\
              vote\tdown\tFood\tchef\tpizza\n\
+             read\tEngineering\tdana\tdead code\n\
              vote\tup\tEngineering\tdana\tdead code\n\
              vote\tup\tEngineering\tdana\tdead code\tsam\tbroke?\n\
              vote\tdown\tEngineering\tdana\tdead code\tmarco\tcongrats\tdana\tthanks\tlin\tdeep\n"
@@ -975,7 +1041,8 @@ mod tests {
         for contents in [
             &b""[..],
             b"\n",
-            b"workit-state 3\nvote\tup\tEngineering\tdana\tdead code\n",
+            b"workit-state 4\nvote\tup\tEngineering\tdana\tdead code\n",
+            b"workit-state 3 \nvote\tup\tEngineering\tdana\tdead code\n",
             b"workit-state 2 \nvote\tup\tEngineering\tdana\tdead code\n",
             b"workit-state 1 \nvote\tup\tEngineering\tdana\tdead code\n",
             b"vote\tup\tEngineering\tdana\tdead code\n",
@@ -1229,6 +1296,10 @@ mod tests {
             "every seed key is unique"
         );
         assert_eq!(encode(&app, &seed_joined(&app)), "workit-state 1\n");
+        assert!(
+            app.posts.iter().all(|p| !p.read),
+            "every post starts unread"
+        );
     }
 
     /// Downvotes "dead code", then upvotes, saves and hides "pizza", by key
@@ -1358,18 +1429,24 @@ mod tests {
 
     #[test]
     fn a_future_version_with_hidden_records_is_left_alone() {
-        let dir = TempDir::new("version-3");
+        let dir = TempDir::new("version-4");
         let path = dir.0.join("state");
-        let contents = "workit-state 3\nhidden\tFood\tchef\tpizza\nsaved\tFood\tchef\tpizza\n";
+        let contents = "workit-state 4\n\
+            hidden\tFood\tchef\tpizza\n\
+            read\tFood\tchef\tpizza\n\
+            saved\tFood\tchef\tpizza\n";
         fs::write(&path, contents).unwrap();
         let mut app = seed();
         let (store, message) = Store::load(path.clone(), &mut app);
         let message = message.unwrap();
         assert!(message.contains("left unchanged"), "{message}");
-        assert!(message.contains("\"workit-state 1\" or \"workit-state 2\""));
+        assert!(message.contains("\"workit-state 1\", \"workit-state 2\" or \"workit-state 3\""));
         let pizza = find(&app, "pizza");
-        assert_eq!((pizza.saved, pizza.hidden), (false, false));
-        press(&mut app, "jh");
+        assert_eq!(
+            (pizza.saved, pizza.hidden, pizza.read),
+            (false, false, false)
+        );
+        press(&mut app, "j\nqh");
         store.save(&app).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), contents);
         assert_eq!(dir.entries(), ["state"]);
@@ -1407,7 +1484,9 @@ mod tests {
         press(app, "\nnnnznaq");
     }
 
-    const VOTED: &str = "workit-state 1\n\
+    /// Both runs open "dead code", which marks it read.
+    const VOTED: &str = "workit-state 3\n\
+        read\tEngineering\tdana\tdead code\n\
         vote\tdown\tEngineering\tdana\tdead code\tmarco\tcongrats\tdana\tthanks\tlin\tdeep\n\
         vote\tup\tEngineering\tdana\tdead code\tsam\tbroke?\n";
 
@@ -1450,7 +1529,9 @@ mod tests {
         run(&path, seed(), |app| {
             press(app, "\nrhello\nrback at you\n");
             esc(app);
-            press(app, "rtop again\nq");
+            // Opening the post marked it read; `m` undoes that, so the
+            // comments are all that is left.
+            press(app, "rtop again\nmq");
         });
         assert_eq!(dir.entries(), Vec::<String>::new(), "no file created");
         assert_eq!(encode(&seed(), &seed_joined(&seed())), "workit-state 1\n");
@@ -1518,8 +1599,11 @@ mod tests {
         );
         let text = encode(&app, &seed_joined(&same()));
         assert_eq!(
-            text, "workit-state 1\nvote\tdown\tEngineering\tdana\tdead code\tyou\tsame\n",
-            "only the seeded comment's vote, under its key"
+            text,
+            "workit-state 3\n\
+             read\tEngineering\tdana\tdead code\n\
+             vote\tdown\tEngineering\tdana\tdead code\tyou\tsame\n",
+            "the post opened, and only the seeded comment's vote, under its key"
         );
 
         let mut fresh = same();
@@ -1535,5 +1619,253 @@ mod tests {
         let comments = &again.posts[0].comments;
         assert_eq!((comments[0].score, comments[0].vote), (1, Vote::Up));
         assert_eq!((comments[1].score, comments[1].vote), (4, Vote::Down));
+    }
+
+    // ---- Read posts ----
+
+    #[test]
+    fn a_read_post_round_trips_with_version_3() {
+        let dir = TempDir::new("read");
+        let path = dir.0.join("state");
+        run(&path, seed(), |app| press(app, "j\nq"));
+        let read = "workit-state 3\nread\tFood\tchef\tpizza\n";
+        assert_eq!(fs::read_to_string(&path).unwrap(), read);
+
+        let app = run(&path, seed(), |app| {
+            assert!(find(app, "pizza").read);
+            assert!(!find(app, "dead code").read && !find(app, "biscuit").read);
+            assert_eq!(titles(app), ["dead code", "pizza"], "reading hides nothing");
+            press(app, "/is:read\n");
+            assert_eq!(titles(app), ["pizza"]);
+        });
+        assert_eq!(encode(&app, &seed_joined(&seed())), read);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            read,
+            "written back the same"
+        );
+    }
+
+    /// "dead code" downvoted, opened and sam's comment on it upvoted;
+    /// "pizza" upvoted, saved, opened and hidden. By key presses on Home.
+    const READ_ALL: &str = "workit-state 3\n\
+        read\tEngineering\tdana\tdead code\n\
+        vote\tdown\tEngineering\tdana\tdead code\n\
+        vote\tup\tEngineering\tdana\tdead code\tsam\tbroke?\n\
+        saved\tFood\tchef\tpizza\n\
+        hidden\tFood\tchef\tpizza\n\
+        read\tFood\tchef\tpizza\n\
+        vote\tup\tFood\tchef\tpizza\n";
+
+    #[test]
+    fn a_read_hidden_saved_and_voted_post_round_trips_with_all_four() {
+        let dir = TempDir::new("read-all");
+        let path = dir.0.join("state");
+        run(&path, seed(), |app| {
+            press(app, "z\nnnnnaq");
+            press(app, "jas\nqh");
+            assert_eq!(titles(app), ["dead code"]);
+        });
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            READ_ALL,
+            "saved, hidden, read, the post's vote, then its comments' votes"
+        );
+
+        let app = run(&path, seed(), |app| {
+            let pizza = find(app, "pizza");
+            assert_eq!(
+                (
+                    pizza.score,
+                    pizza.vote,
+                    pizza.saved,
+                    pizza.hidden,
+                    pizza.read
+                ),
+                (71, Vote::Up, true, true, true)
+            );
+            let dead = find(app, "dead code");
+            assert_eq!((dead.score, dead.vote, dead.read), (99, Vote::Down, true));
+            assert_eq!(dead.comments[1].vote, Vote::Up);
+            assert!(!find(app, "biscuit").read);
+            assert_eq!(titles(app), ["dead code"], "pizza is hidden");
+            press(app, "]]]]");
+            assert_eq!((app.feed, titles(app)), (Feed::Hidden, vec!["pizza"]));
+        });
+        assert_eq!(encode(&app, &seed_joined(&seed())), READ_ALL);
+        assert_eq!(fs::read_to_string(&path).unwrap(), READ_ALL);
+    }
+
+    #[test]
+    fn marking_everything_unread_goes_back_to_version_2_or_1() {
+        let dir = TempDir::new("unread");
+        let path = dir.0.join("state");
+        fs::write(&path, READ_ALL).unwrap();
+        run(&path, seed(), |app| {
+            press(app, "m");
+            assert_eq!(app.status, Some("Marked unread"));
+            press(app, "]]]]m");
+            assert_eq!(app.feed, Feed::Hidden);
+            assert!(app.posts.iter().all(|p| !p.read));
+        });
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "workit-state 2\n\
+             vote\tdown\tEngineering\tdana\tdead code\n\
+             vote\tup\tEngineering\tdana\tdead code\tsam\tbroke?\n\
+             saved\tFood\tchef\tpizza\n\
+             hidden\tFood\tchef\tpizza\n\
+             vote\tup\tFood\tchef\tpizza\n",
+            "a hidden post is left, so version 2"
+        );
+
+        // With nothing hidden, back to version 1.
+        fs::write(
+            &path,
+            "workit-state 3\n\
+             read\tEngineering\tdana\tdead code\n\
+             saved\tFood\tchef\tpizza\n\
+             read\tFood\tchef\tpizza\n",
+        )
+        .unwrap();
+        run(&path, seed(), |app| {
+            assert!(find(app, "dead code").read && find(app, "pizza").read);
+            // Opened again and marked unread in the post view, and `m` in
+            // the feed.
+            press(app, "\nmqjm");
+        });
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "workit-state 1\nsaved\tFood\tchef\tpizza\n"
+        );
+        let app = run(&path, seed(), |_| {});
+        assert!(app.posts.iter().all(|p| !p.read));
+    }
+
+    #[test]
+    fn a_read_record_in_a_version_1_or_2_file_is_malformed() {
+        let records = "vote\tup\tEngineering\tdana\tdead code\n\
+            read\tFood\tchef\tpizza\n\
+            saved\tFood\tchef\tpizza\n\
+            hidden\tDogs\tkim\tbiscuit\n";
+        // Version 1: `read` and `hidden` are both malformed.
+        let mut app = seed();
+        let v1 = format!("workit-state 1\n{records}");
+        assert_eq!(apply(&mut app, v1.as_bytes()), Ok(2), "skipped and counted");
+        let pizza = find(&app, "pizza");
+        assert_eq!((pizza.saved, pizza.read), (true, false));
+        assert!(!find(&app, "biscuit").hidden);
+        assert_eq!(find(&app, "dead code").score, 101, "the rest loads");
+
+        // Version 2: only `read` is.
+        let mut app = seed();
+        let v2 = format!("workit-state 2\n{records}");
+        assert_eq!(apply(&mut app, v2.as_bytes()), Ok(1));
+        assert!(!find(&app, "pizza").read && find(&app, "biscuit").hidden);
+
+        // Version 3: both load.
+        let mut app = seed();
+        let v3 = format!("workit-state 3\n{records}");
+        assert_eq!(apply(&mut app, v3.as_bytes()), Ok(0));
+        assert!(find(&app, "pizza").read && find(&app, "biscuit").hidden);
+
+        // In a version 3 file a `read` record is still checked like the rest,
+        // and one that matches nothing is dropped.
+        let mut app = seed();
+        let bad = "workit-state 3\n\
+            read\tFood\tchef\n\
+            read\tFood\tchef\tpizza\textra\n\
+            read\tyes\tFood\tchef\tpizza\n\
+            read\tFood\tchef\tpasta\n\
+            read\tEngineering\tdana\tdead code\tsam\tbroke?\n";
+        assert_eq!(
+            apply(&mut app, bad.as_bytes()),
+            Ok(4),
+            "pasta matches nothing"
+        );
+        assert!(app.posts.iter().all(|p| !p.read));
+        assert_eq!(encode(&app, &seed_joined(&seed())), "workit-state 1\n");
+
+        // The next save drops a malformed `read` line.
+        for (file, saved) in [
+            (
+                &v1,
+                "workit-state 1\n\
+                 vote\tup\tEngineering\tdana\tdead code\n\
+                 saved\tFood\tchef\tpizza\n",
+            ),
+            (
+                &v2,
+                "workit-state 2\n\
+                 vote\tup\tEngineering\tdana\tdead code\n\
+                 hidden\tDogs\tkim\tbiscuit\n\
+                 saved\tFood\tchef\tpizza\n",
+            ),
+        ] {
+            let dir = TempDir::new("read-v1-v2");
+            let path = dir.0.join("state");
+            fs::write(&path, file).unwrap();
+            let mut app = seed();
+            let (store, message) = Store::load(path.clone(), &mut app);
+            assert!(message.unwrap().contains("malformed line(s)"));
+            store.save(&app).unwrap();
+            assert_eq!(fs::read_to_string(&path).unwrap(), saved);
+        }
+    }
+
+    #[test]
+    fn version_2_and_3_files_are_written_back_byte_for_byte() {
+        for (name, contents) in [("v2", HIDDEN), ("v3", READ_ALL)] {
+            let dir = TempDir::new(&format!("{name}-unchanged"));
+            let path = dir.0.join("state");
+            fs::write(&path, contents).unwrap();
+            // Moving around, searching and switching views reads no post.
+            let app = run(&path, seed(), |app| press(app, "jkv]]/x\x1b"));
+            assert_eq!(fs::read_to_string(&path).unwrap(), contents, "{name}");
+            assert_eq!(encode(&app, &seed_joined(&seed())), contents, "{name}");
+        }
+    }
+
+    #[test]
+    fn read_state_follows_the_post_key_through_a_reordered_seed() {
+        // "pizza" and "biscuit" read, plus a `read` record for a post that
+        // isn't in the new seed.
+        let mut app = seed();
+        app.posts[1].read = true;
+        app.posts[2].read = true;
+        let text = format!(
+            "{}read\tFood\tchef\tpasta\n",
+            encode(&app, &seed_joined(&seed()))
+        );
+        assert_eq!(
+            text,
+            "workit-state 3\n\
+             read\tDogs\tkim\tbiscuit\n\
+             read\tFood\tchef\tpizza\n\
+             read\tFood\tchef\tpasta\n"
+        );
+
+        let mut app = reordered_seed();
+        let seed_joined = seed_joined(&app);
+        assert_eq!(
+            apply(&mut app, text.as_bytes()),
+            Ok(0),
+            "pasta isn't malformed"
+        );
+        let read: Vec<&str> = app
+            .posts
+            .iter()
+            .filter(|p| p.read)
+            .map(|p| p.title)
+            .collect();
+        assert_eq!(read, ["pizza", "biscuit"], "in the new seed order");
+        assert!(!find(&app, "new post").read && !find(&app, "dead code").read);
+        assert_eq!(
+            encode(&app, &seed_joined),
+            "workit-state 3\n\
+             read\tFood\tchef\tpizza\n\
+             read\tDogs\tkim\tbiscuit\n",
+            "the new seed order, and the record matching nothing dropped"
+        );
     }
 }

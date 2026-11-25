@@ -23,14 +23,18 @@ fix whichever one is wrong. Don't let them drift apart.
   phrase in the comments: it jumps to each comment that mentions it, even
   one hidden under a collapsed reply, and highlights every occurrence (see
   Find in comments).
+- Like Reddit and every news reader, it remembers which posts you've opened:
+  a read post's title is drawn muted in the feed, so going back from a post
+  shows where you left off. `m` marks a post read or unread, and the
+  `is:read` / `is:unread` search filters list one or the other.
 - Like Reddit, the feed has a Card view (a bordered card per post, the
   default) and a Compact view (one row per post), switched at runtime with
   `v` or the switch on the sort-tab row.
 - Like Reddit and most keyboard-driven apps, `?` opens a sheet of every key
   binding and what the mouse does, over the screen it was opened from (see
   Help overlay). The footer only has room for some of them.
-- Votes, saves, hidden posts and group membership survive a restart (see
-  Persistence).
+- Votes, saves, hidden posts, read posts and group membership survive a
+  restart (see Persistence).
 - One self-contained binary. No network and no real Workplace data: all
   content is hard-coded, fictional, and safe for work.
 
@@ -38,7 +42,8 @@ fix whichever one is wrong. Don't let them drift apart.
 
 - Fetching real Workplace content (would need auth and APIs, and raises privacy
   concerns).
-- Persisting anything beyond votes, saves, hidden posts and group membership.
+- Persisting anything beyond votes, saves, hidden posts, read posts and group
+  membership.
   The feed, sort, search, Card/Compact view, selection, scroll, comment focus
   and collapse state, find in comments, the help overlay and the toast start
   fresh on every run,
@@ -58,8 +63,8 @@ cargo test
 ```
 
 - **State file:** `WORKIT_STATE=/tmp/scratch cargo run` keeps votes, saves,
-  hidden posts and membership somewhere other than the default (see
-  Persistence).
+  hidden posts, read posts and membership somewhere other than the default
+  (see Persistence).
 - **Dependencies:** just `ratatui` (0.30). It re-exports `crossterm` as
   `ratatui::crossterm`, which keeps the backend and the event types on the same
   version.
@@ -201,15 +206,19 @@ The screen is a header (3 rows), a body, and a footer (1 row).
     trade-off: `v` is now found only through the switch or `?`.
   - `j/k` (which the post view set shows), `c`, and `Tab` (only `1-4` for
     sorting).
+  - `m mark` (read / unread). It came after all of the above, with the group
+    set already at the limit, so it is in neither set (nor in the post view
+    set, also at 80); opening a post marks it read anyway, and `?` lists `m`.
 
   The feed set with a kept search is unchanged and still lists `enter open`:
   `j/k move`, `enter open`, `/ edit search`, `esc clear search`, `q quit`.
   The search set is `type filter`, `w/ u/ flair: narrow`, `enter keep`,
-  `esc clear`. The post view set is `j/k scroll`, `n/p comments`, `/ find`,
-  `a/z vote`, `r reply`, `s save`, `? help`, `esc back` (79 columns). With a
-  comment focused it is `n/p comments`, `/ find`, `a/z vote comment`,
-  `enter collapse`, `? help`, `esc unfocus` (77). Both sets were close to
-  the limit before `/ find` (8 columns) came, so each gave something up:
+  `esc clear` (the help lists `is:read/unread` too). The post view set is
+  `j/k scroll`, `n/p comments`, `/ find`, `a/z vote`, `r reply`, `s save`,
+  `? help`, `esc back` (79 columns). With a comment focused it is
+  `n/p comments`, `/ find`, `a/z vote comment`, `enter collapse`, `? help`,
+  `esc unfocus` (77). Both sets were close to the limit before `/ find` (8
+  columns) came, so each gave something up:
   - `j/k scroll`, from the focused set (with it, that set was 90 before
     `/ find`), since a comment is only ever focused from the unfocused post
     view, whose set shows it, the arrow keys scroll too, and `j`/`k` still
@@ -265,6 +274,13 @@ preview rows, and 1 action row. Here is what goes on each row:
   4. truncate with `…`.
 
   The post view's meta row follows the same rule.
+- **Title:** bold white, wrapped. Once the post is read (see Read posts under
+  Selection behavior) it is drawn `READ_TITLE` instead: `DIM` grey (the
+  meta's `Rgb(129, 131, 132)`), not bold, like a visited link on Reddit. On a
+  dark terminal that is plainly apart from bold white, yet still readable.
+  Nothing else on the card changes: the meta, vote column, preview, action
+  row, wrapping and `card_height` are the same, and the selected card keeps
+  its orange border and highlighted vote column, read or not.
 - **Preview:** the body with newlines flattened, wrapped, and cut to two rows
   with `…`.
 - **Action row:** `▤ N Comments   ↗ Share   ☆ Save   ···`. Save becomes an
@@ -274,9 +290,10 @@ preview rows, and 1 action row. Here is what goes on each row:
   title keeps its bold, and the original-case text is shown. Overlapping
   matches merge into one run, a match that wraps highlights its part on each
   row (the line break draws nothing), and when the preview is cut only the
-  visible part of a match is highlighted, never the `…`. The meta and action
-  rows aren't highlighted. Highlighting only restyles cells: wrapping,
-  `card_height` and scrolling are the same as without it, and with no
+  visible part of a match is highlighted, never the `…`. In a read title the
+  matches are black on orange just the same, between grey cells. The meta
+  and action rows aren't highlighted. Highlighting only restyles cells:
+  wrapping, `card_height` and scrolling are the same as without it, and with no
   free-text terms a card renders exactly as it would with no query.
 
 ### Compact rows
@@ -299,7 +316,8 @@ to right:
 - `★` (orange) for a saved post, `☆` (dim) otherwise, then a blank. The
   title starts in column 13.
 - the title, bold, whitespace runs shown as one space (as on cards), cut
-  with `…` to the room left.
+  with `…` to the room left. A read post's title is `READ_TITLE` (grey, not
+  bold), as on cards, and nothing else on the row changes.
 - right-aligned and dim, `w/<group> · <age> · ▤ <comments>`, with `age` and
   `compact` as on cards, at least 2 blank columns after the title and 1
   blank column before the right edge.
@@ -316,7 +334,11 @@ feed of a 110- or 80-column terminal that means `<age> · ▤ <comments>`. Below
 
 **Selected row.** The whole row is on `HIGHLIGHT_BG` and its title is orange
 (bold), like the active nav entry and the focused comment header. The vote
-and star colors don't change.
+and star colors don't change. When the selected post is read its title stays
+orange on the highlight and only loses its bold: the background alone is too
+faint a mark on a dark terminal, so the orange is what keeps the row
+plainly selected, while the missing bold still says it is read. Once the
+selection moves on, the row's title turns grey.
 
 **Search highlighting** works as on cards: every occurrence of a free-text
 term in the visible part of the title is black on orange, in the original
@@ -346,9 +368,10 @@ wrapped message replaces the cards:
 
 - With an active search: **"Hm... we couldn't find any results"** /
   "Double-check your spelling, or press esc to clear the search". A query
-  only counts when it has a free-text term or a filter. One with no effective
-  terms (`w/`, `   `, `" "`) can't be what emptied the feed, so the message is
-  chosen as if there were no query. The header still shows it.
+  only counts when it has a free-text term or a filter (`is:foo`, which
+  matches nothing, included). One with no effective terms (`w/`, `is:`,
+  `   `, `" "`) can't be what emptied the feed, so the message is chosen as if
+  there were no query. The header still shows it.
 - In Saved, when no post is saved: **"No saved posts yet"** / "Press s on any
   post to save it".
 - In Hidden, when no post is hidden: **"No hidden posts"** / "Press h on any
@@ -357,12 +380,13 @@ wrapped message replaces the cards:
   post is hidden, and Hidden when Rising hides every hidden post: **"Nothing
   here yet"** / "Try another sort with 1-4, or another feed with [ and ]".
 
-In an empty feed, Enter, voting, saving and hiding do nothing.
+In an empty feed, Enter, voting, saving, hiding and `m` do nothing.
 
 ### Post view (Enter)
 
 The post replaces the feed column. The header, nav, sidebar and footer stay,
-as on Reddit's post page. It shows:
+as on Reddit's post page. Opening it marks the post read (see Read posts);
+the post view itself looks the same, read or not. It shows:
 
 - the meta row, the full title, the full body (newlines kept), and an action
   row with the votes,
@@ -620,18 +644,18 @@ right after `?` on the frontpage:
 │ ⊘ Hidden           │   a/z            upvote / downvote, again to undo               │                     │
 │                    │   s              save / unsave                                  │ Create Post         │
 │ GROUPS             │   h              hide / unhide (hidden posts are in Hidden)     │─────────────────────╯
-│ ● w/Engineering    │   J              join / leave the group, on a group feed        │ today ──────────────╮
-│ ● w/RemoteWork     │   v              switch between the Card and Compact views      │n 2026 is happening… │
-│ ● w/OfficeLife     │   c              copy the post's link                           │cements · 545 comme… │
-│ ● w/Hackathon      │   enter          open the post                                  │got his own visitor… │
-│ ○ w/Announcements  │   1-4            sort by Hot, New, Top, Rising                  │TheOffice · 406 com… │
-│ ● w/Foodies        │   Tab            next sort                                      │r opinion: most of … │
-│ ○ w/DogsOfTheOffice│   [/]            previous / next feed                           │ering · 393 comments │
-│ ● w/OncallSurvivors│   /              search, editing a kept search                  │ding opens Monday: … │
-│                    │   esc            clear a kept search                            │cements · 332 comme… │
-│                    │   ?              this help                                      │─────────────────────╯
-│                    │   q              quit                                           │
-╰────────────────────╰───────────────────────────────────────────────────── 1-18 of 77 ╯
+│ ● w/Engineering    │   m              mark read / unread (opening marks it read)     │ today ──────────────╮
+│ ● w/RemoteWork     │   J              join / leave the group, on a group feed        │n 2026 is happening… │
+│ ● w/OfficeLife     │   v              switch between the Card and Compact views      │cements · 545 comme… │
+│ ● w/Hackathon      │   c              copy the post's link                           │got his own visitor… │
+│ ○ w/Announcements  │   enter          open the post                                  │TheOffice · 406 com… │
+│ ● w/Foodies        │   1-4            sort by Hot, New, Top, Rising                  │r opinion: most of … │
+│ ○ w/DogsOfTheOffice│   Tab            next sort                                      │ering · 393 comments │
+│ ● w/OncallSurvivors│   [/]            previous / next feed                           │ding opens Monday: … │
+│                    │   /              search, editing a kept search                  │cements · 332 comme… │
+│                    │   esc            clear a kept search                            │─────────────────────╯
+│                    │   ?              this help                                      │
+╰────────────────────╰───────────────────────────────────────────────────── 1-18 of 80 ╯
  j/k scroll  g/G top/bottom  ?/esc close
 ```
 
@@ -641,6 +665,8 @@ right after `?` on the frontpage:
   what they do. It mirrors "Key bindings" and "Mouse" below, so change them
   together. A test fails if a key of any footer hint set is missing from its
   mode's section, so the footer can't name a key the help doesn't explain.
+  The Feed and Post view sections list `m`, and Search mode lists the
+  `is:read/unread` filter under `w/ u/ flair:`.
 - **Order.** The section for the mode it was opened from comes first (Feed
   or Post view), then the others in table order. It never opens from search
   mode, the composer or the find bar, which type `?` like any other
@@ -661,8 +687,8 @@ right after `?` on the frontpage:
   it to the content height and writes it back on every frame, as in the post
   view, so `G` then `k` moves at once, and after a resize the scroll fits the
   new box: never past the last line, and none at all when everything fits. When there is more than fits, the bottom border
-  shows the lines in view, `1-18 of 77` at 80×24. The 77 lines fit whole
-  from 83 rows.
+  shows the lines in view, `1-18 of 80` at 80×24. The 80 lines fit whole
+  from 86 rows.
 - **Modal.** The help sits on top of the mode and leaves it alone. Closing
   it returns to exactly the screen it was opened from: mode, feed, sort,
   kept search, selection, `offset`, view, post scroll, focus and collapse.
@@ -670,9 +696,9 @@ right after `?` on the frontpage:
   - `?`, `Esc` and `q` close it. `q` never quits here.
   - `j`/`↓`, `k`/`↑` scroll 1 line, `PgDn`/`Space` and `PgUp` 10, `g`/`Home`
     and `G`/`End` go to the top and bottom.
-  - Every other key does nothing. Voting, saving, hiding, joining, the view
-    toggle, sorts, feeds, search, opening, comment focus and collapse never
-    reach the screen underneath.
+  - Every other key does nothing. Voting, saving, hiding, `m`, joining, the
+    view toggle, sorts, feeds, search, opening, comment focus and collapse
+    never reach the screen underneath.
   - Any key press clears a toast, as always, and Ctrl-C still quits and
     saves.
   - The wheel scrolls it 3 lines per notch, anywhere on screen, clamped. A
@@ -692,7 +718,7 @@ struct Comment { author: &'static str, body: Cow<'static, str>, score,
 struct Post    { group: usize, author, title, body, flair: Option<&str>,
                  score, hours_ago, comment_count: u32,
                  comments: Vec<Comment>, vote: Vote, saved: bool,
-                 hidden: bool }
+                 hidden: bool, read: bool }
 enum Vote { Up, None /* default */, Down }
 ```
 
@@ -762,17 +788,20 @@ enum Vote { Up, None /* default */, Down }
   start unjoined, so their posts appear in Popular, All and their own group
   feed, but not in Home. `J` on a group's feed joins or leaves it.
 - **Posts:** 24, built as `Post { …, ..Default::default() }` literals. Every
-  name in the seed data is invented. None starts saved or hidden.
+  name in the seed data is invented. None starts saved, hidden or read.
 - **`hidden`** decides which feeds list the post (see Feeds) and keeps it out
   of Trending today. Its score, votes, comments and save work as usual while
   it is hidden.
+- **`read`** is set when the post is opened and toggled by `m` (see Read
+  posts). It only changes how the title is drawn in the feed and what
+  `is:read` / `is:unread` match; it never decides which feed lists a post.
 
 ## App state (`src/app.rs`)
 
 | Field | Meaning |
 |---|---|
-| `groups`, `posts` | seed data, with the state file applied by `main` before the first frame. `posts` is mutated in place by votes, saves, hides and the comments you write (inserted into `comments`, and `comment_count` + 1), `groups[g].joined` by `J` |
-| `view: Vec<usize>` | indices into `posts` after feed filter, search and sort. Changed only by a rebuild, except that `h` removes the card it takes out of the feed (see Selection behavior) |
+| `groups`, `posts` | seed data, with the state file applied by `main` before the first frame. `posts` is mutated in place by votes, saves, hides, reads (opening a post, `m`) and the comments you write (inserted into `comments`, and `comment_count` + 1), `groups[g].joined` by `J` |
+| `view: Vec<usize>` | indices into `posts` after feed filter, search and sort. Changed only by a rebuild, except that `h` removes the card it takes out of the feed (see Selection behavior). Marking a post read or unread never changes it |
 | `selected` | index into `view` |
 | `offset` | first card (or compact row) drawn. Maintained by the renderer (see Scrolling) |
 | `density: Density` | `Card` (the default) or `Compact`. Toggled by `v` and the view switch, never by a rebuild, and not saved |
@@ -780,7 +809,7 @@ enum Vote { Up, None /* default */, Down }
 | `feed: Feed` | `Home`, `Popular`, `All`, `Saved`, `Hidden`, `Group(usize)` |
 | `mode: Mode` | `Feed`, `Search`, `Post { scroll: u16 }`, `Compose { scroll: u16, restore: u16 }` (the post view with the composer open; `scroll` is the shrunk viewport's, which a submit carries on, and `restore` the post view's scroll from before it opened, which Esc goes back to), `Find { scroll: u16, restore: u16 }` (the post view with the find bar open; the same pair, which Enter carries on and Esc goes back to). `scroll` is clamped, and moved to reveal a newly focused comment, by the renderer. `Mode` stays `Copy`: the draft lives in `draft`, the find in `find` |
 | `query: String` | search text, raw as typed. Kept after leaving search mode with Enter |
-| `search: Query` | `query` parsed into free-text terms and filters. Re-parsed on every rebuild of `view`, and used both to filter and to highlight |
+| `search: Query` | `query` parsed into free-text terms and filters (`groups`, `authors`, `flairs` and `states`, the `is:` values). Re-parsed on every rebuild of `view`, and used both to filter and to highlight |
 | `help: Option<Help>` | the `?` overlay: `None` when closed (at startup), else `Help { scroll: u16 }`. While it is open, keys and clicks go to it and `mode` is left as it was. `scroll` is clamped by the renderer. Not saved |
 | `hits: Option<Hits>` | where the most recent frame drew each clickable thing, written by the renderer on every frame. `None` until the first frame (see Mouse). A submit empties its regions |
 | `draft: String` | the composer's text, raw as typed, at most 500 chars. Emptied when the composer opens, on Esc and on a submit. Only used in `Mode::Compose`. What it answers is `thread.focus`, which can't change while the composer is open |
@@ -838,16 +867,22 @@ current feed and sort, and the view updates on every keystroke.
   empty or only whitespace, such as `""` or `" "`, is ignored. A phrase with
   real text keeps its leading or trailing space, so `"dead "` needs the
   space after "dead". Quote characters are never part of a term.
-- **Filters:** an unquoted term starting with `w/`, `u/` or `flair:` (the
-  prefix in any case) is a filter. `w/<v>` keeps posts whose group name
+- **Filters:** an unquoted term starting with `w/`, `u/`, `flair:` or `is:`
+  (the prefix in any case) is a filter. `w/<v>` keeps posts whose group name
   starts with `<v>`, `u/<v>` those whose author does, and `flair:<v>` those
-  whose flair does (a post with no flair never matches). Values compare
-  case-insensitively and may be quoted: `flair:"looking for"`. A filter with
-  an empty or whitespace-only value (`w/`, `flair:""`, `flair:" "`) is
-  ignored, so typing `w/` doesn't empty the feed. A term that starts with a quote is always free text: `"w/eng"`
-  is a phrase.
-- **Combining:** filters of the same kind are ORed (`w/eng w/food`), and
-  different kinds are ANDed. Every free-text term must also match.
+  whose flair does (a post with no flair never matches). `is:read` keeps the
+  posts you've read and `is:unread` the others. Unlike the other three, an
+  `is:` value is a whole word, not a prefix: any other value (`is:saved`,
+  `is:re`, `is:foo`) matches no post, as a filter that asks for something
+  that doesn't exist should. Values compare case-insensitively (`IS:Unread`)
+  and may be quoted: `flair:"looking for"`, `is:"read"`. A filter with an
+  empty or whitespace-only value (`w/`, `flair:""`, `flair:" "`, `is:`,
+  `is:""`) is ignored, so typing `w/` or `is:` doesn't empty the feed. A term
+  that starts with a quote is always free text: `"w/eng"` and `"is:read"`
+  are phrases.
+- **Combining:** filters of the same kind are ORed (`w/eng w/food`,
+  `is:read is:unread`), and different kinds are ANDed (`is:unread w/eng`).
+  Every free-text term must also match.
 - **Free text:** each term is a case-insensitive substring of the title,
   body, author or group name. Whitespace runs count as one space, in both
   the term and the text, so a phrase matches across a newline in a body.
@@ -858,7 +893,8 @@ current feed and sort, and the view updates on every keystroke.
   each folded char remembers which original chars it came from. That is how
   `Query::highlights` maps a match back onto the original text, including
   non-ASCII text like `jalapeño` or `°F` and chars that lowercase into
-  several (`İ`). Only free-text terms are highlighted, not filter values.
+  several (`İ`). Only free-text terms are highlighted, not filter values
+  (`is:read` highlights no `read`).
 - **Find in comments** reuses all of this: `Query::phrase` makes the bar's
   text one folded free-text term, `Query::found_in` tells whether a comment
   body contains it, and `Query::highlights` and `highlight_rows` light it up
@@ -904,6 +940,24 @@ current feed and sort, and the view updates on every keystroke.
 - **Joining and leaving don't rebuild either.** A group feed's posts don't
   depend on membership, so `J` keeps `view` and `selected` as they are, and
   a kept search stays too.
+- **Read posts.** Opening a post marks it read, however it is opened: `Enter`
+  on the selected card or row, or a left click on a card or compact row, in
+  any feed and either view, with or without a kept search (`open_post` does
+  it, and both paths go through it). Nothing else marks a post read:
+  selecting it, voting, saving, hiding, sharing and scrolling past it don't.
+  `m` toggles the selected post between read and unread in the feed, and the
+  open post in the post view (focused comment or not), with the toast
+  `Marked read` or `Marked unread`. So you can open a post and mark it
+  unread again, and going back to the feed leaves it unread: only opening
+  marks it, never leaving. `m` does nothing in an empty feed.
+- **Marking read doesn't rebuild either.** Neither opening a post nor `m`
+  re-sorts or rebuilds `view`, even when the post no longer matches a kept
+  `is:` filter. With `is:unread` kept, opening a post and going back leaves
+  its card in place, muted and still under the cursor, as does `m`, until
+  the next rebuild (a sort, a feed change or a new search) drops it, just as
+  an unsave does in the Saved feed. Unlike hiding, the card is still
+  something you want to see: you've just read it, and taking it away under
+  the cursor would lose your place.
 - **Comment votes follow the same rules.** Posts and comments share one
   function for the arithmetic, and comments are never reordered.
 - **These rules differ on purpose.** You change feed, sort or search to get a
@@ -929,11 +983,12 @@ Persistence).
 | `n` / `p` | — | focus next / previous visible comment. With a find active: the next / previous match, wrapping, with a `Match k of N` toast |
 | `s` | save / unsave (toast) | same, always for the post |
 | `h` | hide / unhide (toast: `Post hidden` / `Post unhidden`). Does nothing in an empty feed | — |
+| `m` | mark read / unread (toast: `Marked read` / `Marked unread`). Does nothing in an empty feed. Never rebuilds the feed | same, for the open post, focused comment or not |
 | `J` | join / leave the group (toast). Only on a group feed, with or without a kept search | — |
 | `v` | switch between the Card and Compact views (toast: `Compact view` / `Card view`). Works in every feed, an empty one included, and with a kept search | — |
 | `c` | "Link copied to clipboard!" toast | same, always for the post |
 | `r` | — | open the composer: a reply to the focused comment, or a top-level comment with none focused |
-| `Enter` | open post (does nothing in an empty feed) | collapse / expand the focused comment (nothing with none focused) |
+| `Enter` | open post, marking it read (does nothing in an empty feed) | collapse / expand the focused comment (nothing with none focused) |
 | `1`-`4` / `Tab` | set / cycle sort | — |
 | `[` / `]` | prev / next feed | — |
 | `/` | enter search mode, editing any kept query | open the find bar, with an active find's text |
@@ -952,9 +1007,9 @@ on a card's action row stays decorative.
 
 **Search mode:**
 
-- Every printable key, including `q`, `j`, `J`, `h`, `v`, `n`, `p`, `r`, `?`, `/` and
-  digits, is typed into the query. Phrases and the `w/`, `u/` and `flair:` filters are
-  described under Search.
+- Every printable key, including `q`, `j`, `J`, `h`, `m`, `v`, `n`, `p`, `r`,
+  `?`, `/` and digits, is typed into the query. Phrases and the `w/`, `u/`,
+  `flair:` and `is:` filters are described under Search.
 - Known limitation: modifiers are ignored here, so a Ctrl or Alt chord
   (Ctrl-W, Ctrl-U, Alt-x) is typed as its plain letter (`w`, `u`, `x`).
   Ctrl-C still quits. The composer doesn't have this quirk (below); search
@@ -976,8 +1031,8 @@ on a card's action row stays decorative.
 **Composer** (`r` or a `Reply` click in the post view):
 
 - Every printable key, including `q`, `j`, `k`, `r`, `n`, `p`, `a`, `z`,
-  `s`, `c`, `h`, `v`, `J`, `g`, `G`, `?`, `/`, space and digits, is typed into the
-  draft, and none of them acts. Only unmodified or Shift-modified keys
+  `s`, `c`, `h`, `m`, `v`, `J`, `g`, `G`, `?`, `/`, space and digits, is typed into
+  the draft, and none of them acts. Only unmodified or Shift-modified keys
   count: Shift is how capitals and symbols arrive. Any key with Ctrl, Alt or
   another modifier (Ctrl-W, Ctrl-U, Alt-x, Ctrl-Backspace, Alt-Enter) does
   nothing, except Ctrl-C, which quits as from any mode. Control characters
@@ -996,7 +1051,7 @@ on a card's action row stays decorative.
 
 | Key | Find bar |
 |---|---|
-| any printable key (`n`, `p`, `q`, `j`, `r`, `?`, `/`, space, digits included), unmodified or with Shift | typed, up to 100 chars (chars, not bytes); the focus moves to the first match from where it was when the bar opened |
+| any printable key (`n`, `p`, `q`, `j`, `r`, `m`, `?`, `/`, space, digits included), unmodified or with Shift | typed, up to 100 chars (chars, not bytes); the focus moves to the first match from where it was when the bar opened |
 | `Backspace` | delete one char (nothing on empty text) |
 | `Enter` | close the bar; the find stays active on a match, and is dropped with blank text or no match |
 | `Esc` | cancel: no find, and the focus, collapsed set and scroll from before `/` |
@@ -1027,10 +1082,10 @@ the first frame is drawn. `handles_mouse` is that rule, and
 
 | Where | Feed | Post view |
 |---|---|---|
-| a card: any cell of its drawn rectangle, borders and the visible part of a clipped card included | select it and open it, like `Enter` | — |
+| a card: any cell of its drawn rectangle, borders and the visible part of a clipped card included | select it and open it, like `Enter`, which marks it read | — |
 | a card's `▲` / `▼` | select it and vote, like `a` / `z`. Doesn't open the post or re-sort | — |
 | a card's `☆ Save` / `★ Saved` | select it and save / unsave (toast), like `s` | — |
-| a compact row: any cell of it, the meta and blanks included | select it and open it, like `Enter` | — |
+| a compact row: any cell of it, the meta and blanks included | select it and open it, like `Enter`, which marks it read | — |
 | a compact row's `▲` / `▼` | select it and vote, like `a` / `z`. Doesn't open the post or re-sort | — |
 | a compact row's `☆` / `★` | select it and save / unsave (toast), like `s` | — |
 | a sort tab, its number or label | like its digit, `1`-`4` | not drawn |
@@ -1133,10 +1188,11 @@ debug build at that size.
 
 ## Persistence (`src/state.rs`)
 
-Your vote on each post and on each comment, each post's `saved` and `hidden`
-flags and each group's `joined` flag are kept in a small text file between
-runs. Nothing else is: every run starts on Home, Hot, at the top, with no
-query, focus, collapse or toast, the help closed, and with the seed's comment tree.
+Your vote on each post and on each comment, each post's `saved`, `hidden`
+and `read` flags and each group's `joined` flag are kept in a small text file
+between runs. Nothing else is: every run starts on Home, Hot, at the top,
+with no query, focus, collapse or toast, the help closed, and with the seed's
+comment tree.
 
 **Your comments are never saved.** The comments you write last for the
 session only (see Non-goals). `items`, the one list of what can be saved,
@@ -1147,8 +1203,8 @@ only be yours, and whose key would contain your text anyway). From that:
   upvote it starts with, not any vote you cast on it;
 - writing comments changes nothing in the file. The records come in seed
   order, and inserting your comments doesn't change the relative order of
-  the seeded ones, so with the same votes, saves, hides and joins the file
-  is byte for byte what it would be without them. `comment_count` was never
+  the seeded ones, so with the same votes, saves, hides, reads and joins the
+  file is byte for byte what it would be without them. `comment_count` was never
   saved, so the higher count isn't either;
 - your comment can never own or shadow a seeded comment's key, even when its
   author and text are exactly a seeded sibling's (a seed author called
@@ -1166,12 +1222,13 @@ path `items` finds for that key then.
 
 **What is stored.** Only differences from the seed: a group whose `joined`
 differs from the seed's (both joining an unjoined group and leaving a joined
-one), each saved post, each hidden post, and each post or comment with a vote.
-The seed has no votes, saves or hidden posts (a test checks it). An entry you
-undo (vote again, unsave, unhide, re-join) isn't written by the next save, so
-it doesn't come back. Scores are not stored: a post's or comment's `score`
-already includes your vote, so the file keeps the vote and loading applies it
-to the seed score with `cast`'s arithmetic. An upvoted post comes back at
+one), each saved post, each hidden post, each read post, and each post or
+comment with a vote. The seed has no votes, saves, hidden or read posts (a
+test checks it). An entry you undo (vote again, unsave, unhide, mark unread,
+re-join) isn't written by the next save, so it doesn't come back. Scores are
+not stored: a post's or comment's `score` already includes your vote, so the
+file keeps the vote and loading applies it to the seed score with `cast`'s
+arithmetic. An upvoted post comes back at
 seed + 1, and `a` clears it back to the seed score.
 
 **Keys.** The seed keeps changing, so indices and `CommentPath`s can't be
@@ -1194,14 +1251,16 @@ so keys don't depend on the Rust release.
 group, author and title, or two sibling replies with the same author and body.
 Then the first in seed order (groups, then each post followed by its comments
 in pre-order) owns the key. The others are never written or loaded: their
-votes, saves and hides last for the session only. A test checks that every key
-in the real seed is unique, so this only matters if a duplicate is added.
+votes, saves, hides and reads last for the session only. A test checks that
+every key in the real seed is unique, so this only matters if a duplicate is
+added.
 
-**Format.** UTF-8 text. The first line is the version, `workit-state 1` or
-`workit-state 2` (see Versions). Every other line is one record: tab-separated
-fields, ending in a newline. In each field, `\` is written `\\`, a tab `\t`, a
-newline `\n` and a carriage return `\r`, and everything else as is (`=` and
-non-ASCII included), so any string round-trips. The records, in seed order:
+**Format.** UTF-8 text. The first line is the version, `workit-state 1`,
+`workit-state 2` or `workit-state 3` (see Versions). Every other line is one
+record: tab-separated fields, ending in a newline. In each field, `\` is
+written `\\`, a tab `\t`, a newline `\n` and a carriage return `\r`, and
+everything else as is (`=` and non-ASCII included), so any string
+round-trips. The records, in seed order:
 
 ```
 workit-state 1
@@ -1214,12 +1273,15 @@ saved	OfficeLife	priya_r	PSA: the espresso machine on floor 3 is FIXED
 
 - `group`, `joined` or `left`, the group's name.
 - `saved`, then the post's key (3 fields).
-- `hidden`, then the post's key (3 fields). Only in a `workit-state 2` file.
+- `hidden`, then the post's key (3 fields). Only in a `workit-state 2` or
+  `workit-state 3` file.
+- `read`, then the post's key (3 fields). Only in a `workit-state 3` file.
 - `vote`, `up` or `down`, then the key of a post (3 fields) or a comment
   (3 + 2 per level).
 
-A post's records come in the order `saved`, `hidden`, then its `vote`,
-followed by its comments' votes. With a hidden post the same file reads:
+A post's records come in the order `saved`, `hidden`, `read`, then its
+`vote`, followed by its comments' votes. With a hidden post the same file
+reads:
 
 ```
 workit-state 2
@@ -1231,17 +1293,45 @@ saved	OfficeLife	priya_r	PSA: the espresso machine on floor 3 is FIXED
 hidden	OfficeLife	priya_r	PSA: the espresso machine on floor 3 is FIXED
 ```
 
-**Versions.** A build from before hiding existed reads only `workit-state 1`,
-skips a record kind it doesn't know as malformed, and then drops it on its
-next save. So that such a build can never silently delete hidden posts, a save
-writes `workit-state 2` when it writes at least one `hidden` record, and
-`workit-state 1` otherwise. An older build then refuses a file with hidden
-posts and leaves it alone, while someone who never hides a post can still go
-back to it. Unhiding the last hidden post brings the file back to
-`workit-state 1` on the next save. Both versions load. They differ only in
-`hidden`: in a `workit-state 1` file a `hidden` line is malformed (skipped and
-counted, like any bad line). A `workit-state 1` file from before hiding loads
-exactly as before, and is written back byte for byte when nothing changed.
+And with that post read too, and the first one opened:
+
+```
+workit-state 3
+group	left	Engineering
+group	joined	Announcements
+read	Engineering	dana_k	We deleted 40k lines of dead code and the build got 30% faster
+vote	up	Engineering	dana_k	We deleted 40k lines of dead code and the build got 30% faster
+vote	down	Engineering	dana_k	We deleted 40k lines of dead code and the build got 30% faster	lin_tran	212 diffs?! Who reviewed all of these, and are they okay?	oz_reviewer	I have seen things you people wouldn't believe.
+saved	OfficeLife	priya_r	PSA: the espresso machine on floor 3 is FIXED
+hidden	OfficeLife	priya_r	PSA: the espresso machine on floor 3 is FIXED
+read	OfficeLife	priya_r	PSA: the espresso machine on floor 3 is FIXED
+```
+
+**Versions.** An older build refuses any version line it doesn't know and
+leaves the file alone, but within a version it does accept it skips a
+record kind it doesn't know as malformed, and then drops it on its next save.
+A build from before hiding reads only `workit-state 1`; one from after hiding
+but before reading reads `workit-state 1` and `2`. So that neither can ever
+silently delete what it doesn't understand, a save writes the oldest version
+that knows every record it writes:
+
+- `workit-state 3` when it writes at least one `read` record,
+- otherwise `workit-state 2` when it writes at least one `hidden` record,
+- otherwise `workit-state 1`.
+
+An older build then refuses a file with records it would drop, while someone
+who never reads (or hides) a post can still go back to it. Marking every read
+post unread brings the file back to `workit-state 2` (with a hidden post
+left) or `workit-state 1` on the next save, as unhiding the last hidden post
+brings a `workit-state 2` file back to `1`. All three versions load. They
+differ only in the kinds they know: `hidden` is known in versions 2 and 3,
+`read` only in version 3. A `hidden` line in a `workit-state 1` file, or a
+`read` line in a `workit-state 1` or `workit-state 2` file, is malformed
+(skipped, counted and reported like any bad line, and dropped by the next
+save). A `workit-state 1` or `workit-state 2` file from before reading loads
+exactly as before, and is written back byte for byte when the run reads no
+post and changes nothing. Since opening a post now writes a `read` record,
+the first run that opens one moves the file to `workit-state 3`.
 
 **Location.** `$WORKIT_STATE` if it is set and non-empty, used as given.
 Otherwise `$XDG_STATE_HOME/workit/state` when `XDG_STATE_HOME` is an absolute
@@ -1254,8 +1344,9 @@ environment.
 before `ratatui::init()`, so before the first frame. Loading applies each
 record as the keys would (`cast` for votes), then rebuilds `view`, so restored
 state behaves as if you had made those changes by hand: a restored membership
-is in Home's first build, a restored save is in Saved, and a restored hidden
-post is only in Hidden. `App::new()` and `App::with_data` stay pure and never
+is in Home's first build, a restored save is in Saved, a restored hidden
+post is only in Hidden, and a restored read post has its title muted and
+matches `is:read`. `App::new()` and `App::with_data` stay pure and never
 touch the file. Saving happens after `ratatui::restore()`, and only when
 `should_quit` is set, by `q` in the feed or Ctrl-C in any mode. A panic, or an
 I/O error that ends the event loop, doesn't save. When nothing differs from
@@ -1283,12 +1374,13 @@ each writes what it saw, and the last one to quit wins.
   error, below.
 - A malformed line (a bad escape, an unknown record kind or value, the wrong
   number of fields, invalid UTF-8, a `hidden` record in a `workit-state 1`
-  file) is skipped and the rest still loads. Blank lines are ignored. A record
+  file, a `read` record in a `workit-state 1` or `2` file) is skipped and
+  the rest still loads. Blank lines are ignored. A record
   repeated in the file sets the same state again, so a vote isn't toggled off.
   The next save drops the bad lines.
-- A file whose first line isn't exactly `workit-state 1` or `workit-state 2`
-  (empty, garbage, binary, a future `workit-state 3`) loads nothing and is
-  never overwritten.
+- A file whose first line isn't exactly `workit-state 1`, `workit-state 2` or
+  `workit-state 3` (empty, garbage, binary, a future `workit-state 4`) loads
+  nothing and is never overwritten. The message names all three.
 - A read error other than a missing file (permissions, not a regular file,
   over 1 MiB) loads nothing, and that run doesn't save, so a file it couldn't
   read is never replaced.
@@ -1310,8 +1402,8 @@ workit/
                 capture (also turned off on panic), event loop (no redraw for
                 ignored mouse events), loading the state file before the first
                 frame and saving it after the restore, messages on stderr
-    app.rs      state, feeds, sorts, voting, saving, hiding, joining, the
-                Card/Compact toggle, search
+    app.rs      state, feeds, sorts, voting, saving, hiding, read posts,
+                joining, the Card/Compact toggle, search
                 (query parsing, matching, highlight positions), comment focus
                 and collapse, the composer (typing, submitting, inserting your
                 comment and shifting the paths), find in comments (matching,
@@ -1320,20 +1412,20 @@ workit/
                 rendering
     data.rs     seed groups, posts, comments; `Comment::yours`, `YOU` and the
                 500-char limit
-    state.rs    the state file: content keys (never for your comments), format,
-                loading, atomic saving, path selection
-    ui.rs       all rendering (cards and compact rows, the view switch, the
-                composer, the find bar and its highlights, the help overlay
-                and its table, the footer's hint sets), including offset upkeep, post-view and help scroll
-                clamping, revealing the focused comment and recording the
-                click regions
+    state.rs    the state file: content keys (never for your comments), format
+                and its three versions, loading, atomic saving, path selection
+    ui.rs       all rendering (cards and compact rows, read titles muted, the
+                view switch, the composer, the find bar and its highlights,
+                the help overlay and its table, the footer's hint sets),
+                including offset upkeep, post-view and help scroll clamping,
+                revealing the focused comment and recording the click regions
 ```
 
 ## Testing
 
-219 unit tests, run with `cargo test`:
+238 unit tests, run with `cargo test`:
 
-- **`app.rs`** (89), on small custom data sets:
+- **`app.rs`** (97), on small custom data sets:
   - Home hides unjoined groups, and Popular hides low scores.
   - The exact order for each sort.
   - Feed cycling wraps in both directions, with Saved and then Hidden between
@@ -1498,7 +1590,31 @@ workit/
     - Every mouse event ignored while the bar is open (`handles_mouse` false,
       nothing changed), and with a find active a click focusing a comment,
       the wheel scrolling and the find staying.
-- **`ui.rs`** (102), rendering into a `TestBackend`:
+  - Read posts: every post unread at the start, the seed's included; `Enter`
+    marking the post read on Home, in the Compact view, with a kept search
+    and on a group feed, and going back or opening again keeping it read;
+    selecting, voting, saving, sharing, `PgDn`/`PgUp`, the wheel, the view
+    toggle, hiding and unhiding, and clicks on `▲` and Save marking nothing;
+    a card click marking it read in both views, and a stale card region
+    marking nothing.
+  - `m` toggling the selected post with the `Marked read` / `Marked unread`
+    toasts without opening it; in the post view toggling the open post,
+    keeping the scroll and the focused comment; opening, `m`, then `Esc`,
+    `q` or `Backspace` leaving it unread; `m` doing nothing in an empty
+    feed; typed in search mode (a live search for `m`), in the composer and
+    in the find bar; swallowed with the help open.
+  - `is:read`, `is:unread`, `IS:Unread`, `is:"read"`, an unclosed
+    `Is:"UNREAD`, `is:`, `is:""` and `is:" "` ignored, `is:foo`,
+    `is:saved`, `is:re`, `is:reads` and `is:" read"` matching nothing,
+    `is:read is:unread` ORed, `is:unread w/eng` and `is:read w/eng` ANDed,
+    `is:read two`, and `"is:read"` a phrase; `Query::parse` putting the
+    values in `states`, `is:foo` counting as a filter, and no highlight on
+    filter values.
+  - With `is:unread` kept, opening a post and going back, and `m`, keeping
+    the card in place under the cursor until a sort drops it (the search
+    kept); with `is:read` kept, `m` in the feed and in the post view keeping
+    the cards until a feed change.
+- **`ui.rs`** (107), rendering into a `TestBackend`:
   - The helpers `compact`, `age`, `wrap` and `truncate`.
   - The frontpage contents.
   - Sidebars hidden at narrow widths.
@@ -1788,22 +1904,44 @@ workit/
       no panic, the header unchanged, the bar's top-left corner at the
       bottom of the body (or its first row when the body is shorter than
       3), the bar's hints in the footer, and `n` with the find kept.
-- **`state.rs`** (28), on in-memory strings and on files in a directory
+  - Read posts:
+    - Cards: the two read titles `DIM` and not bold, the unread one white
+      and bold, the selected read card keeping its orange border and
+      highlighted vote column; every cell that differs from the same screen
+      with nothing read being a title cell with the same symbol and
+      background; the post view of a read post identical to an unread one.
+    - Compact rows: a read row's title `DIM` and not bold, the selected read
+      row on `HIGHLIGHT_BG` across its width with an orange, non-bold title,
+      an unread row white and bold, the same check that only title cells
+      differ, and selecting the unread row giving its orange bold title.
+    - A kept `HUGE is:read` search highlighting the match in a read title in
+      both views, the rest of the title keeping its style.
+    - Rendered clicks: a card click and a compact row click opening the post
+      and marking it read, its title muted after going back; a card's `▲`
+      and `☆ Save` and a row's `▲` and `☆` acting without marking it.
+    - Every click on a card's `▲`, `▼` (flipping, then clearing), `☆ Save`
+      and `★ Saved`, and on a compact row's `▲`, `▼`, `☆` and `★`, voting or
+      saving with the selection moved and the post never marked read or
+      opened; a click on the card or row itself then opening and marking it.
+- **`state.rs`** (34), on in-memory strings and on files in a directory
   under the system temp dir that each test creates and removes itself. No
   test reads or writes a real state file or reads `HOME`, `XDG_STATE_HOME`
   or `WORKIT_STATE`:
   - A round trip, by key presses, of a post upvote and downvote, a comment
     downvote at depth 2 and an upvote at depth 0, a save, joining an
-    unjoined group and leaving a joined one: the exact file contents, the
-    exact restored scores (seed ± 1), untouched neighbors, Home's first
-    build with the restored membership and Saved with the restored save.
+    unjoined group and leaving a joined one, and the post opened to vote on
+    its comments read: the exact file contents (`workit-state 3`), the
+    exact restored scores (seed ± 1), the read post read and its neighbors
+    not, Home's first build with the restored membership and Saved with the
+    restored save.
   - A saved upvote, loaded and undone with `a`, giving the seed score and a
-    file with no entries; undoing every change leaving a file with only the
-    version line; no file, and no directory, created when nothing changed.
+    file with no entries; undoing every change (`m` marking the read post
+    unread) leaving a file with only the version line; no file, and no
+    directory, created when nothing changed.
   - Keys surviving a seed whose groups, posts and comments are reordered,
     with a new group, a new post and new sibling comments at depths 0 and 2:
-    the right items restored, the new ones untouched, and the records written
-    back in the new seed order.
+    the right items restored, read state included, the new ones untouched,
+    and the records written back in the new seed order.
   - Keys matching nothing (an unknown group, post or comment, a reply named
     as top-level) dropped without counting as malformed.
   - Keys holding a tab, a newline, a carriage return, backslashes, `=` and
@@ -1813,10 +1951,12 @@ workit/
     vote value, missing or extra fields, invalid UTF-8) skipped and counted
     while valid lines load, a repeated vote not toggling, and a last line
     with no newline.
-  - An empty, blank, garbage, binary, `workit-state 3`, `workit-state 2 ` or
-    `workit-state 1 ` (trailing space) first line loading nothing and the file
-    left byte for byte as it was after a save, and a `workit-state 3` file
-    with a `hidden` record left alone too, its message naming both versions.
+  - An empty, blank, garbage, binary, `workit-state 4`, `workit-state 3 `,
+    `workit-state 2 ` or `workit-state 1 ` (trailing space) first line loading
+    nothing and the file left byte for byte as it was after a save, and a
+    `workit-state 4` file with `hidden` and `read` records left alone too,
+    after a run that opened and hid a post, its message naming all three
+    versions.
   - A round trip, by key presses, of a hidden post that is also saved and
     upvoted, next to a downvote: the exact file with `workit-state 2` and the
     records in seed order, the post restored hidden (missing from Home and
@@ -1843,25 +1983,50 @@ workit/
     `HOME`.
   - A save creating missing directories and leaving no temp file behind.
   - A shared key belonging to the first item, for posts and comments.
-  - Every key in the real seed unique, and the seed with no votes, saves or
-    hidden posts.
+  - Every key in the real seed unique, and the seed with no votes, saves,
+    hidden or read posts.
   - Ctrl-C with the help open saving the vote made before it and nothing
     pressed while it was open, the file unchanged in format, and the next
     run starting with the help closed.
   - A run that writes a top-level comment and votes on it, replies to a
     seeded reply and to that reply, then votes on a seeded reply and a
     seeded top-level comment that were both pushed down, saving a file byte
-    for byte the one the same votes save without the comments; loading it
-    restoring those votes onto the right comments, with the seed tree and
-    seed comment count back; and the file written back the same.
-  - Writing comments and nothing else creating no file.
+    for byte the one the same votes save without the comments (both with
+    the opened post's `read` record); loading it restoring those votes onto
+    the right comments, with the seed tree and seed comment count back; and
+    the file written back the same.
+  - Writing comments and nothing else (the post marked unread again with
+    `m`) creating no file.
   - Loading into an app that has your comments: records naming their keys
     matching nothing, your comments unchanged, a seeded record landing on
     the seeded comment at its shifted path.
   - A comment of yours with exactly a seeded sibling's key (a seed author
     called `you`, the same text) never saved and never taking the key: only
-    the seeded comment's vote is written, and it loads onto the seeded
-    comment, with or without yours in front of it.
+    the post's `read` and the seeded comment's vote are written, and the
+    vote loads onto the seeded comment, with or without yours in front of it.
+  - A read post round-tripping, by key presses, with exactly
+    `workit-state 3` and its `read` record, restored read (its neighbors
+    not, Home unchanged, `is:read` listing it), and written back the same.
+  - A post that is read, hidden, saved and upvoted, next to a read and
+    downvoted post with an upvoted comment: the exact file, each post's
+    records in the order `saved`, `hidden`, `read`, vote, comment votes;
+    all four restored, the post only in Hidden; written back the same.
+  - Marking every read post unread (`m` in Home and in Hidden) taking that
+    file down to `workit-state 2`, its hidden post left; and a file with
+    read posts but nothing hidden going down to `workit-state 1` (`m` in the
+    post view and in the feed).
+  - A `read` line skipped and counted in a `workit-state 1` file (with a
+    `hidden` one) and in a `workit-state 2` file (where `hidden` loads),
+    both loading in `workit-state 3`; in version 3, `read` records with the
+    wrong fields malformed and one matching nothing dropped; the next save
+    of the version 1 and 2 files dropping the bad line.
+  - A `workit-state 2` and a `workit-state 3` file written back byte for
+    byte after a run that moves around, switches feeds, views and searches
+    but opens no post.
+  - Read state following the post's key into the reordered seed (restored
+    on the same posts, the new post and the others unread), written back in
+    the new seed order, and a `read` record matching nothing dropped
+    without counting as malformed.
 
 Lint with `arc f`, `arc lint` and `arc rust-clippy`. The `arc lint -e extra`
 engine isn't configured for `users/`.

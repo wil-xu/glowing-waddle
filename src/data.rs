@@ -57,6 +57,9 @@ pub(crate) struct Post {
     pub saved: bool,
     /// Hidden posts show up only in the Hidden feed.
     pub hidden: bool,
+    /// Set when the post is opened, toggled by `m`. A read post's title is
+    /// drawn muted in the feed.
+    pub read: bool,
 }
 
 pub(crate) fn c(author: &'static str, score: i32, hours_ago: u32, body: &'static str) -> Comment {
