@@ -19,6 +19,10 @@ fix whichever one is wrong. Don't let them drift apart.
   commenting on a post and replying to any comment (yours included), saving
   posts and listing them in a Saved feed, and hiding posts, which then show up
   only in a Hidden feed where they can be unhidden.
+- Like a browser's find on Reddit's post page, `/` in the post view finds a
+  phrase in the comments: it jumps to each comment that mentions it, even
+  one hidden under a collapsed reply, and highlights every occurrence (see
+  Find in comments).
 - Like Reddit, the feed has a Card view (a bordered card per post, the
   default) and a Compact view (one row per post), switched at runtime with
   `v` or the switch on the sort-tab row.
@@ -36,7 +40,8 @@ fix whichever one is wrong. Don't let them drift apart.
   concerns).
 - Persisting anything beyond votes, saves, hidden posts and group membership.
   The feed, sort, search, Card/Compact view, selection, scroll, comment focus
-  and collapse state, the help overlay and the toast start fresh on every run,
+  and collapse state, find in comments, the help overlay and the toast start
+  fresh on every run,
   on Home, Hot, in the Card view, at the top, with the help closed.
 - Keeping the comments you write. They last for the session only: every run
   starts with the seed tree, and nothing about them (their text, your upvote
@@ -172,7 +177,8 @@ The screen is a header (3 rows), a body, and a footer (1 row).
     bottom.
 - **Footer:** key hints, which change with the mode. There are separate sets
   for the feed, the feed with a kept search, search mode, the post view with
-  and without a focused comment, the composer and the help overlay. They are
+  and without a focused comment, the post view with a find active, the
+  composer, the find bar and the help overlay. They are
   constants next to `render_footer` (`FEED_HINTS`, `GROUP_HINTS`, ...),
   picked by `hints`. The plain feed set is `a/z vote`, `1-4 sort`, `[/] feed`,
   `/ search`, `s save`, `h hide`, `? help`, `q quit` (72 columns, counting
@@ -193,30 +199,51 @@ The screen is a header (3 rows), a body, and a footer (1 row).
     (`[] feed`, `/ find`) saves only a column or two each, and dropping the
     same hint from both sets keeps them the same apart from `J join`. The
     trade-off: `v` is now found only through the switch or `?`.
-  - `j/k` and `c` (which the post view set shows), and `Tab` (only `1-4` for
+  - `j/k` (which the post view set shows), `c`, and `Tab` (only `1-4` for
     sorting).
 
   The feed set with a kept search is unchanged and still lists `enter open`:
   `j/k move`, `enter open`, `/ edit search`, `esc clear search`, `q quit`.
   The search set is `type filter`, `w/ u/ flair: narrow`, `enter keep`,
-  `esc clear`. The post view set is `j/k scroll`, `n/p comments`, `a/z vote`,
-  `r reply`, `s save`, `c share`, `? help`, `esc back` (80 columns, exactly
-  the limit). With a comment focused it is `n/p comments`,
-  `a/z vote comment`, `r reply`, `enter collapse`, `? help`, `esc unfocus`
-  (78): with `j/k scroll` it would be 90, and that is the hint to drop, since
-  a comment is only ever focused from the unfocused post view, whose set
-  shows it, the arrow keys scroll too, and `j`/`k` still work. `vote comment`
-  was the other candidate (shortening it to `vote` saves 8), but it is the
-  one hint that says the votes now go to the comment rather than the post,
-  which you can't guess. The composer's set is `type reply`, `enter post`,
+  `esc clear`. The post view set is `j/k scroll`, `n/p comments`, `/ find`,
+  `a/z vote`, `r reply`, `s save`, `? help`, `esc back` (79 columns). With a
+  comment focused it is `n/p comments`, `/ find`, `a/z vote comment`,
+  `enter collapse`, `? help`, `esc unfocus` (77). Both sets were close to
+  the limit before `/ find` (8 columns) came, so each gave something up:
+  - `j/k scroll`, from the focused set (with it, that set was 90 before
+    `/ find`), since a comment is only ever focused from the unfocused post
+    view, whose set shows it, the arrow keys scroll too, and `j`/`k` still
+    work. `vote comment` was the other candidate (shortening it to `vote`
+    saves 8), but it is the one hint that says the votes now go to the
+    comment rather than the post, which you can't guess.
+  - `c share`, from the unfocused set, which was 80 columns, exactly the
+    limit. It is the hint that does least (`c` only shows a toast), the feed
+    sets leave `c` out for the same reason, and `?` lists it.
+  - `r reply`, from the focused set, which `/ find` would have made 86. Like
+    `j/k`, the unfocused set, which always comes first, shows it, and every
+    expanded comment draws a `Reply` label right under its body that does
+    the same on a click. `vote comment` stayed for the reason above, and
+    shortening labels (`n/p next`, `enter fold`) saves 4 columns each and
+    makes them vaguer. The trade-off: with a comment focused, `r` is found
+    through the unfocused set, the `Reply` label or `?`.
+
+  With a find active (the bar closed with Enter on a match) the post view
+  shows `n/p match`, `a/z vote comment`, `enter collapse`, `/ edit find`,
+  `? help`, `esc clear` (77): the focused set, as a comment is always
+  focused then, with `n/p` going to the matches, `/` editing the find and
+  `esc` clearing it first, and leaving out `r reply` as that set does. The
+  find bar's set is `type find`, `enter keep`, `esc cancel`. The composer's
+  set is `type reply`, `enter post`,
   `esc cancel` when replying to a comment, and `type comment`, `enter post`,
-  `esc cancel` when commenting on the post; it has no `? help`, since the
-  composer types `?` like any other printable key. While the help is open
+  `esc cancel` when commenting on the post. Neither the composer's nor the
+  find bar's set has `? help`, since both type `?` like any other printable
+  key. While the help is open
   the footer shows `j/k scroll`, `g/G top/bottom`, `?/esc close` (42
   columns, so `close` still shows at 50; the help itself lists `PgDn`, `PgUp`
   and `Space`). The hints are the same in both views. A status toast
   (green, `✔ …`) replaces the hints until the next key press, left click or
-  wheel event (see Mouse).
+  wheel event (see Mouse). `n`/`p` with a find active show
+  `✔ Match k of N` the same way.
 - **Responsive:** the left nav shows only when the body is at least 70 columns
   wide, and the right sidebar only at 100 or more.
 
@@ -379,13 +406,16 @@ collapsed and expanded again. Focus and collapse state reset every time a
 post is opened from the feed; votes don't.
 
 **Keeping the focus on screen.** After `n` or `p` moves the focus, the
-composer opens (and shrinks the viewport), or a submit focuses your new
-comment, the next render scrolls by the least amount that brings the focused
+composer or the find bar opens (and shrinks the viewport), a submit focuses
+your new comment, or the find moves the focus to a match, the next render
+scrolls by the least amount that brings the focused
 comment's header row into view, up or down (none if it is already visible,
 or if nothing is focused). It happens once: `n`/`p`, opening the composer
 and the submit set `Thread.reveal` and the renderer clears it, so `j`/`k`/`PgUp`/
 `PgDn`/`Space`/`g`/`G` then scroll freely. `n` or `p` stopped at an end
-doesn't move the focus and doesn't scroll. Collapsing doesn't scroll either:
+doesn't move the focus and doesn't scroll. (With a find active, `n`/`p`
+wrap instead, so they always move to a match and reveal it.) Collapsing
+doesn't scroll either:
 it only removes rows below the focused header, so a header on screen stays
 on screen even when the scroll is clamped to the shorter content.
 
@@ -461,8 +491,109 @@ never saved (see Persistence).
 Free-text search terms are highlighted in the title and body the same way as
 on the cards, whenever a query is set (so a post opened from a searched feed
 stays highlighted), whether or not a comment is focused. The meta row and
-comments, `[+]` headers included, are not highlighted, and highlighting
-doesn't change the content height or the scroll clamping.
+comments, `[+]` headers included, are never highlighted by the feed query,
+and highlighting doesn't change the content height or the scroll clamping.
+Comment bodies are highlighted by the find instead (see Find in comments),
+and only by it.
+
+### Find in comments (`/`)
+
+`/` in the post view, with or without a focused comment, opens the find bar.
+`/` in the feed is still feed search, and `/` in search mode, the composer
+and the find bar is typed like any other printable key.
+
+**The bar** is a bordered box (orange, like the composer) docked at the
+bottom of the post column, across its full width, one text row high (3 with
+the border), titled ` Find in comments `. It shows the text as typed and the
+search box's orange `▏` cursor right after it; text too long for the row
+shows its end, so the cursor stays visible. Its bottom border shows,
+right-aligned, `k/N`: the current match and the number of matches, `0/0`
+with no match, and nothing while the text is empty. It docks exactly like
+the composer: the post view keeps working above it as a viewport 3 rows
+shorter (scroll clamp, reveal and click regions included), opening it asks
+for a reveal of the focused header, the header, nav, sidebar and footer stay,
+and when the column is shorter than 3 rows the bar takes all of it and is
+clipped. It never panics, down to 1×1.
+
+**What matches.** The text is one literal phrase: no quotes, no filters,
+trimmed at both ends (`Query::phrase` makes a `Query` with that one folded
+free-text term, or none when it is blank). A comment matches when its
+**body** contains the phrase, compared as feed search compares free text
+(`fold`: case-insensitive one char at a time, whitespace runs as one space,
+`jalapeño` and `İ` included). Every comment in the tree counts, at any depth,
+under a collapsed ancestor or not, yours included. Authors, the title and
+the post's body never match. Matches are numbered in tree pre-order, which is
+`CommentPath` order: a parent's path is a prefix of its replies'.
+
+**Matches are never stored.** `find_matches` walks the whole tree whenever
+they are needed (a keystroke, `n`/`p`, a frame with the bar open). The
+current match is simply `Thread.focus`, and `k` is its number among the
+matches (0 when the focused comment isn't one, which a click with a find
+active can cause, see below). The focus is already shifted by `make_room`,
+so a comment you write can't leave a stale match behind: one that matches
+just becomes a match, the count goes up and the later matches renumber.
+
+**Typing.** The bar is modal like the composer (see Key bindings). On every
+change of the text, the focus moves to the first match at or after the
+comment that was focused when the bar opened (the first match in the tree
+when nothing was), wrapping to the first match when there is none after it,
+and that match is shown. Typing is tentative: each change starts again from
+the focus and the collapsed set from when the bar opened (`Find.before`),
+not from the previous match, so only what the current match needs is
+expanded. A prefix that matched something under a collapsed comment doesn't
+leave it expanded once the text has moved on: typing `s` may expand a
+thread to show a reply, and `see` matching another comment collapses that
+thread again. With no match (or blank text) both the focus and the collapsed
+set are back to what they were when the bar opened.
+
+**Showing a match** (`Thread::show`, for typing and for `n`/`p`) expands
+every collapsed ancestor of it, and the match itself if it is collapsed (its
+body is what matched), focuses it and reveals its header once, like `n`/`p`.
+No other comment's collapse state changes. Enter keeps exactly what the
+current match needed.
+
+**Leaving the bar.**
+
+- `Enter` closes it. With a match, the find stays **active**: the focus
+  stays on the current match and the highlights stay. With blank text or no
+  match there is no active find, and the focus stays where typing left it
+  (back where it was). Like a submit, Enter carries the shrunk viewport's
+  scroll on.
+- `Esc` cancels: the bar closes, no find is active (even one that was active
+  before `/` reopened the bar), and the focus, the collapsed set and the
+  scroll are exactly as before `/`, whatever typing expanded or scrolled.
+  `Mode::Find` keeps the composer's `scroll`/`restore` pair for the scroll,
+  and `Find.before` keeps a copy of the thread from when `/` opened the bar;
+  Esc puts both back, and drops a reveal not yet drawn.
+
+**An active find.** With the bar closed and a find active:
+
+- `n`/`p` go to the next / previous **match** after / before the focus, in
+  pre-order, not the next visible comment. They wrap at both ends (so with
+  one match they stay on it), show the match as above, and toast
+  `Match k of N`.
+- `/` reopens the bar with the same text and the cursor at its end, moving
+  nothing; typing then looks from the focus at that moment.
+- `Esc` clears the find first, leaving the focus where it is; the next `Esc`
+  unfocuses, and the next goes back to the feed, as without a find.
+- Every other key works as without a find: votes on the focused comment,
+  `Enter` collapsing (the focused match included; `n`/`p` still visit every
+  match, expanding as needed), `r` and the composer, `s`, `c`, `?` and
+  scrolling.
+- The mouse works as without a find (a click on a header focuses it, a click
+  on `Reply` replies), and the find stays active.
+
+**Highlighting.** While the bar is open or a find is active, every
+occurrence of the phrase in every visible comment body is drawn black on
+orange, like feed search highlights, in the original case, through the same
+`Query::highlights` and `highlight_rows`. A match wrapped across rows lights
+its part on each. It only restyles cells, so the content height and the
+scroll clamp are the same as without it. Bodies never take the feed query's
+highlights, and the title and post body keep the feed query's.
+
+**Lifetime.** The find is session state for the open post: `App.find` is
+cleared when you go back to the feed (`q`, `Backspace`, the last `Esc`) and
+when a post is opened. It is never saved, and the state file doesn't change.
 
 The renderer clamps the scroll position to the content height (after any
 collapse) and writes it back into `Mode::Post { scroll }`. So `G` followed by
@@ -471,9 +602,10 @@ collapse) and writes it back into `Mode::Post { scroll }`. So `G` followed by
 ### Help overlay (`?`)
 
 `?` in the feed (either view, any feed, an empty one and one with a kept
-search included) or in the post view (focused or not) opens a box titled
-`Keys` over the body. In search mode `?` is typed into the query like any
-other printable key. Captured from the real binary in a 110×24 tmux pane,
+search included) or in the post view (focused or not, with a find active or
+not) opens a box titled `Keys` over the body. In search mode `?` is typed
+into the query like any other printable key, and so it is in the composer
+and the find bar. Captured from the real binary in a 110×24 tmux pane,
 right after `?` on the frontpage:
 
 ```
@@ -499,19 +631,20 @@ right after `?` on the frontpage:
 │                    │   esc            clear a kept search                            │cements · 332 comme… │
 │                    │   ?              this help                                      │─────────────────────╯
 │                    │   q              quit                                           │
-╰────────────────────╰───────────────────────────────────────────────────── 1-18 of 70 ╯
+╰────────────────────╰───────────────────────────────────────────────────── 1-18 of 77 ╯
  j/k scroll  g/G top/bottom  ?/esc close
 ```
 
-- **One table.** Everything in the box comes from `HELP` in `ui.rs`: seven
-  sections (Feed, Post view, Search mode, Composer, Mouse, This help,
-  Anywhere for Ctrl-C), each a list of rows, each row its keys (shown joined by `, `) and
+- **One table.** Everything in the box comes from `HELP` in `ui.rs`: eight
+  sections (Feed, Post view, Search mode, Composer, Find in comments, Mouse,
+  This help, Anywhere for Ctrl-C), each a list of rows, each row its keys (shown joined by `, `) and
   what they do. It mirrors "Key bindings" and "Mouse" below, so change them
   together. A test fails if a key of any footer hint set is missing from its
   mode's section, so the footer can't name a key the help doesn't explain.
 - **Order.** The section for the mode it was opened from comes first (Feed
   or Post view), then the others in table order. It never opens from search
-  mode or the composer, which type `?` like any other printable key. A blank line separates
+  mode, the composer or the find bar, which type `?` like any other
+  printable key. A blank line separates
   sections. Headings are white and bold, keys orange and bold, as in the
   footer. Each section's key column is as wide as its longest keys.
 - **Layout.** The box is centered over the body, whatever the mode drew
@@ -528,7 +661,8 @@ right after `?` on the frontpage:
   it to the content height and writes it back on every frame, as in the post
   view, so `G` then `k` moves at once, and after a resize the scroll fits the
   new box: never past the last line, and none at all when everything fits. When there is more than fits, the bottom border
-  shows the lines in view, `1-18 of 70` at 80×24.
+  shows the lines in view, `1-18 of 77` at 80×24. The 77 lines fit whole
+  from 83 rows.
 - **Modal.** The help sits on top of the mode and leaves it alone. Closing
   it returns to exactly the screen it was opened from: mode, feed, sort,
   kept search, selection, `offset`, view, post scroll, focus and collapse.
@@ -577,16 +711,23 @@ enum Vote { Up, None /* default */, Down }
   path (`CommentPath` in `app.rs`): its index among the top-level comments,
   then among that comment's replies, and so on. The state file names a
   comment by content, not by path. `Thread::visible` is the only walk
-  over the tree. It lists the visible comments in display order, with their
-  paths and collapse state, and both `n`/`p` and the renderer use it. A
-  vote just follows the focused path down the tree.
+  over what is shown. It lists the visible comments in display order, with
+  their paths and collapse state, and both `n`/`p` and the renderer use it.
+  `find_matches` is the only other walk: it lists the paths of the comments
+  the find matches, over the whole tree, collapsed or not, in the same
+  pre-order, and is called afresh each time, never stored. A vote just
+  follows the focused path down the tree.
 - **How paths stay valid.** The only change to a tree while running is a
   comment you write, inserted at index 0 of its parent's list. That moves
   every later sibling up one index, and with it every descendant of one,
   since a descendant's path starts with its ancestor's. Nothing else moves:
   ancestors, earlier siblings and other branches keep their paths. Paths
   are held in only three places: `Thread.focus`, `Thread.collapsed` and the
-  last frame's click regions. Before anything reads them again, the submit
+  last frame's click regions (plus the copy of the thread in `Find.before`
+  while the find bar is open, when no comment can be written; Enter empties
+  it). The find's matches aren't among them: they are worked out from the
+  tree each time, and the current match is `Thread.focus`. Before anything
+  reads them again, the submit
   calls `Thread::make_room(at)`, which, for the new comment's path `at` =
   `parent + [i]`, adds 1 at position `parent.len()` to every path that
   starts with `parent` and has an index of `i` or more there. So each
@@ -637,14 +778,16 @@ enum Vote { Up, None /* default */, Down }
 | `density: Density` | `Card` (the default) or `Compact`. Toggled by `v` and the view switch, never by a rebuild, and not saved |
 | `sort: Sort` | `Hot`, `New`, `Top`, `Rising` |
 | `feed: Feed` | `Home`, `Popular`, `All`, `Saved`, `Hidden`, `Group(usize)` |
-| `mode: Mode` | `Feed`, `Search`, `Post { scroll: u16 }`, `Compose { scroll: u16, restore: u16 }` (the post view with the composer open; `scroll` is the shrunk viewport's, which a submit carries on, and `restore` the post view's scroll from before it opened, which Esc goes back to). `scroll` is clamped, and moved to reveal a newly focused comment, by the renderer. `Mode` stays `Copy`: the draft lives in `draft` |
+| `mode: Mode` | `Feed`, `Search`, `Post { scroll: u16 }`, `Compose { scroll: u16, restore: u16 }` (the post view with the composer open; `scroll` is the shrunk viewport's, which a submit carries on, and `restore` the post view's scroll from before it opened, which Esc goes back to), `Find { scroll: u16, restore: u16 }` (the post view with the find bar open; the same pair, which Enter carries on and Esc goes back to). `scroll` is clamped, and moved to reveal a newly focused comment, by the renderer. `Mode` stays `Copy`: the draft lives in `draft`, the find in `find` |
 | `query: String` | search text, raw as typed. Kept after leaving search mode with Enter |
 | `search: Query` | `query` parsed into free-text terms and filters. Re-parsed on every rebuild of `view`, and used both to filter and to highlight |
 | `help: Option<Help>` | the `?` overlay: `None` when closed (at startup), else `Help { scroll: u16 }`. While it is open, keys and clicks go to it and `mode` is left as it was. `scroll` is clamped by the renderer. Not saved |
 | `hits: Option<Hits>` | where the most recent frame drew each clickable thing, written by the renderer on every frame. `None` until the first frame (see Mouse). A submit empties its regions |
 | `draft: String` | the composer's text, raw as typed, at most 500 chars. Emptied when the composer opens, on Esc and on a submit. Only used in `Mode::Compose`. What it answers is `thread.focus`, which can't change while the composer is open |
+| `find: Option<Find>` | find in comments: `None` with no find, else `Find { text, before }`, while the bar is open (`Mode::Find`) or the find is active (the post view, after Enter on a match). `text` is raw as typed, at most `MAX_FIND_CHARS` = 100 chars. `before` is the thread from when `/` opened the bar, for Esc, and empty once the bar closes. The matches and the current match aren't stored (see Find in comments). Cleared when a post is opened and when you go back to the feed. Not saved |
 | `thread: Thread` | the open post's comment state: `focus: Option<CommentPath>`, `collapsed: HashSet<CommentPath>` (see Data model, and how a submit shifts both) and `reveal: bool` (set when `focus` moves by `n`/`p` or a submit, cleared by the renderer once it has scrolled). Reset to the default whenever a post is opened. Only read in the post view and the composer |
-| `status: Option<&'static str>` | toast text. Every toast is a fixed string. Cleared on the next key press, left click or wheel event |
+| `status: Option<&'static str>` | toast text. Every toast in it is a fixed string. Cleared on the next key press, left click or wheel event |
+| `match_toast: Option<(usize, usize)>` | the `Match k of N` toast after `n`/`p` with a find active, kept apart so `status` stays a fixed string. Shown and cleared like `status`, which wins if both are set (they never are) |
 | `karma: u32` | fixed at 1,337 (shown as `1.3k`). Votes don't change it |
 | `should_quit` | checked by the event loop in `main.rs`, and by `main`, which saves the state file only when it is set |
 
@@ -716,6 +859,10 @@ current feed and sort, and the view updates on every keystroke.
   `Query::highlights` maps a match back onto the original text, including
   non-ASCII text like `jalapeño` or `°F` and chars that lowercase into
   several (`İ`). Only free-text terms are highlighted, not filter values.
+- **Find in comments** reuses all of this: `Query::phrase` makes the bar's
+  text one folded free-text term, `Query::found_in` tells whether a comment
+  body contains it, and `Query::highlights` and `highlight_rows` light it up
+  in the bodies (see Find in comments).
 - **Rendering:** `highlight_rows` in `ui.rs` walks the original text
   alongside the rows `wrap` made from it. `wrap` only drops whitespace and
   joins a row's words with one space, which stands for the whitespace run it
@@ -768,8 +915,8 @@ current feed and sort, and the view updates on every keystroke.
 
 ## Key bindings
 
-**Global:** Ctrl-C quits from any mode, including search, the composer and
-with the help open. Like `q` in the feed, it saves the state file (see
+**Global:** Ctrl-C quits from any mode, including search, the composer, the
+find bar and with the help open. Like `q` in the feed, it saves the state file (see
 Persistence).
 
 | Key | Feed | Post view |
@@ -779,7 +926,7 @@ Persistence).
 | `Space` | — | scroll 10 lines |
 | `g`/`Home`, `G`/`End` | first / last card | top / bottom |
 | `a` / `z` | upvote / downvote | same, for the focused comment, or the post with none focused |
-| `n` / `p` | — | focus next / previous visible comment |
+| `n` / `p` | — | focus next / previous visible comment. With a find active: the next / previous match, wrapping, with a `Match k of N` toast |
 | `s` | save / unsave (toast) | same, always for the post |
 | `h` | hide / unhide (toast: `Post hidden` / `Post unhidden`). Does nothing in an empty feed | — |
 | `J` | join / leave the group (toast). Only on a group feed, with or without a kept search | — |
@@ -789,8 +936,8 @@ Persistence).
 | `Enter` | open post (does nothing in an empty feed) | collapse / expand the focused comment (nothing with none focused) |
 | `1`-`4` / `Tab` | set / cycle sort | — |
 | `[` / `]` | prev / next feed | — |
-| `/` | enter search mode, editing any kept query | — |
-| `Esc` | clear a kept search. Otherwise nothing, so it never quits | unfocus the comment, or back to feed with none focused |
+| `/` | enter search mode, editing any kept query | open the find bar, with an active find's text |
+| `Esc` | clear a kept search. Otherwise nothing, so it never quits | clear an active find; else unfocus the comment; else back to feed |
 | `?` | open the help (see Help overlay) | same |
 | `q` | quit | back to feed |
 | `Backspace` | — | back to feed |
@@ -805,7 +952,7 @@ on a card's action row stays decorative.
 
 **Search mode:**
 
-- Every printable key, including `q`, `j`, `J`, `h`, `v`, `n`, `p`, `r`, `?` and
+- Every printable key, including `q`, `j`, `J`, `h`, `v`, `n`, `p`, `r`, `?`, `/` and
   digits, is typed into the query. Phrases and the `w/`, `u/` and `flair:` filters are
   described under Search.
 - Known limitation: modifiers are ignored here, so a Ctrl or Alt chord
@@ -829,7 +976,7 @@ on a card's action row stays decorative.
 **Composer** (`r` or a `Reply` click in the post view):
 
 - Every printable key, including `q`, `j`, `k`, `r`, `n`, `p`, `a`, `z`,
-  `s`, `c`, `h`, `v`, `J`, `g`, `G`, `?`, space and digits, is typed into the
+  `s`, `c`, `h`, `v`, `J`, `g`, `G`, `?`, `/`, space and digits, is typed into the
   draft, and none of them acts. Only unmodified or Shift-modified keys
   count: Shift is how capitals and symbols arrive. Any key with Ctrl, Alt or
   another modifier (Ctrl-W, Ctrl-U, Alt-x, Ctrl-Backspace, Alt-Enter) does
@@ -845,6 +992,21 @@ on a card's action row stays decorative.
   and the exact scroll from before the composer opened, even if opening it
   scrolled to keep the focused header visible.
 
+**Find bar** (`/` in the post view):
+
+| Key | Find bar |
+|---|---|
+| any printable key (`n`, `p`, `q`, `j`, `r`, `?`, `/`, space, digits included), unmodified or with Shift | typed, up to 100 chars (chars, not bytes); the focus moves to the first match from where it was when the bar opened |
+| `Backspace` | delete one char (nothing on empty text) |
+| `Enter` | close the bar; the find stays active on a match, and is dropped with blank text or no match |
+| `Esc` | cancel: no find, and the focus, collapsed set and scroll from before `/` |
+| Ctrl-C | quit, as from any mode |
+| any other Ctrl or Alt chord, Tab, the arrows, anything else | nothing |
+
+`/` in each mode: in the feed it enters search mode; in search mode, the
+composer and the find bar it is typed; in the post view it opens the find
+bar (with an active find's text); with the help open it does nothing.
+
 ## Mouse
 
 `main.rs` turns mouse capture on after `ratatui::init()` and off again
@@ -858,8 +1020,8 @@ below), and only those go to `App::on_mouse`.
 down). Releases, drags, moves, right and middle clicks and horizontal scrolls
 are ignored completely, so they don't even clear the toast. A left press or
 a wheel event clears the toast first, as a key press does, even when it
-lands on nothing. In search mode and while the composer is open every mouse
-event is ignored, clicks and the wheel included, and so is any event before
+lands on nothing. In search mode and while the composer or the find bar is
+open every mouse event is ignored, clicks and the wheel included, and so is any event before
 the first frame is drawn. `handles_mouse` is that rule, and
 `on_mouse` checks it first, so an event it rejects changes no state.
 
@@ -918,8 +1080,8 @@ recorded after the card or row, win over it.
 - Regions cover only what was drawn: nav rows only when the nav is drawn and
   only the rows that fit, a clipped card's visible part, arrows and Save
   labels only when their row is drawn, and comment headers and `Reply`
-  labels only inside the scrolled viewport (above the composer when it is
-  open). Everything is clipped like the widgets, so a click
+  labels only inside the scrolled viewport (above the composer or the find
+  bar when one is open). Everything is clipped like the widgets, so a click
   follows the responsive layout, the feed offset and the post-view scroll.
 - The arrows are drawn one cell each, where a centered one-cell line goes,
   so the cell recorded is the cell drawn. The Save label's columns come from
@@ -938,8 +1100,8 @@ recorded after the card or row, win over it.
   the shorter viewport, though no click reaches them.
 - `on_mouse` decides what a target does from the mode: card, sort, view
   switch, nav and search targets only act in the feed, `Comment` and
-  `Reply` only in the post view, and nothing in search mode or the
-  composer. It ignores a target that no longer applies, such as a card
+  `Reply` only in the post view (a find active or not: it stays active),
+  and nothing in search mode, the composer or the find bar. It ignores a target that no longer applies, such as a card
   index past the end of `view` or a comment hidden under a collapsed
   ancestor, so a stale region can't break the focus invariants. A submit
   shifts paths (see Data model), so it drops the last frame's regions
@@ -961,7 +1123,8 @@ tracking, so the terminal sends a steady stream of `Moved` events while the
 pointer moves. The event loop draws a frame only after an event that may
 have changed something: a key press, a mouse event `handles_mouse` accepts,
 or any non-mouse event (a resize, for one). `handles_mouse` rejects every
-mouse event in search mode and the composer, so those cost no redraw either. A mouse event it rejects changes
+mouse event in search mode, the composer and the find bar, so those cost no
+redraw either. A mouse event it rejects changes
 nothing, so the frame on screen, and the click regions recorded with it,
 are still current. Measured in a 110×24 tmux pane, 300 pointer moves and
 a click used to cost 302 full renders, and now cost 2 (startup and the
@@ -1151,7 +1314,8 @@ workit/
                 Card/Compact toggle, search
                 (query parsing, matching, highlight positions), comment focus
                 and collapse, the composer (typing, submitting, inserting your
-                comment and shifting the paths), key handling (the help's keys
+                comment and shifting the paths), find in comments (matching,
+                typing, showing a match, `n`/`p` between matches), key handling (the help's keys
                 included), mouse handling (hit-testing the click regions). No
                 rendering
     data.rs     seed groups, posts, comments; `Comment::yours`, `YOU` and the
@@ -1159,17 +1323,17 @@ workit/
     state.rs    the state file: content keys (never for your comments), format,
                 loading, atomic saving, path selection
     ui.rs       all rendering (cards and compact rows, the view switch, the
-                composer, the help overlay and its table, the footer's hint
-                sets), including offset upkeep, post-view and help scroll
+                composer, the find bar and its highlights, the help overlay
+                and its table, the footer's hint sets), including offset upkeep, post-view and help scroll
                 clamping, revealing the focused comment and recording the
                 click regions
 ```
 
 ## Testing
 
-197 unit tests, run with `cargo test`:
+219 unit tests, run with `cargo test`:
 
-- **`app.rs`** (73), on small custom data sets:
+- **`app.rs`** (89), on small custom data sets:
   - Home hides unjoined groups, and Popular hides low scores.
   - The exact order for each sort.
   - Feed cycling wraps in both directions, with Saved and then Hidden between
@@ -1278,7 +1442,63 @@ workit/
     scroll; Esc returning to `restore` even when the composer's scroll
     moved, and dropping a pending reveal; a submit carrying the composer's
     scroll on and revealing the new comment.
-- **`ui.rs`** (96), rendering into a `TestBackend`:
+  - Find in comments, on a tree of eight comments four levels deep whose
+    post body and title mention the phrase and whose authors don't appear
+    in any body:
+    - `/` opening the bar with and without a focused comment (empty text,
+      the focus kept, a reveal asked for, `restore` set); `/` still entering
+      search mode in the feed and typed in the composer.
+    - `n`, `p`, `q`, `j`, `k`, `r`, `?`, `/`, space, digits and more typed
+      without acting; Backspace deleting `ñ` as one char; Ctrl-W, Ctrl-U,
+      Alt-x, Alt-n, Ctrl-Backspace, Alt-Enter and Alt-Esc doing nothing,
+      Shift-`Q` typed; the 100-char limit counted in chars, with room again
+      after a Backspace; Tab and the arrows doing nothing; Ctrl-C quitting.
+    - Matching: case, a whitespace run in the body and in the text, a
+      non-ASCII phrase in either case, trimmed text, quotes and `u/`
+      taken literally, a phrase only in an author, the post body or the
+      title matching nothing, empty and blank text matching nothing, `İ`
+      matching itself, and a comment under a collapsed ancestor and one of
+      yours counting.
+    - Typing from no focus and from each comment landing on the first match
+      at or after it, wrapping from after the last; every change looking
+      from the starting comment again (`roll`, `roll b`, and back), the
+      trimmed `roll ` included; no match and empty text going back to the
+      starting focus; typing being tentative: `s` focusing dave and
+      expanding alice, then `see` focusing frank with alice collapsed again,
+      kept by Enter; a phrase extended past its last match putting back the
+      focus and the collapsed set from before `/`; Backspace back onto a
+      match showing it again; no match with nothing focused leaving nothing focused,
+      and Enter then keeping no find.
+    - A match under a collapsed grandparent, its parent and itself
+      collapsed: exactly those expanded, a collapsed sibling of an ancestor
+      and another branch left collapsed, and Esc putting all of them back;
+      a prefix's match left collapsed once the text moves on; `p` with a
+      find active
+      expanding only the match's ancestor.
+    - Esc restoring the focus, the collapsed set and the scroll exactly,
+      even when typing expanded a comment and a frame scrolled, and straight
+      after opening; Enter keeping the find on a match (carrying the scroll
+      on, `before` emptied, `1/3`); Enter with no match or empty text
+      dropping it, the focus left where it was, `n` back to comments.
+    - With a find active: `n`/`p` visiting the matches in order and wrapping
+      at both ends with the `Match k of N` toast and a reveal, the next key
+      clearing the toast; collapsing the focused match and `n`/`p` expanding
+      it again; `n`/`p` from a comment that isn't a match; one match
+      staying put; votes, `s`, `c`, scrolling, the help, `Enter` and the
+      composer working as usual and the find staying; `/` reopening with the
+      same text, moving nothing, typing from there, and Esc dropping the
+      find; `Esc` clearing it, then unfocusing, then going back.
+    - A matching reply to the first match renumbering the later ones (`2/4`,
+      then `n` to carol's shifted path as `3 of 4`), a reply that doesn't
+      match showing `0/4`, and with the last match current, a click on an
+      earlier comment's `Reply` (the find staying active) inserting a match
+      before it.
+    - `q` and `Backspace` clearing the find, opening a post starting with
+      none, and `n` back to comments.
+    - Every mouse event ignored while the bar is open (`handles_mouse` false,
+      nothing changed), and with a find active a click focusing a comment,
+      the wheel scrolling and the find staying.
+- **`ui.rs`** (102), rendering into a `TestBackend`:
   - The helpers `compact`, `age`, `wrap` and `truncate`.
   - The frontpage contents.
   - Sidebars hidden at narrow widths.
@@ -1304,15 +1524,19 @@ workit/
     with a kept search staying, and Hidden's sidebar.
   - The group sidebar button and nav mark flipping with `J`.
   - Every hint set (feed, kept search, search, post view unfocused and
-    focused, the composer for a comment and for the post, help) fitting in
-    80 columns on every feed, Hidden included, in both the Card and Compact
-    views, with the exact plain and group feed sets, `h hide` and `? help`
-    in both, `J join` only in the feed set on group feeds, the exact
-    search-mode, post-view (`r reply` in both), composer and help sets, the
-    toggle's toast, a toast replacing the focused set, typing (`?`
-    included) keeping the composer's set, `Esc` from the composer bringing
-    back the post set it came from, and `Esc` bringing back the unfocused
-    one. Closing the help bringing back the set it replaced.
+    focused, the composer for a comment and for the post, the find bar, an
+    active find, help) fitting in 80 columns on every feed, Hidden
+    included, in both the Card and Compact views, with the exact plain and
+    group feed sets, `h hide` and `? help` in both, `J join` only in the
+    feed set on group feeds, the exact search-mode, post-view (`/ find` in
+    both, `r reply` only unfocused), composer, find bar, active find and
+    help sets, the toggle's toast, a toast replacing the focused set,
+    typing (`?` included) keeping the composer's and the find bar's set,
+    `Esc` from the composer bringing back the post set it came from, `n`
+    with a find active showing the `Match` toast, `Esc` clearing the find
+    bringing back the focused set, `Esc` from the find bar bringing back
+    the unfocused one, and `Esc` bringing back the unfocused one. Closing
+    the help bringing back the set it replaced.
   - The composer at 110×24 and 80×24, row by row: the ` Commenting on the
     post ` and ` Replying to u/bob ` titles, the cursor in orange right
     after the last char, `0/500` and `<n>/500` right-aligned on the bottom
@@ -1481,10 +1705,10 @@ workit/
       wraps. The feed's section first and `1-18 of N` on the bottom border.
     - The current mode's section first: Feed (with a kept search too), or
       Post view then Feed, the rest in table order (Search mode, Composer,
-      Mouse, This help, Anywhere).
+      Find in comments, Mouse, This help, Anywhere).
     - At 80×24, 100×30, 110×24 and 200×80, from the feed and the post view,
       scrolling through all of it: every line, and every description whole,
-      on screen. Tall enough, no scrolling and no position shown.
+      on screen. Tall enough (200×90), no scrolling and no position shown.
     - Each scrolling key, clamped at both ends; `G` storing `u16::MAX` and
       the renderer clamping it so the last row (`Ctrl-C`) is the box's last;
       `G` then `k` moving at once; the feed never moving.
@@ -1507,7 +1731,8 @@ workit/
       at 80×24, the scroll re-clamped to the new content and box, the last
       line on the box's last row (the whole content, unscrolled, when it
       fits) and `k` moving on the very next frame; a scroll left at the old
-      bottom clamped by a bigger box alone, and down to 1×1 no panic.
+      bottom clamped by a bigger box alone (to none at 80×90, where it
+      fits), and down to 1×1 no panic.
     - From cards and compact rows scrolled down, a group feed with a kept
       search, an empty feed and a post view with a focused and a collapsed
       comment, scrolled: `?`, `Esc` and `q` each closing it and restoring
@@ -1524,12 +1749,45 @@ workit/
       the footer the help's set (where the body has 2 rows or more), and the
       scroll within its clamp after `G`.
     - Every key of every footer hint set listed in the help table under its
-      mode's section (the composer's sets under Composer), along with the
-      keys the feed sets leave out; each section once; and the footer only
-      ever showing one of those sets, walking through the feed, search, the
-      post view, the help and the composer for a reply and a comment.
-    - Every char of the help table and the hint sets one cell wide in
+      mode's section (the composer's sets under Composer, the find bar's
+      under Find in comments, the active find's under Post view), along with
+      the keys the feed and post view sets leave out; each section once; and
+      the footer only ever showing one of those sets, walking through the
+      feed, search, the post view, the help, the composer for a reply and a
+      comment, the find bar and an active find.
+    - Every char of the help table and the hint sets (the find bar's and
+      the active find's included, and the bar's title) one cell wide in
       ratatui (`↓`, `↑`, `▲`, `▼` and `☆` included), and `▦`/`≡` unused.
+  - Find in comments, on a post whose title and body mention the phrase,
+    with alice's body holding it twice, carol's `jalapeño` twice, fillers,
+    and zed's at the bottom:
+    - The bar at 110×24 and 80×24, row by row: ` Find in comments ` on its
+      top border right below the post box, the text and the orange cursor
+      right after it, nothing on the bottom border with empty text, `1/2`,
+      `0/0` with no match, `1/2` with a trailing space (trimmed), the bar's
+      hints; after Enter the bar gone and the active find's hints, `n`
+      toasting `Match 2 of 2` with zed focused on screen; `/` reopening it
+      with the same text and `2/2`; a 100-char text showing its end and the
+      cursor.
+    - Highlights black on orange, colors only, on every occurrence in a
+      body, with the bar open and with the find kept, in the original case,
+      `JALAPEÑO` lighting both `jalapeño` and `JALAPEÑO`; a body with no
+      match, the title, the post body and the header plain; a kept feed
+      search lighting the title but no body, and a find next to it lighting
+      only its own phrase in the bodies; Esc clearing them.
+    - Highlighting changing no text, scroll clamp or click region at 110,
+      60, 40 and 30 columns, after `G`; a match wrapped across two rows lit
+      on both.
+    - At widths from 12 to 120, the post view above the bar identical to the
+      same post at 21 rows (scroll clamp included), the header unchanged,
+      the bar's corners on the column's edges.
+    - Typing scrolling zed's header into view above the bar, clicks and the
+      wheel on it doing nothing (every field of `App` unchanged), and Esc
+      restoring the scroll.
+    - Every size from 1×1 to 32×12, plus 80×4 to 80×7, 200×5 and 30×24:
+      no panic, the header unchanged, the bar's top-left corner at the
+      bottom of the body (or its first row when the body is shorter than
+      3), the bar's hints in the footer, and `n` with the find kept.
 - **`state.rs`** (28), on in-memory strings and on files in a directory
   under the system temp dir that each test creates and removes itself. No
   test reads or writes a real state file or reads `HOME`, `XDG_STATE_HOME`

@@ -51,6 +51,8 @@ const SCORE_WIDTH: usize = 5;
 const MIN_TITLE: usize = 20;
 /// The composer's text rows, inside its border.
 const COMPOSER_ROWS: u16 = 3;
+/// The find bar's text rows, inside its border.
+const FIND_ROWS: u16 = 1;
 
 fn compact(n: i64) -> String {
     if n.abs() < 1_000 {
@@ -147,7 +149,7 @@ pub(crate) fn render(frame: &mut Frame, app: &mut App) {
         render_sidebar(frame, app, sidebar);
     }
     match app.mode {
-        Mode::Post { scroll } | Mode::Compose { scroll, .. } => {
+        Mode::Post { scroll } | Mode::Compose { scroll, .. } | Mode::Find { scroll, .. } => {
             render_post(frame, app, main, scroll, &mut hits)
         }
         Mode::Feed | Mode::Search => render_feed(frame, app, main, &mut hits),
@@ -230,7 +232,7 @@ type Hint = (&'static str, &'static str);
 // Every hint set must fit on one line at 80 columns, counting the blank after
 // the last hint, on every feed, in both views.
 //
-// The feed sets leave out `j/k`, `c` (which the post view set shows) and
+// The feed sets leave out `j/k` (which the post view set shows), `c` and
 // `Tab` (only `1-4`). With `J join` the group set would be 84 with
 // `enter open`, and with `v view` the plain set would be too, so both leave
 // it out: Enter is the most guessable key, and clicking a card or a compact
@@ -273,29 +275,48 @@ const SEARCH_HINTS: &[Hint] = &[
     ("enter", "keep"),
     ("esc", "clear"),
 ];
-// With `r reply` this set is 80 columns, counting the blank after the last
-// hint: exactly the limit.
+// With `r reply` this set was 80 columns, counting the blank after the last
+// hint: exactly the limit. `/ find` (8 more) made it give up `c share`, the
+// hint that does least: `c` only shows a toast, the feed sets leave it out
+// too, and `?` lists it. That makes 79.
 const POST_HINTS: &[Hint] = &[
     ("j/k", "scroll"),
     ("n/p", "comments"),
+    ("/", "find"),
     ("a/z", "vote"),
     ("r", "reply"),
     ("s", "save"),
-    ("c", "share"),
     ("?", "help"),
     ("esc", "back"),
 ];
 // With `? help` and `r reply` this set would be 90, so it leaves out
 // `j/k scroll`: the set above always shows it first, since a comment is only
 // focused from the unfocused post view, and the wheel scrolls too. `vote
-// comment` stays, as it says what `a`/`z` act on. That makes 78.
+// comment` stays, as it says what `a`/`z` act on. That made 78, and `/ find`
+// would make it 86, so it gives up `r reply` too, for the same reason as
+// `j/k`: the set above shows it first, and every expanded comment draws a
+// `Reply` label right under its body that does the same on a click. That
+// makes 77.
 const FOCUSED_HINTS: &[Hint] = &[
     ("n/p", "comments"),
+    ("/", "find"),
     ("a/z", "vote comment"),
-    ("r", "reply"),
     ("enter", "collapse"),
     ("?", "help"),
     ("esc", "unfocus"),
+];
+// The find bar types every plain key, `?` included, so it has no `? help`.
+const FIND_BAR_HINTS: &[Hint] = &[("type", "find"), ("enter", "keep"), ("esc", "cancel")];
+// A find is only active on a match, so a comment is focused: the focused set,
+// with `n/p` now going to the matches, `/` editing the find, and `esc`
+// clearing it first. It leaves out `r reply` as that set does. 77 columns.
+const ACTIVE_FIND_HINTS: &[Hint] = &[
+    ("n/p", "match"),
+    ("a/z", "vote comment"),
+    ("enter", "collapse"),
+    ("/", "edit find"),
+    ("?", "help"),
+    ("esc", "clear"),
 ];
 // Short enough (42 columns) that `close` still shows at 50 columns. The
 // help itself lists `PgDn`/`PgUp`/`Space`, on screen while this is.
@@ -314,15 +335,28 @@ fn hints(app: &App) -> &'static [Hint] {
         Mode::Feed if matches!(app.feed, Feed::Group(_)) => GROUP_HINTS,
         Mode::Feed => FEED_HINTS,
         Mode::Search => SEARCH_HINTS,
+        Mode::Post { .. } if app.find.is_some() => ACTIVE_FIND_HINTS,
         Mode::Post { .. } if app.thread.focus.is_some() => FOCUSED_HINTS,
         Mode::Post { .. } => POST_HINTS,
         Mode::Compose { .. } if app.thread.focus.is_some() => REPLY_HINTS,
         Mode::Compose { .. } => COMMENT_HINTS,
+        Mode::Find { .. } => FIND_BAR_HINTS,
     }
 }
 
+/// Draws the toast if there is one, else the mode's hint set. Every set fits
+/// 80 columns, and the comments on the sets above say what each one leaves
+/// out for that: when `/ find` came, the post view set gave up `c share`
+/// (only a toast, and left out of the feed sets too) and the focused set
+/// `r reply` (shown by the unfocused set first, and by the `Reply` label
+/// under every expanded comment). `?` lists every key.
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
-    if let Some(status) = app.status {
+    let toast = match (app.status, app.match_toast) {
+        (Some(status), _) => Some(status.to_owned()),
+        (None, Some((k, n))) => Some(format!("Match {k} of {n}")),
+        (None, None) => None,
+    };
+    if let Some(status) = toast {
         frame.render_widget(
             Line::from(Span::styled(
                 format!(" ✔ {status} "),
@@ -353,6 +387,7 @@ enum Section {
     Post,
     Search,
     Compose,
+    Find,
     Mouse,
     Help,
     Anywhere,
@@ -365,7 +400,7 @@ type HelpRow = (&'static [&'static str], &'static str);
 /// shows a few of these; a test checks that each footer key is listed here,
 /// in the section for its mode. Keep it in step with PLAN.md's "Key
 /// bindings" and "Mouse".
-const HELP: [(Section, &str, &[HelpRow]); 7] = [
+const HELP: [(Section, &str, &[HelpRow]); 8] = [
     (
         Section::Feed,
         "Feed",
@@ -397,13 +432,14 @@ const HELP: [(Section, &str, &[HelpRow]); 7] = [
             (&["PgDn/PgUp"], "scroll 10 lines down / up"),
             (&["Space"], "scroll 10 lines down"),
             (&["g/G", "Home/End"], "top / bottom"),
-            (&["n/p"], "focus the next / previous comment"),
+            (&["n/p"], "focus the next / previous comment or match"),
             (&["a/z"], "vote on the focused comment, or the post"),
             (&["r"], "reply to the focused comment, or the post"),
             (&["enter"], "collapse / expand the focused comment"),
             (&["s"], "save / unsave the post"),
             (&["c"], "copy the post's link"),
-            (&["esc"], "unfocus the comment, or back to the feed"),
+            (&["/"], "find in comments, editing an active find"),
+            (&["esc"], "clear the find, unfocus, or back to the feed"),
             (&["q", "Backspace"], "back to the feed"),
             (&["?"], "this help"),
         ],
@@ -427,6 +463,16 @@ const HELP: [(Section, &str, &[HelpRow]); 7] = [
             (&["Backspace"], "delete a character"),
             (&["enter"], "post it"),
             (&["esc"], "discard it, back to the post"),
+        ],
+    ),
+    (
+        Section::Find,
+        "Find in comments",
+        &[
+            (&["type"], "find as you type: q, j, ? and digits too"),
+            (&["Backspace"], "delete a character"),
+            (&["enter"], "keep the find, so n/p go to the matches"),
+            (&["esc"], "cancel, back to where you were"),
         ],
     ),
     (
@@ -502,6 +548,7 @@ fn help_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         Mode::Search => Section::Search,
         Mode::Post { .. } => Section::Post,
         Mode::Compose { .. } => Section::Compose,
+        Mode::Find { .. } => Section::Find,
     };
     let sections = HELP
         .iter()
@@ -1280,13 +1327,15 @@ fn render_compact_row(
 
 /// One comment, without its replies. A collapsed one is only its header,
 /// marked `[+]` and counting the replies it hides, and its guide row.
-/// Returns where the `Reply` label is drawn, if it is: the index in `out`
-/// of the action row, and the label's columns from the start of the row.
+/// Occurrences of `find` in the body are highlighted. Returns where the
+/// `Reply` label is drawn, if it is: the index in `out` of the action row,
+/// and the label's columns from the start of the row.
 fn comment_lines(
     comment: &Comment,
     depth: usize,
     collapsed: bool,
     focused: bool,
+    find: &Query,
     width: usize,
     out: &mut Vec<Line<'static>>,
 ) -> Option<(usize, Range<u16>)> {
@@ -1323,9 +1372,17 @@ fn comment_lines(
     let mut reply = None;
     if !collapsed {
         out.extend(
-            wrap(&comment.body, text_width)
-                .into_iter()
-                .map(|l| Line::from(vec![Span::styled(prefix.clone(), guide), Span::raw(l)])),
+            highlight_rows(
+                &comment.body,
+                &find.highlights(&comment.body),
+                whole(wrap(&comment.body, text_width)),
+                Style::default(),
+            )
+            .into_iter()
+            .map(|mut line| {
+                line.spans.insert(0, Span::styled(prefix.clone(), guide));
+                line
+            }),
         );
         let arrow = |active: bool, glyph: &'static str, c: Color| {
             Span::styled(glyph, Style::new().fg(if active { c } else { DIM }).bold())
@@ -1363,25 +1420,26 @@ fn comment_lines(
 }
 
 /// The post view, as a scrolled viewport. In `Mode::Compose` the composer
-/// is docked below it, across the column, and the viewport (its scroll
-/// clamp and click regions included) is the height left above it.
+/// is docked below it, across the column, and in `Mode::Find` the find bar
+/// is, and the viewport (its scroll clamp and click regions included) is the
+/// height left above it.
 fn render_post(frame: &mut Frame, app: &mut App, area: Rect, scroll: u16, hits: &mut Hits) {
-    let composing = matches!(app.mode, Mode::Compose { .. });
-    let (area, composer) = if composing {
-        let height = (COMPOSER_ROWS + 2).min(area.height);
-        let post = Rect {
-            height: area.height - height,
-            ..area
-        };
-        let composer = Rect {
-            y: post.bottom(),
-            height,
-            ..area
-        };
-        (post, Some(composer))
-    } else {
-        (area, None)
+    let docked = match app.mode {
+        Mode::Compose { .. } => COMPOSER_ROWS + 2,
+        Mode::Find { .. } => FIND_ROWS + 2,
+        _ => 0,
     };
+    let dock_height = docked.min(area.height);
+    let area = Rect {
+        height: area.height - dock_height,
+        ..area
+    };
+    let dock = Rect {
+        y: area.bottom(),
+        height: dock_height,
+        ..area
+    };
+    let find = app.find_query();
     let Some(post) = app.selected_post() else {
         return;
     };
@@ -1453,6 +1511,7 @@ fn render_post(frame: &mut Frame, app: &mut App, area: Rect, scroll: u16, hits: 
             shown.depth(),
             shown.collapsed,
             focused,
+            &find,
             width,
             &mut lines,
         ) {
@@ -1482,6 +1541,7 @@ fn render_post(frame: &mut Frame, app: &mut App, area: Rect, scroll: u16, hits: 
     app.thread.reveal = false;
     app.mode = match app.mode {
         Mode::Compose { restore, .. } => Mode::Compose { scroll, restore },
+        Mode::Find { restore, .. } => Mode::Find { scroll, restore },
         _ => Mode::Post { scroll },
     };
 
@@ -1519,8 +1579,10 @@ fn render_post(frame: &mut Frame, app: &mut App, area: Rect, scroll: u16, hits: 
             .block(block.padding(Padding::horizontal(1))),
         area,
     );
-    if let Some(composer) = composer {
-        render_composer(frame, app, composer);
+    match app.mode {
+        Mode::Compose { .. } => render_composer(frame, app, dock),
+        Mode::Find { .. } => render_find_bar(frame, app, dock),
+        _ => {}
     }
 }
 
@@ -1599,6 +1661,41 @@ fn render_composer(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+/// The find bar: a bordered box with the text as typed and the search
+/// box's cursor after it (the end of the text, when it is too long for the
+/// row), and the current match and the number of matches on its bottom
+/// border, nothing while the text is empty.
+fn render_find_bar(frame: &mut Frame, app: &App, area: Rect) {
+    let text = app.find.as_ref().map_or("", |find| find.text.as_str());
+    let mut block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(ORANGE)
+        .title(Line::styled(
+            " Find in comments ",
+            Style::new().fg(Color::White).bold(),
+        ))
+        .padding(Padding::horizontal(1));
+    if !text.is_empty() {
+        let (k, n) = app.match_number();
+        block = block
+            .title_bottom(Line::styled(format!(" {k}/{n} "), Style::new().fg(DIM)).right_aligned());
+    }
+    let inner = block.inner(area);
+    // The cursor takes a cell, so the row shows the last chars that fit
+    // before it.
+    let room = usize::from(inner.width).saturating_sub(1);
+    let chars = text.chars().count();
+    let shown: String = text.chars().skip(chars.saturating_sub(room)).collect();
+    let line = Line::from(vec![
+        Span::raw(shown),
+        Span::styled(
+            "▏",
+            Style::new().fg(ORANGE).add_modifier(Modifier::SLOW_BLINK),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(line).block(block), area);
+}
+
 #[cfg(test)]
 mod tests {
     use ratatui::Terminal;
@@ -1614,6 +1711,7 @@ mod tests {
     use ratatui::layout::Position;
 
     use super::*;
+    use crate::app::MAX_FIND_CHARS;
     use crate::data;
 
     fn buffer(app: &mut App, width: u16, height: u16) -> Buffer {
@@ -1988,7 +2086,7 @@ mod tests {
                 assert!(post.ends_with("esc back"), "{feed:?}: {post:?}");
                 assert_eq!(
                     post,
-                    " j/k scroll  n/p comments  a/z vote  r reply  s save  c share  ? help  esc back",
+                    " j/k scroll  n/p comments  / find  a/z vote  r reply  s save  ? help  esc back",
                     "{feed:?}"
                 );
                 assert!(post.chars().count() <= 80, "{feed:?}: {post:?}");
@@ -2011,7 +2109,7 @@ mod tests {
                 let focused = footer(&mut app);
                 assert_eq!(
                     focused,
-                    " n/p comments  a/z vote comment  r reply  enter collapse  ? help  esc unfocus",
+                    " n/p comments  / find  a/z vote comment  enter collapse  ? help  esc unfocus",
                     "{feed:?}"
                 );
                 assert!(focused.chars().count() <= 80, "{feed:?}: {focused:?}");
@@ -2027,8 +2125,41 @@ mod tests {
                 assert_eq!(footer(&mut app), focused, "{feed:?}: cancelled");
                 press(&mut app, KeyCode::Char('c'));
                 assert_eq!(footer(&mut app), " ✔ Link copied to clipboard!", "{feed:?}");
+                // The find bar, typed into (`?` included), then kept.
+                press(&mut app, KeyCode::Char('/'));
+                let bar = footer(&mut app);
+                assert_eq!(bar, " type find  enter keep  esc cancel", "{feed:?}");
+                type_str(&mut app, "?");
+                assert_eq!(footer(&mut app), bar, "{feed:?}: typing keeps it");
+                press(&mut app, KeyCode::Backspace);
+                type_str(&mut app, "t");
+                press(&mut app, KeyCode::Enter);
+                assert!(app.find.is_some(), "{feed:?}: every post has a t");
+                let found = footer(&mut app);
+                assert_eq!(
+                    found,
+                    " n/p match  a/z vote comment  enter collapse  / edit find  ? help  esc clear",
+                    "{feed:?}"
+                );
+                assert!(found.chars().count() <= 80, "{feed:?}: {found:?}");
+                press(&mut app, KeyCode::Char('n'));
+                assert!(
+                    footer(&mut app).starts_with(" ✔ Match "),
+                    "{feed:?}: the toast"
+                );
+                press(&mut app, KeyCode::Char('?'));
+                assert_eq!(footer(&mut app), HELP_FOOTER, "{feed:?}: find");
+                press(&mut app, KeyCode::Esc);
+                assert_eq!(footer(&mut app), found, "{feed:?}: help closed");
+                press(&mut app, KeyCode::Esc);
+                assert_eq!(footer(&mut app), focused, "{feed:?}: find cleared");
+
                 press(&mut app, KeyCode::Esc);
                 assert_eq!(footer(&mut app), post, "{feed:?}: unfocused again");
+                press(&mut app, KeyCode::Char('/'));
+                assert_eq!(footer(&mut app), bar, "{feed:?}: unfocused");
+                press(&mut app, KeyCode::Esc);
+                assert_eq!(footer(&mut app), post, "{feed:?}: find cancelled");
                 press(&mut app, KeyCode::Esc);
                 assert_eq!(app.mode, Mode::Feed, "{feed:?}");
                 assert_eq!(app.density, density, "{feed:?}: back in the same view");
@@ -3252,6 +3383,7 @@ mod tests {
                     app.karma,
                     app.should_quit
                 ),
+                (&app.draft, &app.find, app.match_toast),
             )
         )
     }
@@ -4274,7 +4406,14 @@ mod tests {
 
     #[test]
     fn the_section_for_the_current_mode_comes_first() {
-        let others = ["Search mode", "Composer", "Mouse", "This help", "Anywhere"];
+        let others = [
+            "Search mode",
+            "Composer",
+            "Find in comments",
+            "Mouse",
+            "This help",
+            "Anywhere",
+        ];
         let mut app = thread_post();
         press(&mut app, KeyCode::Char('?'));
         assert_eq!(headings(&app)[..2], ["Feed", "Post view"]);
@@ -4344,7 +4483,7 @@ mod tests {
         // Tall enough for all of it: no scrolling and no position.
         let mut app = App::new();
         press(&mut app, KeyCode::Char('?'));
-        let buf = buffer(&mut app, 200, 80);
+        let buf = buffer(&mut app, 200, 90);
         assert_eq!(app.hits.as_ref().unwrap().max_scroll, 0);
         let area = help_box(&app).unwrap();
         assert_eq!(area.height, help_text(&app, usize::MAX).len() as u16 + 2);
@@ -4615,7 +4754,7 @@ mod tests {
         assert!(big < small, "{big} < {small}");
         let inner = usize::from(help_box(&app).unwrap().width - 4);
         assert_eq!(usize::from(big), help_text(&app, inner).len() - 44);
-        buffer(&mut app, 80, 80);
+        buffer(&mut app, 80, 90);
         assert_eq!(help_scroll(&app), 0);
         buffer(&mut app, 30, 8);
         assert_eq!(
@@ -4919,15 +5058,17 @@ mod tests {
                 .flat_map(|(keys, _)| keys.iter())
                 .any(|k| *k == key || (key.chars().count() > 1 && k.eq_ignore_ascii_case(key)))
         };
-        let sets: [(&[Hint], Section); 9] = [
+        let sets: [(&[Hint], Section); 11] = [
             (FEED_HINTS, Section::Feed),
             (GROUP_HINTS, Section::Feed),
             (KEPT_SEARCH_HINTS, Section::Feed),
             (POST_HINTS, Section::Post),
             (FOCUSED_HINTS, Section::Post),
+            (ACTIVE_FIND_HINTS, Section::Post),
             (SEARCH_HINTS, Section::Search),
             (REPLY_HINTS, Section::Compose),
             (COMMENT_HINTS, Section::Compose),
+            (FIND_BAR_HINTS, Section::Find),
             (HELP_HINTS, Section::Help),
         ];
         for (set, section) in sets {
@@ -4942,12 +5083,18 @@ mod tests {
         assert!(listed(Section::Anywhere, "Ctrl-C"));
         assert!(listed(Section::Search, "Backspace"));
         assert!(listed(Section::Post, "Backspace") && listed(Section::Post, "Space"));
+        // What the post view's sets leave out is in the help.
+        for key in ["c", "r", "j/k", "s"] {
+            assert!(listed(Section::Post, key), "{key}");
+        }
+        assert!(listed(Section::Find, "Backspace"));
         // Each section once.
         for section in [
             Section::Feed,
             Section::Post,
             Section::Search,
             Section::Compose,
+            Section::Find,
             Section::Mouse,
             Section::Help,
             Section::Anywhere,
@@ -4961,7 +5108,19 @@ mod tests {
             assert!(sets.iter().any(|(set, _)| *set == shown), "{shown:?}");
         };
         for keys in [
-            "", "?", "?q/e", "\n", "\n", "\nn", "\nn?", "q", "rhi?\x1b", "\n\x1b", "r?\x1b",
+            "",
+            "?",
+            "?q/e",
+            "\n",
+            "\n",
+            "\nn",
+            "\nn?",
+            "q",
+            "rhi?\x1b",
+            "\n\x1b",
+            "r?\x1b",
+            "/e?\n",
+            "n?\x1b/zz\x1b\x1b",
             "[[[[[[[",
         ] {
             for ch in keys.chars() {
@@ -4980,7 +5139,7 @@ mod tests {
 
     #[test]
     fn help_glyphs_are_one_cell_wide() {
-        let mut texts: Vec<&str> = vec![" Keys "];
+        let mut texts: Vec<&str> = vec![" Keys ", " Find in comments "];
         for (_, title, rows) in HELP {
             texts.push(title);
             for (keys, what) in rows {
@@ -4997,6 +5156,8 @@ mod tests {
             SEARCH_HINTS,
             REPLY_HINTS,
             COMMENT_HINTS,
+            FIND_BAR_HINTS,
+            ACTIVE_FIND_HINTS,
             HELP_HINTS,
         ] {
             for (key, what) in set {
@@ -5673,5 +5834,320 @@ mod tests {
         buffer(&mut app, 110, 24);
         assert_eq!(scroll(&app), before);
         assert_eq!(app.thread.focus, Some(vec![1]), "still focused");
+    }
+
+    // ---- Find in comments ----
+
+    /// One post whose title and body mention "rollback", with comments:
+    /// alice (twice in her body), bob (no match) and carol (jalapeño twice)
+    /// under her, dan, eight fillers, then zed's at the bottom.
+    fn find_post() -> App {
+        let mut app = one_post("Rollback postmortem", "We rolled back the rollback.");
+        let c = |author, body| data::c(author, 3, 2, body);
+        let mut comments = vec![
+            c("alice", "Rollback plan? Rollback early.").with(vec![
+                c("bob", "no idea").with(vec![c("carol", "Spicy jalapeño dip, JALAPEÑO!")]),
+            ]),
+            c("dan", "nothing to see"),
+        ];
+        comments.extend((0..8).map(|_| c("filler", "more words here")));
+        comments.push(c("zed", "the last rollback is done"));
+        app.posts[0].comments = comments;
+        press(&mut app, KeyCode::Enter);
+        app
+    }
+
+    /// Opens the find bar and types `text`.
+    fn find_text(app: &mut App, text: &str) {
+        press(app, KeyCode::Char('/'));
+        type_str(app, text);
+    }
+
+    #[test]
+    fn the_find_bar_shows_its_title_the_text_and_the_match_count() {
+        for width in [110, 80] {
+            let (x, w) = main_column(width);
+            let inner = usize::from(w) - 4;
+            let line = |n: usize| "─".repeat(n);
+            let text_row = |text: &str| format!("│ {text:<inner$} │");
+            let title = " Find in comments ";
+            let top = format!("╭{title}{}╮", line(usize::from(w) - 2 - title.len()));
+
+            let mut app = find_post();
+            press(&mut app, KeyCode::Char('/'));
+            let buf = buffer(&mut app, width, 24);
+            assert!(rows(&buf)[19].contains("╰──"), "{width}: the post box ends");
+            assert_eq!(cut(&buf, x, w, 20), top, "{width}");
+            assert_eq!(cut(&buf, x, w, 21), text_row("▏"), "{width}: the cursor");
+            let plain = format!("╰{}╯", line(usize::from(w) - 2));
+            assert_eq!(cut(&buf, x, w, 22), plain, "{width}: no count yet");
+            assert_eq!(
+                rows(&buf)[23].trim_end(),
+                " type find  enter keep  esc cancel"
+            );
+
+            type_str(&mut app, "Rollback");
+            let buf = buffer(&mut app, width, 24);
+            assert_eq!(cut(&buf, x, w, 21), text_row("Rollback▏"), "{width}");
+            let (cx, cy) = find(&buf, "▏");
+            assert_eq!((cx, cy, buf[(cx, cy)].fg), (x + 10, 21, ORANGE));
+            let count = |k_n: &str| {
+                let k_n = format!(" {k_n} ");
+                format!("╰{}{k_n}╯", line(usize::from(w) - 2 - k_n.len()))
+            };
+            assert_eq!(cut(&buf, x, w, 22), count("1/2"), "{width}: alice, zed");
+            assert_eq!(cut(&buf, x, w, 20), top, "{width}");
+
+            type_str(&mut app, "zz");
+            let buf = buffer(&mut app, width, 24);
+            assert_eq!(cut(&buf, x, w, 22), count("0/0"), "{width}: no match");
+            press(&mut app, KeyCode::Backspace);
+            press(&mut app, KeyCode::Backspace);
+            press(&mut app, KeyCode::Char(' '));
+            let buf = buffer(&mut app, width, 24);
+            assert_eq!(cut(&buf, x, w, 21), text_row("Rollback ▏"), "{width}");
+            assert_eq!(cut(&buf, x, w, 22), count("1/2"), "{width}: trimmed");
+
+            // Kept: the bar goes, the active find's hints and toast show.
+            press(&mut app, KeyCode::Enter);
+            let buf = buffer(&mut app, width, 24);
+            assert!(!rows(&buf).join("").contains(title.trim()), "{width}");
+            assert_eq!(
+                rows(&buf)[23].trim_end(),
+                " n/p match  a/z vote comment  enter collapse  / edit find  ? help  esc clear"
+            );
+            press(&mut app, KeyCode::Char('n'));
+            let buf = buffer(&mut app, width, 24);
+            assert_eq!(rows(&buf)[23].trim_end(), " ✔ Match 2 of 2");
+            let (zx, zy) = find(&buf, "u/zed");
+            assert!(
+                is_focus_style(&buf, zx, zy),
+                "{width}: zed focused, on screen"
+            );
+
+            // Reopened with the same text and the cursor at its end, on zed.
+            press(&mut app, KeyCode::Char('/'));
+            let buf = buffer(&mut app, width, 24);
+            assert_eq!(cut(&buf, x, w, 21), text_row("Rollback ▏"), "{width}");
+            assert_eq!(cut(&buf, x, w, 22), count("2/2"), "{width}");
+
+            // Too long for the row: its end, so the cursor shows.
+            press(&mut app, KeyCode::Esc);
+            let long: String = ('a'..='z').cycle().take(MAX_FIND_CHARS).collect();
+            find_text(&mut app, &long);
+            let buf = buffer(&mut app, width, 24);
+            let tail: String = long.chars().skip(MAX_FIND_CHARS - (inner - 1)).collect();
+            assert_eq!(
+                cut(&buf, x, w, 21),
+                text_row(&format!("{tail}▏")),
+                "{width}"
+            );
+            assert_eq!(cut(&buf, x, w, 22), count("0/0"), "{width}");
+        }
+    }
+
+    #[test]
+    fn the_find_highlights_every_occurrence_in_comment_bodies_only() {
+        let mut app = find_post();
+        find_text(&mut app, "rollback");
+        for kept in [false, true] {
+            if kept {
+                press(&mut app, KeyCode::Enter);
+                assert!(app.find.is_some());
+            }
+            let buf = buffer(&mut app, 110, 40);
+            let (x, y) = find(&buf, "Rollback plan? Rollback early.");
+            assert_eq!(hits(&buf, x, y, 30), "^^^^^^^^.......^^^^^^^^.......");
+            assert_eq!(buf[(x, y)].modifier, Modifier::empty(), "only the colors");
+            let (x, y) = find(&buf, "no idea");
+            assert_eq!(hits(&buf, x, y, 7), ".......", "a body with no match");
+            for plain in [
+                "Rollback postmortem",
+                "We rolled back the rollback.",
+                "u/alice",
+            ] {
+                let (x, y) = find(&buf, plain);
+                let n = plain.chars().count() as u16;
+                assert_eq!(hits(&buf, x, y, n), ".".repeat(usize::from(n)), "{plain}");
+            }
+        }
+        // Scrolled down to zed's.
+        press(&mut app, KeyCode::Char('p'));
+        press(&mut app, KeyCode::Char('G'));
+        let buf = buffer(&mut app, 110, 24);
+        let (x, y) = find(&buf, "the last rollback is done");
+        assert_eq!(hits(&buf, x, y, 25), ".........^^^^^^^^........");
+
+        // Non-ASCII, every occurrence, in the original case.
+        let mut app = find_post();
+        find_text(&mut app, "JALAPEÑO");
+        let buf = buffer(&mut app, 110, 40);
+        let (x, y) = find(&buf, "Spicy jalapeño dip, JALAPEÑO!");
+        assert_eq!(hits(&buf, x, y, 29), "......^^^^^^^^......^^^^^^^^.");
+
+        // No find: nothing, even with a kept feed search for the same word,
+        // which lights up the title and body only.
+        let mut app = find_post();
+        press(&mut app, KeyCode::Char('q'));
+        type_str(&mut app, "/rollback");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        let buf = buffer(&mut app, 110, 40);
+        let (x, y) = find(&buf, "Rollback postmortem");
+        assert_eq!(hits(&buf, x, y, 19), "^^^^^^^^...........");
+        let (x, y) = find(&buf, "Rollback plan? Rollback early.");
+        assert_eq!(hits(&buf, x, y, 30), ".".repeat(30));
+        // And a find next to it: only its own phrase in the bodies.
+        find_text(&mut app, "early");
+        let buf = buffer(&mut app, 110, 40);
+        let (x, y) = find(&buf, "Rollback postmortem");
+        assert_eq!(hits(&buf, x, y, 19), "^^^^^^^^...........");
+        let (x, y) = find(&buf, "Rollback plan? Rollback early.");
+        assert_eq!(hits(&buf, x, y, 30), "........................^^^^^.");
+
+        // Esc clears the find, and its highlights.
+        press(&mut app, KeyCode::Esc);
+        let buf = buffer(&mut app, 110, 40);
+        let (x, y) = find(&buf, "Rollback plan? Rollback early.");
+        assert_eq!(hits(&buf, x, y, 30), ".".repeat(30));
+    }
+
+    #[test]
+    fn find_highlighting_never_changes_the_layout() {
+        for width in [110, 60, 40, 30] {
+            let mut app = find_post();
+            find_text(&mut app, "rollback early");
+            press(&mut app, KeyCode::Enter);
+            press(&mut app, KeyCode::Char('G'));
+            let lit = buffer(&mut app, width, 24);
+            let at = (app.mode, app.hits.clone());
+            let active = app.find.take();
+            let unlit = buffer(&mut app, width, 24);
+            // The footer's hints say whether a find is active; the rest is
+            // the same text.
+            assert_eq!(rows(&lit)[..23], rows(&unlit)[..23], "{width}");
+            assert_eq!((app.mode, app.hits.clone()), at, "{width}: the same clamp");
+            assert_ne!(lit, unlit, "{width}: only the styles differ");
+            app.find = active;
+            press(&mut app, KeyCode::Char('g'));
+            let lit = buffer(&mut app, width, 24);
+            let (x, y) = find(&lit, "early.");
+            assert_eq!(
+                hits(&lit, x, y, 6),
+                "^^^^^.",
+                "{width}: alice's body is lit"
+            );
+        }
+        // A match wrapped across two rows is lit on both.
+        let mut app = find_post();
+        find_text(&mut app, "rollback early");
+        let buf = buffer(&mut app, 30, 24);
+        let (x, y) = find(&buf, "Rollback plan? Rollback");
+        assert_eq!(hits(&buf, x, y, 24), "...............^^^^^^^^.");
+        assert_eq!(find(&buf, "early."), (x, y + 1), "wrapped");
+        assert_eq!(hits(&buf, x, y + 1, 6), "^^^^^.");
+    }
+
+    #[test]
+    fn the_post_view_above_the_find_bar_is_a_shorter_viewport() {
+        for width in [120, 110, 80, 60, 30, 12] {
+            let (x, w) = main_column(width);
+            let mut app = find_post();
+            type_str(&mut app, "jjjjj");
+            find_text(&mut app, "zz");
+            let barred = buffer(&mut app, width, 24);
+            let Mode::Find { scroll, restore } = app.mode else {
+                panic!("the bar is open");
+            };
+            assert_eq!((scroll, restore), (5, 5), "{width}: nothing focused");
+            let max = app.hits.as_ref().unwrap().max_scroll;
+            // The same post with the find active and no bar, 3 rows shorter.
+            app.mode = Mode::Post { scroll };
+            let short = buffer(&mut app, width, 21);
+            assert_eq!(app.hits.as_ref().unwrap().max_scroll, max, "{width}");
+            for y in 3..20 {
+                assert_eq!(
+                    cut(&barred, x, w, y),
+                    cut(&short, x, w, y),
+                    "{width}: row {y}"
+                );
+            }
+            assert_eq!(rows(&barred)[..3], rows(&short)[..3], "{width}: the header");
+            if w >= 4 {
+                assert_eq!(barred[(x, 20)].symbol(), "╭", "{width}");
+                assert_eq!(barred[(x + w - 1, 22)].symbol(), "╯", "{width}");
+            }
+        }
+    }
+
+    #[test]
+    fn typing_reveals_the_match_above_the_bar_and_esc_restores_the_scroll() {
+        let mut app = find_post();
+        type_str(&mut app, "jj");
+        buffer(&mut app, 110, 24);
+        find_text(&mut app, "last");
+        let buf = buffer(&mut app, 110, 24);
+        let (x, y) = find(&buf, "u/zed");
+        assert!(is_focus_style(&buf, x, y));
+        assert!(y < 20, "above the bar, at row {y}");
+        assert!(!buf_has(&buf, "u/alice"), "scrolled down to it");
+        // The mouse is ignored while the bar is open, on a header too.
+        let before = state(&app);
+        click(&mut app, (x, y));
+        mouse(&mut app, MouseEventKind::ScrollUp, (x, y));
+        assert_eq!(state(&app), before);
+
+        press(&mut app, KeyCode::Esc);
+        let buf = buffer(&mut app, 110, 24);
+        assert_eq!(scroll(&app), 2, "the scroll from before /");
+        assert!(buf_has(&buf, "u/alice"));
+        assert_eq!(app.thread.focus, None);
+    }
+
+    fn buf_has(buf: &Buffer, needle: &str) -> bool {
+        !find_all(buf, needle).is_empty()
+    }
+
+    #[test]
+    fn the_find_bar_draws_inside_tiny_terminals() {
+        let mut sizes: Vec<(u16, u16)> = (1..=32)
+            .flat_map(|w| (1..=12).map(move |h| (w, h)))
+            .collect();
+        sizes.extend([(80, 4), (80, 5), (80, 6), (80, 7), (200, 5), (30, 24)]);
+        for (width, height) in sizes {
+            let mut app = find_post();
+            press(&mut app, KeyCode::Char('n'));
+            let closed = buffer(&mut app, width, height);
+            find_text(&mut app, "rollback");
+            let buf = buffer(&mut app, width, height);
+            let size = format!("{width}x{height}");
+            assert_eq!(buf.area, Rect::new(0, 0, width, height), "{size}");
+            assert!(matches!(app.mode, Mode::Find { .. }), "{size}");
+            // Never over the header.
+            if height >= 4 {
+                assert_eq!(rows(&buf)[..3], rows(&closed)[..3], "{size}");
+            }
+            // The bar keeps the bottom of the column, or all of it.
+            let (x, w) = main_column(width);
+            let body = height.saturating_sub(4);
+            if body > 0 && w > 0 {
+                let top = 3 + body - body.min(3);
+                assert_eq!(buf[(x, top)].symbol(), "╭", "{size}");
+                if height > 4 {
+                    assert_eq!(
+                        rows(&buf)[usize::from(height - 1)].trim_end(),
+                        " type find  enter keep  esc cancel"
+                            .chars()
+                            .take(usize::from(width))
+                            .collect::<String>()
+                            .trim_end(),
+                        "{size}: the footer"
+                    );
+                }
+            }
+            press(&mut app, KeyCode::Enter);
+            press(&mut app, KeyCode::Char('n'));
+            buffer(&mut app, width, height);
+        }
     }
 }

@@ -20,6 +20,8 @@ use crate::data::Vote;
 
 const POPULAR_MIN_SCORE: i32 = 500;
 const RISING_MAX_HOURS: u32 = 24;
+/// The most chars the find bar takes.
+pub(crate) const MAX_FIND_CHARS: usize = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Sort {
@@ -86,6 +88,14 @@ pub(crate) enum Mode {
         scroll: u16,
         restore: u16,
     },
+    /// The post view with the find bar open below it. The text is in
+    /// `App.find`. `scroll` and `restore` work as in `Compose`: `scroll` is
+    /// the shrunk viewport's, which Enter carries on, and `restore` the
+    /// scroll from before `/`, which Esc goes back to.
+    Find {
+        scroll: u16,
+        restore: u16,
+    },
 }
 
 /// The `?` help overlay, while it is open. It sits on top of whatever mode
@@ -120,6 +130,43 @@ pub(crate) struct Shown<'a> {
     pub path: CommentPath,
     pub comment: &'a Comment,
     pub collapsed: bool,
+}
+
+/// Find in comments: the bar's text, while the bar is open or the find is
+/// active (the bar closed with Enter on a match). Matches are never stored:
+/// they are worked out from the tree whenever they are needed (see
+/// `find_matches`), and the current match is simply `Thread.focus`, so a
+/// comment you write can't leave a stale path behind. Session state only.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Find {
+    /// Raw as typed, at most `MAX_FIND_CHARS` chars. Trimmed and folded
+    /// when matched (see `Query::phrase`).
+    pub text: String,
+    /// While the bar is open, the thread as it was when `/` opened it: where
+    /// typing starts looking from and what Esc puts back. Nothing can insert
+    /// a comment while the bar is open, so its paths stay valid. Emptied when
+    /// the bar closes with Enter.
+    pub before: Thread,
+}
+
+/// The paths of the comments whose body matches `find`, at any depth and
+/// whether or not they are hidden under a collapsed ancestor, in pre-order
+/// (the order of `Thread::visible` with nothing collapsed).
+pub(crate) fn find_matches(comments: &[Comment], find: &Query) -> Vec<CommentPath> {
+    fn walk(comments: &[Comment], find: &Query, parent: &[usize], out: &mut Vec<CommentPath>) {
+        for (i, comment) in comments.iter().enumerate() {
+            let path = [parent, &[i]].concat();
+            if find.found_in(&comment.body) {
+                out.push(path.clone());
+            }
+            walk(&comment.replies, find, &path, out);
+        }
+    }
+    let mut out = Vec::new();
+    if !find.text.is_empty() {
+        walk(comments, find, &[], &mut out);
+    }
+    out
 }
 
 impl Shown<'_> {
@@ -183,6 +230,18 @@ impl Thread {
             self.focus = Some(next.path);
             self.reveal = true;
         }
+    }
+
+    /// Focuses the comment at `path` and makes it visible: every collapsed
+    /// ancestor is expanded, and the comment itself if it is collapsed. No
+    /// other comment's collapse state changes. Asks for a reveal, like
+    /// `n`/`p`.
+    fn show(&mut self, path: &[usize]) {
+        for end in 1..=path.len() {
+            self.collapsed.remove(&path[..end]);
+        }
+        self.focus = Some(path.to_vec());
+        self.reveal = true;
     }
 
     fn toggle_collapse(&mut self) {
@@ -338,7 +397,13 @@ pub(crate) struct App {
     /// The composer's text, raw as typed. Only used in `Mode::Compose`, and
     /// emptied whenever the composer opens.
     pub draft: String,
+    /// Find in comments, while the bar is open (`Mode::Find`) or a find is
+    /// active. Cleared when a post is opened and when you go back to the feed.
+    pub find: Option<Find>,
     pub status: Option<&'static str>,
+    /// The `Match k of N` toast after `n`/`p` with a find active. A toast
+    /// like `status` (which only holds fixed strings), cleared with it.
+    pub match_toast: Option<(usize, usize)>,
     pub karma: u32,
     pub should_quit: bool,
 }
@@ -482,6 +547,28 @@ impl Query {
             .all(|term| fields.iter().any(|field| field.contains(term.as_str())))
     }
 
+    /// The find bar's query: `text`, trimmed at both ends, as one literal
+    /// phrase (no quotes, no filters), folded like a free-text term. Blank
+    /// text gives a query with no terms, which matches and highlights
+    /// nothing.
+    pub(crate) fn phrase(text: &str) -> Query {
+        let term = folded(text.trim());
+        Query {
+            text: if term.is_empty() { vec![] } else { vec![term] },
+            ..Query::default()
+        }
+    }
+
+    /// Whether `text` contains every free-text term, compared as `matches`
+    /// compares them. False with no terms.
+    pub(crate) fn found_in(&self, text: &str) -> bool {
+        if self.text.is_empty() {
+            return false;
+        }
+        let text = folded(text);
+        self.text.iter().all(|term| text.contains(term.as_str()))
+    }
+
     /// For each char of `text`, whether it is part of an occurrence of a
     /// free-text term. Overlapping occurrences simply mark the same chars.
     pub(crate) fn highlights(&self, text: &str) -> Vec<bool> {
@@ -525,7 +612,9 @@ impl App {
             help: None,
             hits: None,
             draft: String::new(),
+            find: None,
             status: None,
+            match_toast: None,
             karma: 1_337,
             should_quit: false,
         };
@@ -648,7 +737,100 @@ impl App {
 
     fn open_post(&mut self) {
         self.thread = Thread::default();
+        self.find = None;
         self.mode = Mode::Post { scroll: 0 };
+    }
+
+    /// The open post's comments matching the find, in pre-order. None with
+    /// no find, or with blank text.
+    pub(crate) fn find_matches(&self) -> Vec<CommentPath> {
+        match (self.selected_post(), &self.find) {
+            (Some(post), Some(find)) => find_matches(&post.comments, &Query::phrase(&find.text)),
+            _ => Vec::new(),
+        }
+    }
+
+    /// What the find highlights in comment bodies: nothing with no find.
+    pub(crate) fn find_query(&self) -> Query {
+        self.find
+            .as_ref()
+            .map_or_else(Query::default, |find| Query::phrase(&find.text))
+    }
+
+    /// `(k, n)`: the focused comment's number among the `n` matches, or 0
+    /// when it isn't one.
+    pub(crate) fn match_number(&self) -> (usize, usize) {
+        let matches = self.find_matches();
+        let k = self
+            .thread
+            .focus
+            .as_ref()
+            .and_then(|focus| matches.iter().position(|m| m == focus))
+            .map_or(0, |i| i + 1);
+        (k, matches.len())
+    }
+
+    /// Opens the find bar, with the active find's text if there is one, and
+    /// remembers the thread for Esc. Like the composer, it takes rows from
+    /// the post viewport, so it asks for a reveal of the focused header.
+    fn open_find(&mut self, scroll: u16) {
+        let text = self.find.take().map(|find| find.text).unwrap_or_default();
+        let mut before = self.thread.clone();
+        before.reveal = false;
+        self.find = Some(Find { text, before });
+        self.thread.reveal = true;
+        self.mode = Mode::Find {
+            scroll,
+            restore: scroll,
+        };
+    }
+
+    /// After the find text changes: focuses the first match at or after the
+    /// comment focused when the bar opened (the first match when nothing
+    /// was), wrapping to the first match, and shows it. Tentative: every
+    /// change starts again from the focus and the collapsed set from when the
+    /// bar opened, so only the current match's ancestors (and itself) end up
+    /// expanded, never those of a match an earlier keystroke passed through.
+    /// With no match, both are back to what they were when the bar opened.
+    fn seek(&mut self) {
+        let Some(find) = &self.find else {
+            return;
+        };
+        let (start, collapsed) = (find.before.focus.clone(), find.before.collapsed.clone());
+        let matches = self.find_matches();
+        // Paths compare in pre-order: a parent's is a prefix of its replies'.
+        let next = matches
+            .iter()
+            .find(|path| start.as_ref().is_none_or(|start| *path >= start))
+            .or(matches.first())
+            .cloned();
+        let moved = self.thread.focus != start;
+        self.thread.collapsed = collapsed;
+        self.thread.focus = start;
+        match next {
+            Some(path) => self.thread.show(&path),
+            None if moved => self.thread.reveal = true,
+            None => {}
+        }
+    }
+
+    /// `n`/`p` with a find active: the next (or previous) match in the tree
+    /// after (or before) the focus, wrapping at both ends, shown and counted
+    /// in a toast. The focus needn't be a match (a click can move it).
+    fn step_match(&mut self, forward: bool) {
+        let matches = self.find_matches();
+        let n = matches.len();
+        if n == 0 {
+            return;
+        }
+        let i = match &self.thread.focus {
+            None if forward => 0,
+            None => n - 1,
+            Some(focus) if forward => matches.iter().position(|m| m > focus).unwrap_or(0),
+            Some(focus) => matches.iter().rposition(|m| m < focus).unwrap_or(n - 1),
+        };
+        self.thread.show(&matches[i]);
+        self.match_toast = Some((i + 1, n));
     }
 
     fn step_focus(&mut self, forward: bool) {
@@ -735,6 +917,7 @@ impl App {
             return;
         }
         self.status = None;
+        self.match_toast = None;
         if let Some(help) = self.help {
             self.on_help_key(key.code, help.scroll);
             return;
@@ -744,15 +927,20 @@ impl App {
             Mode::Search => self.on_search_key(key.code),
             Mode::Post { scroll } => self.on_post_key(key.code, scroll),
             Mode::Compose { scroll, restore } => self.on_compose_key(key, scroll, restore),
+            Mode::Find { scroll, restore } => self.on_find_key(key, scroll, restore),
         }
     }
 
     /// Whether `on_mouse` acts on `event` at all: a left press or the wheel,
-    /// after the first frame, outside search mode and the composer. The rest
-    /// change nothing, so the event loop doesn't redraw for them.
+    /// after the first frame, outside search mode, the composer and the find
+    /// bar. The rest change nothing, so the event loop doesn't redraw for
+    /// them.
     pub(crate) fn handles_mouse(&self, event: &MouseEvent) -> bool {
         self.hits.is_some()
-            && !matches!(self.mode, Mode::Search | Mode::Compose { .. })
+            && !matches!(
+                self.mode,
+                Mode::Search | Mode::Compose { .. } | Mode::Find { .. }
+            )
             && matches!(
                 event.kind,
                 MouseEventKind::Down(MouseButton::Left)
@@ -780,6 +968,7 @@ impl App {
         let target = hits.at(event.column, event.row).cloned();
         let max_scroll = hits.max_scroll;
         self.status = None;
+        self.match_toast = None;
         if let Some(Help { scroll }) = self.help {
             self.help = match wheel {
                 Some(delta) => Some(Help {
@@ -810,7 +999,7 @@ impl App {
                 Some(Target::Reply(path)) => self.click_reply(path, scroll),
                 _ => {}
             },
-            (Mode::Search | Mode::Compose { .. }, _) => {}
+            (Mode::Search | Mode::Compose { .. } | Mode::Find { .. }, _) => {}
         }
     }
 
@@ -921,6 +1110,46 @@ impl App {
                 if !ch.is_control() && self.draft.chars().count() < MAX_COMMENT_CHARS =>
             {
                 self.draft.push(ch);
+            }
+            _ => {}
+        }
+    }
+
+    /// The find bar is modal like the composer: every printable key,
+    /// unmodified or with Shift, is typed, up to `MAX_FIND_CHARS` chars, and
+    /// any other modifier does nothing (Ctrl-C has already quit). Each change
+    /// moves the focus (see `seek`). Enter closes the bar, keeping the find
+    /// only when it has a match. Esc cancels: no find, and the focus, the
+    /// collapsed set and the scroll from before `/`.
+    fn on_find_key(&mut self, key: KeyEvent, scroll: u16, restore: u16) {
+        if !key.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
+            return;
+        }
+        let Some(find) = &mut self.find else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                // `before` has no reveal, so none is left to move `restore`.
+                self.thread = std::mem::take(&mut find.before);
+                self.find = None;
+                self.mode = Mode::Post { scroll: restore };
+            }
+            KeyCode::Enter => {
+                find.before = Thread::default();
+                if self.find_matches().is_empty() {
+                    self.find = None;
+                }
+                self.mode = Mode::Post { scroll };
+            }
+            KeyCode::Backspace => {
+                if find.text.pop().is_some() {
+                    self.seek();
+                }
+            }
+            KeyCode::Char(ch) if !ch.is_control() && find.text.chars().count() < MAX_FIND_CHARS => {
+                find.text.push(ch);
+                self.seek();
             }
             _ => {}
         }
@@ -1053,12 +1282,18 @@ impl App {
     /// view.
     fn on_post_key(&mut self, code: KeyCode, scroll: u16) {
         let focus = self.thread.focus.clone();
+        let finding = self.find.is_some();
         let scroll = match code {
+            KeyCode::Esc if finding => {
+                self.find = None;
+                scroll
+            }
             KeyCode::Esc if focus.is_some() => {
                 self.thread.focus = None;
                 scroll
             }
             KeyCode::Char('q') | KeyCode::Esc | KeyCode::Backspace => {
+                self.find = None;
                 self.mode = Mode::Feed;
                 return;
             }
@@ -1068,6 +1303,10 @@ impl App {
             KeyCode::PageUp => scroll.saturating_sub(10),
             KeyCode::Char('g') | KeyCode::Home => 0,
             KeyCode::Char('G') | KeyCode::End => u16::MAX,
+            KeyCode::Char(key @ ('n' | 'p')) if finding => {
+                self.step_match(key == 'n');
+                scroll
+            }
             KeyCode::Char('n') => {
                 self.step_focus(true);
                 scroll
@@ -1102,6 +1341,10 @@ impl App {
             }
             KeyCode::Char('r') => {
                 self.open_composer(scroll);
+                return;
+            }
+            KeyCode::Char('/') => {
+                self.open_find(scroll);
                 return;
             }
             _ => scroll,
@@ -3070,5 +3313,702 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.mode, Mode::Post { scroll: 7 });
         assert!(app.thread.reveal);
+    }
+
+    // ---- Find in comments ----
+
+    /// ```text
+    /// alice  [0]        "Rollback plan?"
+    /// │ bob  [0,0]      "no idea"
+    /// │ │ carol [0,0,0]   "We did a ROLLBACK."
+    /// │ │ │ dave [0,0,0,0]  "Spicy JALAPEÑO dip"
+    /// │ erin [0,1]      "roll\n  back"
+    /// frank [1]         "nothing to see"
+    /// │ grace [1,0]     "rollback again, rollback"
+    /// hank [2]          "the end"
+    /// ```
+    /// The post's body says "rollback secret" and no body names an author.
+    fn find_sample() -> App {
+        let c = |author, body| data::c(author, 1, 1, body);
+        let mut post = post(0, 50, 1, "Thread");
+        post.body = "The rollback secret";
+        post.comments = vec![
+            c("alice", "Rollback plan?").with(vec![
+                c("bob", "no idea").with(vec![
+                    c("carol", "We did a ROLLBACK.").with(vec![c("dave", "Spicy JALAPEÑO dip")]),
+                ]),
+                c("erin", "roll\n  back"),
+            ]),
+            c("frank", "nothing to see").with(vec![c("grace", "rollback again, rollback")]),
+            c("hank", "the end"),
+        ];
+        let mut app = App::with_data(vec![group("Joined", true)], vec![post]);
+        press(&mut app, KeyCode::Enter);
+        app
+    }
+
+    /// The authors of the comments the find matches, in order.
+    fn match_authors(app: &App) -> Vec<&'static str> {
+        app.find_matches()
+            .iter()
+            .map(|path| at(app, path).author)
+            .collect()
+    }
+
+    /// Focuses the comment by `author` with `n`, as nothing else is set.
+    fn focus_on(app: &mut App, author: &str) {
+        unfocus(app);
+        for _ in 0..20 {
+            press(app, KeyCode::Char('n'));
+            if focused(app) == Some(author) {
+                return;
+            }
+        }
+        panic!("no visible comment by {author}");
+    }
+
+    fn find_bar_text(app: &App) -> &str {
+        assert!(matches!(app.mode, Mode::Find { .. }), "{:?}", app.mode);
+        &app.find.as_ref().expect("the bar has a find").text
+    }
+
+    #[test]
+    fn slash_opens_the_find_bar_with_and_without_focus() {
+        let mut app = find_sample();
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('/'));
+        assert_eq!(
+            app.mode,
+            Mode::Find {
+                scroll: 1,
+                restore: 1
+            }
+        );
+        assert_eq!(find_bar_text(&app), "");
+        assert_eq!(app.thread.focus, None);
+        assert!(
+            app.thread.reveal,
+            "it shrinks the viewport, like the composer"
+        );
+        assert!(app.find_matches().is_empty());
+        press(&mut app, KeyCode::Esc);
+        assert_eq!((app.mode, &app.find), (Mode::Post { scroll: 1 }, &None));
+
+        focus_on(&mut app, "bob");
+        press(&mut app, KeyCode::Char('/'));
+        assert_eq!(find_bar_text(&app), "");
+        assert_eq!(focused(&app), Some("bob"), "the focus stays");
+        assert_eq!(app.find.as_ref().unwrap().before.focus, Some(vec![0, 0]));
+    }
+
+    #[test]
+    fn slash_is_still_search_in_the_feed_and_typed_in_the_composer() {
+        let mut app = find_sample();
+        press(&mut app, KeyCode::Char('q'));
+        press(&mut app, KeyCode::Char('/'));
+        assert_eq!((app.mode, &app.find), (Mode::Search, &None));
+        press_str(&mut app, "a/b");
+        assert_eq!(app.query, "a/b");
+        press(&mut app, KeyCode::Esc);
+
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('r'));
+        press_str(&mut app, "/x/");
+        assert_eq!(app.draft, "/x/");
+        assert!(matches!(app.mode, Mode::Compose { .. }));
+        assert_eq!(app.find, None);
+    }
+
+    #[test]
+    fn every_printable_key_is_typed_into_the_find_bar() {
+        let mut app = find_sample();
+        focus_on(&mut app, "alice");
+        press(&mut app, KeyCode::Char('/'));
+        let typed = "npqjkr?/ 19azscvhJgG[]";
+        press_str(&mut app, typed);
+        assert_eq!(find_bar_text(&app), typed);
+        assert!(!app.should_quit);
+        assert_eq!((app.help, app.status, app.match_toast), (None, None, None));
+        assert_eq!(app.posts[0].vote, Vote::None);
+        assert_eq!(app.posts[0].comments[0].vote, Vote::None);
+        assert!(!app.posts[0].saved);
+        assert_eq!(focused(&app), Some("alice"), "no match: the start focus");
+
+        // Backspace deletes one char, `ñ` included.
+        press_str(&mut app, "ñ");
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(find_bar_text(&app), typed);
+
+        // Ctrl and Alt chords do nothing, Shift is how capitals arrive.
+        let before = app.find.clone();
+        for (ch, modifiers) in [
+            ('w', KeyModifiers::CONTROL),
+            ('u', KeyModifiers::CONTROL),
+            ('x', KeyModifiers::ALT),
+            ('n', KeyModifiers::ALT),
+        ] {
+            app.on_key(KeyEvent::new(KeyCode::Char(ch), modifiers));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::ALT));
+        assert_eq!(app.find, before);
+        assert!(matches!(app.mode, Mode::Find { .. }));
+        app.on_key(KeyEvent::new(KeyCode::Char('Q'), KeyModifiers::SHIFT));
+        assert!(find_bar_text(&app).ends_with('Q'));
+
+        // At most 100 chars, with room again after a Backspace.
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('/'));
+        press_str(&mut app, &"é".repeat(120));
+        assert_eq!(find_bar_text(&app).chars().count(), MAX_FIND_CHARS);
+        press(&mut app, KeyCode::Backspace);
+        press_str(&mut app, "xy");
+        assert_eq!(find_bar_text(&app).chars().count(), MAX_FIND_CHARS);
+        assert!(find_bar_text(&app).ends_with("éx"));
+
+        // Tab and the arrows do nothing.
+        let before = (app.find.clone(), app.mode, app.thread.clone());
+        for code in [KeyCode::Tab, KeyCode::Up, KeyCode::Down, KeyCode::Left] {
+            press(&mut app, code);
+        }
+        assert_eq!((app.find.clone(), app.mode, app.thread.clone()), before);
+
+        ctrl_c(&mut app);
+        assert!(app.should_quit, "Ctrl-C quits from the find bar");
+    }
+
+    #[test]
+    fn the_find_matches_bodies_like_free_text_search() {
+        let mut app = find_sample();
+        let mut find = |text: &str| {
+            press(&mut app, KeyCode::Char('/'));
+            press_str(&mut app, text);
+            let authors = match_authors(&app);
+            press(&mut app, KeyCode::Esc);
+            authors
+        };
+        assert_eq!(find("rollback"), ["alice", "carol", "grace"]);
+        assert_eq!(find("ROLLBACK"), ["alice", "carol", "grace"], "case");
+        assert_eq!(find("rOlLbAcK."), ["carol"]);
+        assert_eq!(find("roll back"), ["erin"], "a newline and spaces");
+        assert_eq!(find("roll   back"), ["erin"], "a run in the text too");
+        assert_eq!(find("jalapeño"), ["dave"], "non-ASCII");
+        assert_eq!(find("JALAPEÑO DIP"), ["dave"]);
+        assert_eq!(find("  rollback  "), ["alice", "carol", "grace"], "trimmed");
+        assert_eq!(find("\"rollback\""), Vec::<&str>::new(), "no quotes");
+        assert_eq!(find("u/grace"), Vec::<&str>::new(), "no filters");
+        assert_eq!(find("grace"), Vec::<&str>::new(), "only an author");
+        assert_eq!(find("secret"), Vec::<&str>::new(), "only the post body");
+        assert_eq!(find("Thread"), Vec::<&str>::new(), "only the title");
+        assert_eq!(find(""), Vec::<&str>::new(), "empty");
+        assert_eq!(find("   "), Vec::<&str>::new(), "blank");
+
+        // `İ` lowercases into two chars, and still matches itself.
+        let comments = vec![data::c("x", 1, 1, "GİT push"), data::c("y", 1, 1, "git")];
+        assert_eq!(find_matches(&comments, &Query::phrase("gİt")), [vec![0]]);
+        assert_eq!(find_matches(&comments, &Query::phrase("git")), [vec![1]]);
+
+        // Every comment counts: under a collapsed ancestor, and yours.
+        let mut app = find_sample();
+        focus_on(&mut app, "alice");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('r'));
+        press_str(&mut app, "my rollback");
+        press(&mut app, KeyCode::Enter);
+        focus_on(&mut app, "alice");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(visible_authors(&app), ["alice", "frank", "grace", "hank"]);
+        press(&mut app, KeyCode::Char('/'));
+        press_str(&mut app, "rollback");
+        assert_eq!(match_authors(&app), ["alice", "you", "carol", "grace"]);
+    }
+
+    #[test]
+    fn typing_focuses_the_first_match_at_or_after_the_start_and_wraps() {
+        let cases = [
+            (None, "alice"),
+            (Some("alice"), "alice"),
+            (Some("bob"), "carol"),
+            (Some("carol"), "carol"),
+            (Some("dave"), "grace"),
+            (Some("erin"), "grace"),
+            (Some("grace"), "grace"),
+            (Some("hank"), "alice"),
+        ];
+        for (start, expected) in cases {
+            let mut app = find_sample();
+            if let Some(start) = start {
+                focus_on(&mut app, start);
+            }
+            press(&mut app, KeyCode::Char('/'));
+            press_str(&mut app, "rollback");
+            assert_eq!(focused(&app), Some(expected), "from {start:?}");
+            assert!(app.thread.reveal, "from {start:?}");
+        }
+
+        // Every change looks again from the start, not from the last match.
+        let mut app = find_sample();
+        focus_on(&mut app, "bob");
+        press(&mut app, KeyCode::Char('/'));
+        press_str(&mut app, "roll");
+        assert_eq!(focused(&app), Some("carol"));
+        press_str(&mut app, " b");
+        assert_eq!(focused(&app), Some("erin"), "only erin has \"roll b\"");
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(focused(&app), Some("carol"), "\"roll \" is trimmed");
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(focused(&app), Some("carol"));
+
+        // No match: back to the focus from when the bar opened.
+        press_str(&mut app, "zzz");
+        assert_eq!(focused(&app), Some("bob"));
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(focused(&app), Some("carol"));
+        while !find_bar_text(&app).is_empty() {
+            press(&mut app, KeyCode::Backspace);
+        }
+        assert_eq!(focused(&app), Some("bob"), "empty text matches nothing");
+
+        let mut app = find_sample();
+        press(&mut app, KeyCode::Char('/'));
+        press_str(&mut app, "dave");
+        assert_eq!(app.thread.focus, None, "nothing was focused");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!((app.thread.focus.clone(), app.find.clone()), (None, None));
+    }
+
+    #[test]
+    fn a_match_under_collapsed_comments_expands_exactly_its_ancestors() {
+        let mut app = find_sample();
+        // alice (grandparent's parent), carol (parent), dave (the match),
+        // erin (alice's other reply) and frank (another branch). bob, the
+        // grandparent, stays expanded.
+        let collapsed: HashSet<CommentPath> = [
+            vec![0],
+            vec![0, 0, 0],
+            vec![0, 0, 0, 0],
+            vec![0, 1],
+            vec![1],
+        ]
+        .into();
+        app.thread.collapsed = collapsed.clone();
+        assert_eq!(visible_authors(&app), ["alice", "frank", "hank"]);
+        press(&mut app, KeyCode::Char('/'));
+        press_str(&mut app, "jalapeño");
+        assert_eq!(app.thread.focus, Some(vec![0, 0, 0, 0]));
+        assert!(app.thread.reveal);
+        let left: HashSet<CommentPath> = [vec![0, 1], vec![1]].into();
+        assert_eq!(app.thread.collapsed, left);
+        assert_eq!(
+            visible_authors(&app),
+            ["alice", "bob", "carol", "dave", "erin", "frank", "hank"]
+        );
+
+        // Esc puts every one of them back.
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.thread.collapsed, collapsed);
+        assert_eq!(app.thread.focus, None);
+
+        // Typing is tentative: `a` matches alice and expands her, but
+        // `again` matches only grace, so only frank stays expanded.
+        press(&mut app, KeyCode::Char('/'));
+        press_str(&mut app, "a");
+        assert_eq!(focused(&app), Some("alice"));
+        assert!(!app.thread.collapsed.contains(&vec![0]));
+        press_str(&mut app, "gain");
+        assert_eq!(focused(&app), Some("grace"));
+        let left: HashSet<CommentPath> =
+            [vec![0], vec![0, 0, 0], vec![0, 0, 0, 0], vec![0, 1]].into();
+        assert_eq!(app.thread.collapsed, left, "only frank expanded");
+        press(&mut app, KeyCode::Esc);
+
+        // `p` with a find active: grace under frank, alice left collapsed.
+        find_and_keep(&mut app, "rollback");
+        assert_eq!(focused(&app), Some("alice"));
+        app.thread.collapsed = [vec![0], vec![1]].into();
+        press(&mut app, KeyCode::Char('p'));
+        assert_eq!(focused(&app), Some("grace"));
+        assert_eq!(app.thread.collapsed, [vec![0]].into());
+    }
+
+    #[test]
+    fn esc_restores_the_focus_the_collapsed_set_and_the_scroll_exactly() {
+        let mut app = find_sample();
+        press_str(&mut app, "jj");
+        focus_on(&mut app, "bob");
+        app.thread.collapsed = [vec![0, 0, 0], vec![1]].into();
+        app.thread.reveal = false;
+        let thread = app.thread.clone();
+        press(&mut app, KeyCode::Char('/'));
+        press_str(&mut app, "rollback");
+        assert_eq!(focused(&app), Some("carol"));
+        press_str(&mut app, " again");
+        assert_eq!(focused(&app), Some("grace"));
+        assert_eq!(
+            app.thread.collapsed,
+            [vec![0, 0, 0]].into(),
+            "only frank expanded: carol was only on the way"
+        );
+        // As if a frame had scrolled the shrunk viewport to the match.
+        app.mode = Mode::Find {
+            scroll: 9,
+            restore: 2,
+        };
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.mode, Mode::Post { scroll: 2 });
+        assert_eq!(app.thread, thread, "focus, collapsed, and no reveal");
+        assert_eq!(app.find, None);
+        assert_eq!(app.status, None);
+
+        // The same straight after opening, before any frame.
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!((app.mode, &app.thread), (Mode::Post { scroll: 2 }, &thread));
+    }
+
+    #[test]
+    fn enter_keeps_the_find_on_a_match_and_drops_it_otherwise() {
+        let mut app = find_sample();
+        press(&mut app, KeyCode::Char('/'));
+        press_str(&mut app, "rollback");
+        app.mode = Mode::Find {
+            scroll: 7,
+            restore: 3,
+        };
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.mode, Mode::Post { scroll: 7 }, "the scroll carries on");
+        let find = app.find.as_ref().expect("the find is active");
+        assert_eq!(find.text, "rollback");
+        assert_eq!(find.before, Thread::default(), "nothing kept for Esc");
+        assert_eq!(focused(&app), Some("alice"));
+        assert_eq!(app.match_number(), (1, 3));
+
+        // No match: no find, and the focus where typing left it.
+        let mut app = find_sample();
+        focus_on(&mut app, "erin");
+        press(&mut app, KeyCode::Char('/'));
+        press_str(&mut app, "rollbackzzz");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.find, None);
+        assert_eq!(focused(&app), Some("erin"));
+        assert!(matches!(app.mode, Mode::Post { .. }));
+
+        // Empty text: the same.
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.find, None);
+        press_str(&mut app, "n");
+        assert_eq!(focused(&app), Some("frank"), "n is back to comments");
+    }
+
+    /// Opens the find bar, types `text` and keeps it.
+    fn find_and_keep(app: &mut App, text: &str) {
+        press(app, KeyCode::Char('/'));
+        press_str(app, text);
+        press(app, KeyCode::Enter);
+        assert!(app.find.is_some(), "{text:?} should match");
+    }
+
+    #[test]
+    fn n_and_p_go_to_the_matches_wrapping_with_a_toast() {
+        let mut app = find_sample();
+        find_and_keep(&mut app, "rollback");
+        let mut steps = Vec::new();
+        for key in "nnnpppp".chars() {
+            app.thread.reveal = false;
+            press(&mut app, KeyCode::Char(key));
+            assert!(app.thread.reveal, "{key}");
+            steps.push((focused(&app).unwrap(), app.match_toast.unwrap()));
+        }
+        assert_eq!(
+            steps,
+            [
+                ("carol", (2, 3)),
+                ("grace", (3, 3)),
+                ("alice", (1, 3)),
+                ("grace", (3, 3)),
+                ("carol", (2, 3)),
+                ("alice", (1, 3)),
+                ("grace", (3, 3)),
+            ]
+        );
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.match_toast, None, "the next key clears the toast");
+
+        // Collapsing the focused match is allowed, and n/p expand again.
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(focused(&app), Some("alice"));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.thread.collapsed, [vec![0]].into());
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(focused(&app), Some("carol"));
+        assert_eq!(app.thread.collapsed, HashSet::new());
+        press(&mut app, KeyCode::Char('p'));
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('p'));
+        assert_eq!(focused(&app), Some("grace"), "wrapped back");
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(focused(&app), Some("alice"));
+        assert_eq!(app.thread.collapsed, HashSet::new(), "a match itself");
+
+        // From a comment that isn't a match (a click can focus one).
+        app.thread.focus = Some(vec![0, 1]);
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(
+            (focused(&app), app.match_toast),
+            (Some("grace"), Some((3, 3)))
+        );
+        app.thread.focus = Some(vec![0, 1]);
+        press(&mut app, KeyCode::Char('p'));
+        assert_eq!(
+            (focused(&app), app.match_toast),
+            (Some("carol"), Some((2, 3)))
+        );
+
+        // One match: n and p stay on it, and still say so.
+        let mut app = find_sample();
+        find_and_keep(&mut app, "dip");
+        for key in ['n', 'p'] {
+            press(&mut app, KeyCode::Char(key));
+            assert_eq!(
+                (focused(&app), app.match_toast),
+                (Some("dave"), Some((1, 1)))
+            );
+        }
+    }
+
+    #[test]
+    fn other_keys_work_as_usual_with_a_find_active() {
+        let mut app = find_sample();
+        find_and_keep(&mut app, "rollback");
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.posts[0].comments[0].vote, Vote::Up, "a votes alice");
+        press(&mut app, KeyCode::Char('z'));
+        assert_eq!(app.posts[0].comments[0].vote, Vote::Down);
+        press(&mut app, KeyCode::Char('s'));
+        assert_eq!(app.status, Some("Post saved"));
+        press(&mut app, KeyCode::Char('c'));
+        assert_eq!(app.status, Some("Link copied to clipboard!"));
+        press_str(&mut app, "jjG");
+        assert_eq!(app.mode, Mode::Post { scroll: u16::MAX });
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('?'));
+        assert!(app.help.is_some());
+        press(&mut app, KeyCode::Char('?'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.thread.collapsed, [vec![0]].into(), "Enter collapses");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('r'));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.mode, Mode::Post { scroll: 0 });
+        assert_eq!(focused(&app), Some("alice"));
+        assert_eq!(app.find.as_ref().unwrap().text, "rollback", "still active");
+    }
+
+    #[test]
+    fn slash_reopens_the_bar_with_the_same_text() {
+        let mut app = find_sample();
+        find_and_keep(&mut app, "rollback");
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Char('/'));
+        assert_eq!(find_bar_text(&app), "rollback");
+        assert_eq!(focused(&app), Some("carol"), "reopening moves nothing");
+        assert_eq!(app.match_number(), (2, 3));
+        // Typing looks from where it was reopened.
+        press_str(&mut app, " ");
+        assert_eq!(focused(&app), Some("carol"), "trimmed: the same phrase");
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(focused(&app), Some("carol"));
+        press_str(&mut app, "k again");
+        assert_eq!(focused(&app), Some("grace"));
+        // Esc cancels the reopened bar too: no find, carol focused.
+        press(&mut app, KeyCode::Esc);
+        assert_eq!((focused(&app), &app.find), (Some("carol"), &None));
+    }
+
+    #[test]
+    fn esc_clears_the_find_then_unfocuses_then_goes_back() {
+        let mut app = find_sample();
+        find_and_keep(&mut app, "rollback");
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.find, None);
+        assert_eq!(focused(&app), Some("carol"), "the focus stays");
+        assert!(matches!(app.mode, Mode::Post { .. }));
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(focused(&app), Some("dave"), "n is back to comments");
+        assert_eq!(app.match_toast, None);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.thread.focus, None);
+        assert!(matches!(app.mode, Mode::Post { .. }));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.mode, Mode::Feed);
+    }
+
+    #[test]
+    fn a_submitted_comment_that_matches_renumbers_the_later_matches() {
+        let mut app = find_sample();
+        find_and_keep(&mut app, "rollback");
+        assert_eq!(app.match_number(), (1, 3));
+        // A reply to alice lands before carol and grace.
+        post_comment(&mut app, "Rollback done");
+        assert_eq!(app.thread.focus, Some(vec![0, 0]));
+        assert_eq!(app.match_number(), (2, 4));
+        assert_eq!(match_authors(&app), ["alice", "you", "carol", "grace"]);
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(
+            (focused(&app), app.match_toast),
+            (Some("carol"), Some((3, 4)))
+        );
+        assert_eq!(app.thread.focus, Some(vec![0, 1, 0]), "carol moved down");
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.match_toast, Some((4, 4)));
+
+        // A reply that doesn't match changes no number.
+        post_comment(&mut app, "agreed");
+        assert_eq!(app.match_number(), (0, 4));
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.match_toast, Some((1, 4)), "wrapped from the last");
+
+        // With grace the current match, a click on alice's Reply (the mouse
+        // works, and the find stays) inserts a match before it.
+        let mut app = find_sample();
+        find_and_keep(&mut app, "rollback");
+        press(&mut app, KeyCode::Char('p'));
+        assert_eq!(app.match_toast, Some((3, 3)));
+        app.hits = Some(Hits {
+            regions: vec![(Rect::new(0, 0, 5, 1), Target::Reply(vec![0]))],
+            max_scroll: 0,
+        });
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 0, 0);
+        assert!(matches!(app.mode, Mode::Compose { .. }));
+        assert_eq!(focused(&app), Some("alice"));
+        press_str(&mut app, "one more rollback");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.find.is_some(), "still active");
+        assert_eq!(app.match_number(), (2, 4));
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(
+            (focused(&app), app.match_toast),
+            (Some("grace"), Some((4, 4)))
+        );
+    }
+
+    #[test]
+    fn going_back_to_the_feed_clears_the_find() {
+        for leave in [KeyCode::Char('q'), KeyCode::Backspace] {
+            let mut app = find_sample();
+            find_and_keep(&mut app, "rollback");
+            press(&mut app, leave);
+            assert_eq!((app.mode, &app.find), (Mode::Feed, &None), "{leave:?}");
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.find, None);
+            assert_eq!(app.thread, Thread::default());
+            press(&mut app, KeyCode::Char('n'));
+            assert_eq!(app.match_toast, None, "n is back to comments");
+        }
+        // Opening a post clears it too, however it was left.
+        let mut app = find_sample();
+        find_and_keep(&mut app, "rollback");
+        app.mode = Mode::Feed;
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.find, None);
+    }
+
+    #[test]
+    fn the_mouse_is_ignored_in_the_find_bar_and_works_with_a_find_active() {
+        let mut app = find_sample();
+        app.hits = Some(Hits {
+            regions: vec![(Rect::new(0, 0, 10, 1), Target::Comment(vec![2]))],
+            max_scroll: 10,
+        });
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        press(&mut app, KeyCode::Char('/'));
+        press_str(&mut app, "rollback");
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::ScrollDown,
+            MouseEventKind::ScrollUp,
+        ] {
+            let event = MouseEvent { kind, ..click };
+            assert!(!app.handles_mouse(&event), "{kind:?}");
+            let before = (app.mode, app.thread.clone(), app.find.clone());
+            app.on_mouse(event);
+            assert_eq!((app.mode, app.thread.clone(), app.find.clone()), before);
+        }
+        press(&mut app, KeyCode::Enter);
+        assert!(app.handles_mouse(&click));
+        app.on_mouse(click);
+        assert_eq!(focused(&app), Some("hank"), "a click focuses");
+        assert_eq!(app.find.as_ref().unwrap().text, "rollback", "still active");
+        mouse(&mut app, MouseEventKind::ScrollDown, 0, 0);
+        assert_eq!(app.mode, Mode::Post { scroll: 3 });
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(
+            (focused(&app), app.match_toast),
+            (Some("alice"), Some((1, 3)))
+        );
+    }
+
+    #[test]
+    fn typing_never_leaves_a_passed_match_expanded() {
+        // The case from review: `s` finds dave under alice, `see` only frank.
+        let mut app = find_sample();
+        app.thread.collapsed = [vec![0]].into();
+        press(&mut app, KeyCode::Char('/'));
+        press_str(&mut app, "s");
+        assert_eq!(focused(&app), Some("dave"));
+        assert_eq!(app.thread.collapsed, HashSet::new(), "alice expanded");
+        press_str(&mut app, "ee");
+        assert_eq!(focused(&app), Some("frank"));
+        assert_eq!(app.thread.collapsed, [vec![0]].into(), "alice again");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.find.is_some());
+        assert_eq!(focused(&app), Some("frank"));
+        assert_eq!(app.thread.collapsed, [vec![0]].into(), "Enter keeps it");
+        assert_eq!(visible_authors(&app), ["alice", "frank", "grace", "hank"]);
+
+        // No match: the focus and the collapsed set from before `/`.
+        let mut app = find_sample();
+        focus_on(&mut app, "hank");
+        let collapsed: HashSet<CommentPath> = [vec![0], vec![0, 0, 0], vec![1]].into();
+        app.thread.collapsed = collapsed.clone();
+        press(&mut app, KeyCode::Char('/'));
+        press_str(&mut app, "jalapeño");
+        assert_eq!(focused(&app), Some("dave"), "wrapped from hank");
+        assert_eq!(app.thread.collapsed, [vec![1]].into());
+        press_str(&mut app, " sauce");
+        assert_eq!(focused(&app), Some("hank"));
+        assert_eq!(app.thread.collapsed, collapsed);
+        assert!(app.thread.reveal, "the focus moved back");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.find, None);
+        assert_eq!(
+            (focused(&app), &app.thread.collapsed),
+            (Some("hank"), &collapsed)
+        );
+
+        // Backspace back onto a match shows it again, from the same start.
+        let mut app = find_sample();
+        app.thread.collapsed = collapsed.clone();
+        press(&mut app, KeyCode::Char('/'));
+        press_str(&mut app, "dipx");
+        assert_eq!(
+            (app.thread.focus.clone(), &app.thread.collapsed),
+            (None, &collapsed)
+        );
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(focused(&app), Some("dave"));
+        assert_eq!(app.thread.collapsed, [vec![1]].into());
     }
 }
